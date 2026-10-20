@@ -1,0 +1,321 @@
+{
+  "schema_version": 1,
+  "dataset_version": 1,
+  "measured_at_unix_seconds": 1792498091,
+  "measurement": "sum of wall-clock durations of synchronous production World::mesh_chunk calls per scenario run; CPU work only, includes scheduling/preemption",
+  "package_version": "0.1.0",
+  "build": {
+    "debug_assertions": false,
+    "profile_label_external": "release",
+    "rustc_version_external": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+    "hardware_label_external": "Intel(R) Core(TM) i7-9700 CPU @ 3.00GHz; 51409334272 RAM bytes; Windows 10.0.26300; Power Scheme GUID: 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c  (High performance)",
+    "source_revision_external": "See provenance SHA256 BCBD9B3FC422AEFE622BD911B29F24B93A1D11F64BEE79C32AD94DB24C8EC9E6",
+    "target_os": "windows",
+    "target_arch": "x86_64",
+    "available_parallelism": 8,
+    "benchmark_threads": 1
+  },
+  "seed": 728491,
+  "chunk_size": 32,
+  "warmup_runs_per_scenario": 1,
+  "measured_runs_per_scenario": 5,
+  "digest_algorithm": "FNV-1a-64 over chunk keys/counts and ordered little-endian vertex f32 bits, texture-layer u32 and index u32 values; noncryptographic",
+  "scenarios": [
+    {
+      "name": "seeded_route",
+      "description": "12 fixed terrain, river, cave-depth and upper-air chunks; no edits",
+      "chunks": [
+        [
+          -2,
+          0,
+          -2
+        ],
+        [
+          -1,
+          0,
+          -1
+        ],
+        [
+          0,
+          0,
+          -1
+        ],
+        [
+          1,
+          0,
+          -2
+        ],
+        [
+          2,
+          0,
+          -2
+        ],
+        [
+          2,
+          1,
+          -2
+        ],
+        [
+          3,
+          1,
+          -2
+        ],
+        [
+          1,
+          1,
+          -1
+        ],
+        [
+          0,
+          1,
+          0
+        ],
+        [
+          -1,
+          1,
+          1
+        ],
+        [
+          2,
+          2,
+          -2
+        ],
+        [
+          3,
+          2,
+          -2
+        ]
+      ],
+      "world_edit_count": 0,
+      "elapsed_ms": {
+        "min": 31.963000000000005,
+        "median": 32.3269,
+        "p95_nearest_rank": 32.4066,
+        "max": 32.4066
+      },
+      "samples_ms": [
+        32.3512,
+        32.4066,
+        31.963000000000005,
+        32.3269,
+        32.3026
+      ],
+      "vertices_per_run": 54612,
+      "triangles_per_run": 27306,
+      "mesh_payload_bytes_per_run": 2730600,
+      "surface_area_per_run": 18894.0,
+      "mesh_digest": "b4e9985c3b035d64",
+      "repeatability_verified": true
+    },
+    {
+      "name": "empty_high_chunk",
+      "description": "32-cubed air chunk at y=192 with a one-cell air halo; matching Air edits elide to zero overrides",
+      "chunks": [
+        [
+          0,
+          6,
+          0
+        ]
+      ],
+      "world_edit_count": 0,
+      "elapsed_ms": {
+        "min": 1.9418,
+        "median": 1.9468,
+        "p95_nearest_rank": 1.9551999999999998,
+        "max": 1.9551999999999998
+      },
+      "samples_ms": [
+        1.9468,
+        1.9551999999999998,
+        1.9507,
+        1.9442000000000002,
+        1.9418
+      ],
+      "vertices_per_run": 0,
+      "triangles_per_run": 0,
+      "mesh_payload_bytes_per_run": 0,
+      "surface_area_per_run": 0.0,
+      "mesh_digest": "ca8a6edabefcad13",
+      "repeatability_verified": true
+    },
+    {
+      "name": "isolated_solid_chunk",
+      "description": "32-cubed Stone edit volume at y=192 surrounded by a one-cell generated-air halo",
+      "chunks": [
+        [
+          0,
+          6,
+          0
+        ]
+      ],
+      "world_edit_count": 32768,
+      "elapsed_ms": {
+        "min": 2.5931,
+        "median": 2.6169000000000002,
+        "p95_nearest_rank": 2.642,
+        "max": 2.642
+      },
+      "samples_ms": [
+        2.6104000000000003,
+        2.5931,
+        2.6169000000000002,
+        2.642,
+        2.6237
+      ],
+      "vertices_per_run": 1224,
+      "triangles_per_run": 612,
+      "mesh_payload_bytes_per_run": 61200,
+      "surface_area_per_run": 6144.0,
+      "mesh_digest": "41be41bea5c6c402",
+      "repeatability_verified": true
+    },
+    {
+      "name": "enclosed_solid_chunk",
+      "description": "32-cubed Stone volume plus a fully solid one-cell halo; every face occluded",
+      "chunks": [
+        [
+          0,
+          6,
+          0
+        ]
+      ],
+      "world_edit_count": 39304,
+      "elapsed_ms": {
+        "min": 2.3285,
+        "median": 2.3463999999999996,
+        "p95_nearest_rank": 2.3652,
+        "max": 2.3652
+      },
+      "samples_ms": [
+        2.3652,
+        2.3285,
+        2.3463999999999996,
+        2.3543000000000003,
+        2.3447
+      ],
+      "vertices_per_run": 0,
+      "triangles_per_run": 0,
+      "mesh_payload_bytes_per_run": 0,
+      "surface_area_per_run": 0.0,
+      "mesh_digest": "ca8a6edabefcad13",
+      "repeatability_verified": true
+    },
+    {
+      "name": "checkerboard_high_chunk",
+      "description": "alternating Stone/Air cells continued through a one-cell halo; worst-case unmergeable exposed faces",
+      "chunks": [
+        [
+          0,
+          6,
+          0
+        ]
+      ],
+      "world_edit_count": 19652,
+      "elapsed_ms": {
+        "min": 18.3736,
+        "median": 18.6235,
+        "p95_nearest_rank": 18.969,
+        "max": 18.969
+      },
+      "samples_ms": [
+        18.3736,
+        18.882199999999997,
+        18.5134,
+        18.969,
+        18.6235
+      ],
+      "vertices_per_run": 393216,
+      "triangles_per_run": 196608,
+      "mesh_payload_bytes_per_run": 19660800,
+      "surface_area_per_run": 98304.0,
+      "mesh_digest": "9b90a6ba4714f004",
+      "repeatability_verified": true
+    },
+    {
+      "name": "edited_terrain_route",
+      "description": "same 12-chunk route after a cross-border excavation, basalt floor and timber beam around (64,-64)",
+      "chunks": [
+        [
+          -2,
+          0,
+          -2
+        ],
+        [
+          -1,
+          0,
+          -1
+        ],
+        [
+          0,
+          0,
+          -1
+        ],
+        [
+          1,
+          0,
+          -2
+        ],
+        [
+          2,
+          0,
+          -2
+        ],
+        [
+          2,
+          1,
+          -2
+        ],
+        [
+          3,
+          1,
+          -2
+        ],
+        [
+          1,
+          1,
+          -1
+        ],
+        [
+          0,
+          1,
+          0
+        ],
+        [
+          -1,
+          1,
+          1
+        ],
+        [
+          2,
+          2,
+          -2
+        ],
+        [
+          3,
+          2,
+          -2
+        ]
+      ],
+      "world_edit_count": 3007,
+      "elapsed_ms": {
+        "min": 32.5309,
+        "median": 32.588,
+        "p95_nearest_rank": 32.69370000000001,
+        "max": 32.69370000000001
+      },
+      "samples_ms": [
+        32.620400000000004,
+        32.588,
+        32.69370000000001,
+        32.5578,
+        32.5309
+      ],
+      "vertices_per_run": 54640,
+      "triangles_per_run": 27320,
+      "mesh_payload_bytes_per_run": 2732000,
+      "surface_area_per_run": 19084.0,
+      "mesh_digest": "076eb3d79690adef",
+      "repeatability_verified": true
+    }
+  ]
+}

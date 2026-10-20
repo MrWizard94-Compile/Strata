@@ -1,0 +1,955 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+mod benchmark;
+mod material_export;
+mod materials;
+mod player;
+mod renderer;
+mod save;
+mod streaming;
+mod world;
+
+use egui::{Align2, Color32, FontId, Pos2, Rect, RichText, Stroke, Vec2};
+use player::{Motion, Player};
+use renderer::{PresentOutcome, RenderCamera, Renderer};
+use save::SaveStore;
+use std::{
+    collections::{HashSet, VecDeque},
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+use streaming::Streaming;
+use winit::{
+    application::ApplicationHandler,
+    dpi::LogicalSize,
+    event::{DeviceEvent, ElementState, MouseButton, MouseScrollDelta, WindowEvent},
+    event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
+    keyboard::{KeyCode, PhysicalKey},
+    window::{CursorGrabMode, Window, WindowId},
+};
+use world::{Block, World};
+
+const ACCENT: Color32 = Color32::from_rgb(225, 184, 111);
+const IVORY: Color32 = Color32::from_rgb(242, 238, 225);
+const MUTED: Color32 = Color32::from_rgb(160, 178, 177);
+const PANEL: Color32 = Color32::from_rgba_premultiplied(12, 24, 28, 236);
+const HOTBAR: [Block; 8] = [
+    Block::Grass,
+    Block::Stone,
+    Block::Wood,
+    Block::Leaves,
+    Block::Sand,
+    Block::Clay,
+    Block::Crystal,
+    Block::Basalt,
+];
+
+struct Options {
+    seed: u64,
+    save_dir: PathBuf,
+    smoke_seconds: Option<f32>,
+    benchmark_cpu: Option<PathBuf>,
+    export_materials: Option<PathBuf>,
+}
+impl Options {
+    fn parse() -> Result<Self, String> {
+        let mut result = Self {
+            seed: 728_491,
+            save_dir: PathBuf::from("saves/emerald-reach"),
+            smoke_seconds: None,
+            benchmark_cpu: None,
+            export_materials: None,
+        };
+        let mut args = std::env::args().skip(1);
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--seed" => {
+                    result.seed = args
+                        .next()
+                        .ok_or("--seed needs a value")?
+                        .parse()
+                        .map_err(|_| "Invalid seed")?
+                }
+                "--save-dir" => {
+                    result.save_dir = PathBuf::from(args.next().ok_or("--save-dir needs a path")?)
+                }
+                "--benchmark-cpu" => {
+                    result.benchmark_cpu = Some(PathBuf::from(
+                        args.next()
+                            .ok_or("--benchmark-cpu needs a new report path")?,
+                    ));
+                }
+                "--export-materials" => {
+                    result.export_materials = Some(PathBuf::from(
+                        args.next()
+                            .ok_or("--export-materials needs a new directory")?,
+                    ));
+                }
+                "--smoke-seconds" => {
+                    let seconds: f32 = args
+                        .next()
+                        .ok_or("--smoke-seconds needs a value")?
+                        .parse()
+                        .map_err(|_| "Invalid smoke duration")?;
+                    if !seconds.is_finite() || !(1.0..=120.0).contains(&seconds) {
+                        return Err("Smoke duration must be 1–120 seconds".into());
+                    }
+                    result.smoke_seconds = Some(seconds);
+                }
+                "--help" | "-h" => {
+                    return Err(
+                        "STRATA: --seed <u64> --save-dir <directory> --smoke-seconds <1..120>\nCPU-only benchmark: --benchmark-cpu <new-report.json> (fixed dataset, no window or saves)\nMaterial PNG export: --export-materials <new-directory>"
+                            .into(),
+                    );
+                }
+                _ => return Err(format!("Unknown option: {arg}")),
+            }
+        }
+        if result.benchmark_cpu.is_some() && result.export_materials.is_some() {
+            return Err("Choose either a benchmark or a material export per invocation".into());
+        }
+        Ok(result)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Screen {
+    Title,
+    Playing,
+    Paused,
+    Settings,
+}
+
+struct Game {
+    window: Arc<Window>,
+    renderer: Renderer,
+    egui: egui::Context,
+    egui_state: egui_winit::State,
+    egui_renderer: egui_wgpu::Renderer,
+    world: Arc<World>,
+    player: Player,
+    streaming: Streaming,
+    saves: SaveStore,
+    screen: Screen,
+    settings_return: Screen,
+    has_entered: bool,
+    focused: bool,
+    keys: HashSet<KeyCode>,
+    selected: usize,
+    debug: bool,
+    radius: i32,
+    sensitivity: f32,
+    start: Instant,
+    last_frame: Instant,
+    last_present: Option<Instant>,
+    next_redraw: Instant,
+    last_save: Instant,
+    last_report: Instant,
+    accumulator: f32,
+    frame_times: VecDeque<f32>,
+    frame_count: u64,
+    skipped_frames: u64,
+    status: String,
+    status_until: Instant,
+    fatal: Option<String>,
+    dirty: bool,
+    smoke_seconds: Option<f32>,
+    should_exit: bool,
+}
+
+impl Game {
+    fn new(window: Arc<Window>, options: &Options) -> Result<Self, String> {
+        let (saves, loaded) = SaveStore::open(&options.save_dir)?;
+        let (world, player, has_save) = match loaded {
+            Some(snapshot) => {
+                let world = snapshot.world();
+                (world, Player::restore(snapshot.player), true)
+            }
+            None => {
+                let world = World::new(options.seed);
+                let player = Player::new(&world);
+                (world, player, false)
+            }
+        };
+        let renderer = pollster::block_on(Renderer::new(Arc::clone(&window)))?;
+        println!(
+            "STRATA_BOOT version=0.1.0 seed={} adapter={} saved_world={has_save}",
+            world.seed(),
+            renderer.adapter_name
+        );
+        let egui = egui::Context::default();
+        let mut style = (*egui.style_of(egui::Theme::Dark)).clone();
+        style.visuals = egui::Visuals::dark();
+        style.visuals.override_text_color = Some(IVORY);
+        style.visuals.panel_fill = PANEL;
+        style.visuals.window_fill = PANEL;
+        style.visuals.widgets.inactive.bg_fill = Color32::from_rgb(32, 49, 52);
+        style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(53, 73, 72);
+        style.visuals.selection.bg_fill = ACCENT;
+        style.spacing.item_spacing = Vec2::new(12.0, 12.0);
+        style.spacing.button_padding = Vec2::new(18.0, 14.0);
+        egui.set_theme(egui::Theme::Dark);
+        egui.set_style_of(egui::Theme::Dark, style);
+        let egui_state = egui_winit::State::new(
+            egui.clone(),
+            egui::ViewportId::ROOT,
+            window.as_ref(),
+            Some(window.scale_factor() as f32),
+            None,
+            Some(renderer.device.limits().max_texture_dimension_2d as usize),
+        );
+        let egui_renderer = egui_wgpu::Renderer::new(
+            &renderer.device,
+            renderer.format,
+            egui_wgpu::RendererOptions::default(),
+        );
+        let now = Instant::now();
+        Ok(Self {
+            window,
+            renderer,
+            egui,
+            egui_state,
+            egui_renderer,
+            world: Arc::new(world),
+            player,
+            streaming: Streaming::new(),
+            saves,
+            screen: Screen::Title,
+            settings_return: Screen::Title,
+            has_entered: false,
+            focused: true,
+            keys: HashSet::new(),
+            selected: 0,
+            debug: false,
+            radius: 4,
+            sensitivity: 1.0,
+            start: now,
+            last_frame: now,
+            last_present: None,
+            next_redraw: now,
+            last_save: now,
+            last_report: now,
+            accumulator: 0.0,
+            frame_times: VecDeque::with_capacity(240),
+            frame_count: 0,
+            skipped_frames: 0,
+            status: if has_save {
+                "Your world is ready to return to.".into()
+            } else {
+                "A new world. A place to begin.".into()
+            },
+            status_until: now + Duration::from_secs(5),
+            fatal: None,
+            dirty: false,
+            smoke_seconds: options.smoke_seconds,
+            should_exit: false,
+        })
+    }
+
+    fn notify(&mut self, text: impl Into<String>) {
+        self.status = text.into();
+        self.status_until = Instant::now() + Duration::from_secs(4);
+    }
+
+    fn capture_cursor(&mut self, capture: bool) {
+        if capture {
+            if self
+                .window
+                .set_cursor_grab(CursorGrabMode::Locked)
+                .or_else(|_| self.window.set_cursor_grab(CursorGrabMode::Confined))
+                .is_err()
+            {
+                self.notify("Mouse capture unavailable. Arrow keys also turn the camera.");
+            }
+        } else {
+            let _ = self.window.set_cursor_grab(CursorGrabMode::None);
+        }
+        self.window.set_cursor_visible(!capture);
+    }
+
+    fn enter(&mut self) {
+        self.screen = Screen::Playing;
+        self.has_entered = true;
+        self.keys.clear();
+        self.last_frame = Instant::now();
+        self.last_present = None;
+        self.frame_times.clear();
+        self.next_redraw = Instant::now();
+        self.accumulator = 0.0;
+        self.capture_cursor(true);
+        self.notify("WASD to explore · mouse to look · Esc to pause");
+        println!("STRATA_ENTER eye={:?}", self.player.eye.to_array());
+    }
+
+    fn pause(&mut self) {
+        self.screen = Screen::Paused;
+        self.keys.clear();
+        self.capture_cursor(false);
+    }
+
+    fn save(&mut self) -> bool {
+        match self.saves.save(&self.world, self.player.snapshot()) {
+            Ok(()) => {
+                self.dirty = false;
+                self.last_save = Instant::now();
+                self.notify("World saved.");
+                println!("STRATA_SAVE edits={}", self.world.edits().len());
+                true
+            }
+            Err(error) => {
+                self.notify(format!("Save failed: {error}"));
+                eprintln!("STRATA_SAVE_FAILED {error}");
+                false
+            }
+        }
+    }
+
+    fn edit(&mut self, place: bool) {
+        if self.screen != Screen::Playing {
+            return;
+        }
+        let Some(hit) = self.world.raycast(
+            self.player.eye.to_array(),
+            self.player.direction().to_array(),
+            8.0,
+        ) else {
+            return;
+        };
+        let position = if place { hit.previous } else { hit.block };
+        if place && self.player.occupies(position) {
+            self.notify("Step back to place a block here.");
+            return;
+        }
+        if !(-30..159).contains(&position[1]) {
+            self.notify("This build supports edits between -30 and 158 blocks high.");
+            return;
+        }
+        if self.world.edits().len() >= 99_999 {
+            self.notify("This world's current edit limit has been reached.");
+            return;
+        }
+        let block = if place {
+            HOTBAR[self.selected]
+        } else {
+            Block::Air
+        };
+        Arc::make_mut(&mut self.world).set_block(position, block);
+        self.streaming.invalidate_edit(position);
+        self.dirty = true;
+        println!(
+            "STRATA_EDIT action={} position={position:?} material={}",
+            if place { "place" } else { "break" },
+            block.name()
+        );
+    }
+
+    fn keyboard(&mut self, code: KeyCode, pressed: bool, repeat: bool) {
+        if !pressed {
+            self.keys.remove(&code);
+            return;
+        }
+        self.keys.insert(code);
+        if repeat {
+            return;
+        }
+        match code {
+            KeyCode::Escape => match self.screen {
+                Screen::Playing => self.pause(),
+                Screen::Paused => self.enter(),
+                Screen::Settings => self.screen = self.settings_return,
+                Screen::Title => {}
+            },
+            KeyCode::Enter if self.screen == Screen::Title || self.screen == Screen::Paused => {
+                self.enter()
+            }
+            KeyCode::F3 => self.debug = !self.debug,
+            KeyCode::F5 => {
+                self.save();
+            }
+            KeyCode::KeyF if self.screen == Screen::Playing => {
+                let changed = self.player.toggle_flight(&self.world);
+                self.notify(if !changed {
+                    "Move clear of the terrain before leaving flight."
+                } else if self.player.flying {
+                    "Flight enabled · Space up · Ctrl down"
+                } else {
+                    "Walking · Space to jump"
+                });
+            }
+            KeyCode::KeyX => self.edit(false),
+            KeyCode::KeyC => self.edit(true),
+            KeyCode::ArrowLeft if self.screen == Screen::Playing => self.player.look(-0.12, 0.0),
+            KeyCode::ArrowRight if self.screen == Screen::Playing => self.player.look(0.12, 0.0),
+            KeyCode::ArrowUp if self.screen == Screen::Playing => self.player.look(0.0, 0.12),
+            KeyCode::ArrowDown if self.screen == Screen::Playing => self.player.look(0.0, -0.12),
+            KeyCode::Digit1 => self.selected = 0,
+            KeyCode::Digit2 => self.selected = 1,
+            KeyCode::Digit3 => self.selected = 2,
+            KeyCode::Digit4 => self.selected = 3,
+            KeyCode::Digit5 => self.selected = 4,
+            KeyCode::Digit6 => self.selected = 5,
+            KeyCode::Digit7 => self.selected = 6,
+            KeyCode::Digit8 => self.selected = 7,
+            _ => {}
+        }
+    }
+
+    fn motion(&self) -> Motion {
+        let key = |k| if self.keys.contains(&k) { 1.0 } else { 0.0 };
+        Motion {
+            forward: key(KeyCode::KeyW) - key(KeyCode::KeyS),
+            right: key(KeyCode::KeyD) - key(KeyCode::KeyA),
+            vertical: key(KeyCode::Space) - key(KeyCode::ControlLeft),
+            sprint: self.keys.contains(&KeyCode::ShiftLeft),
+            jump: self.keys.contains(&KeyCode::Space),
+        }
+    }
+
+    fn camera(&self) -> RenderCamera {
+        let mut eye = self.player.eye;
+        let mut direction = self.player.direction();
+        if !self.has_entered {
+            eye += glam::Vec3::new(15.0, 28.0, 24.0);
+            direction = glam::Vec3::new(-0.3, -0.3, -1.0).normalize();
+        }
+        RenderCamera {
+            eye: eye.to_array(),
+            target: (eye + direction).to_array(),
+            time: self.start.elapsed().as_secs_f32(),
+            fog_distance: self.radius as f32 * 32.0 - 12.0,
+            selected: if self.screen == Screen::Playing {
+                self.world
+                    .raycast(
+                        self.player.eye.to_array(),
+                        self.player.direction().to_array(),
+                        8.0,
+                    )
+                    .map(|h| h.block)
+            } else {
+                None
+            },
+        }
+    }
+
+    fn frame_stats(&self) -> (f32, f32) {
+        if self.frame_times.is_empty() {
+            return (0.0, 0.0);
+        }
+        let average = self.frame_times.iter().sum::<f32>() / self.frame_times.len() as f32;
+        let mut sorted: Vec<_> = self.frame_times.iter().copied().collect();
+        sorted.sort_by(f32::total_cmp);
+        (
+            1000.0 / average.max(0.001),
+            sorted[(sorted.len() * 95 / 100).min(sorted.len() - 1)],
+        )
+    }
+
+    fn redraw(&mut self) {
+        if self.window.inner_size().width == 0 || self.window.inner_size().height == 0 {
+            return;
+        }
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_frame).as_secs_f32();
+        self.last_frame = now;
+        if self.screen == Screen::Playing && self.focused {
+            self.accumulator += elapsed.min(0.1);
+            let motion = self.motion();
+            while self.accumulator >= 1.0 / 60.0 {
+                self.player.tick(&self.world, motion, 1.0 / 60.0);
+                self.accumulator -= 1.0 / 60.0;
+            }
+        } else {
+            self.accumulator = 0.0;
+        }
+        let camera = self.camera();
+        for key in self.streaming.update(camera.eye, self.radius, &self.world) {
+            self.renderer.remove_chunk(key);
+        }
+        for result in self.streaming.take_ready() {
+            self.renderer.upload_chunk(result.key, &result.mesh);
+        }
+        if self.has_entered && now.duration_since(self.last_save) > Duration::from_secs(30) {
+            self.last_save = now;
+            self.save();
+        }
+        if now.duration_since(self.last_report) > Duration::from_secs(10) {
+            self.last_report = now;
+            let (fps, p95) = self.frame_stats();
+            println!(
+                "STRATA_FRAME presented={} skipped={} present_fps={fps:.1} present_p95_ms={p95:.2} chunks={} triangles={} mesh_ms={:.2}",
+                self.frame_count,
+                self.skipped_frames,
+                self.renderer.chunk_count(),
+                self.renderer.triangle_count(),
+                self.streaming.last_mesh_ms
+            );
+        }
+        let input = self.egui_state.take_egui_input(&self.window);
+        let context = self.egui.clone();
+        let output = context.run_pass(input, |ctx| self.draw_ui(ctx));
+        self.egui_state
+            .handle_platform_output(&self.window, output.platform_output);
+        if self.screen == Screen::Playing {
+            self.window.set_cursor_visible(false);
+        }
+        let paint_jobs = context.tessellate(output.shapes, output.pixels_per_point);
+        match self.renderer.render(
+            camera,
+            &mut self.egui_renderer,
+            &paint_jobs,
+            &output.textures_delta,
+            output.pixels_per_point,
+        ) {
+            Ok(PresentOutcome::Presented) => {
+                let presented_at = Instant::now();
+                if let Some(previous) = self.last_present.replace(presented_at) {
+                    self.frame_times
+                        .push_back(presented_at.duration_since(previous).as_secs_f32() * 1000.0);
+                    if self.frame_times.len() > 240 {
+                        self.frame_times.pop_front();
+                    }
+                }
+                self.frame_count += 1;
+                self.next_redraw = presented_at
+                    + if self.focused {
+                        Duration::ZERO
+                    } else {
+                        Duration::from_millis(50)
+                    };
+            }
+            Ok(PresentOutcome::Skipped) => {
+                self.skipped_frames += 1;
+                self.next_redraw = Instant::now() + Duration::from_millis(50);
+            }
+            Err(error) => {
+                self.fatal = Some(format!("Rendering stopped: {error}"));
+                eprintln!("STRATA_RENDER_FAILED {error}");
+                self.should_exit = true;
+            }
+        }
+        if self
+            .smoke_seconds
+            .is_some_and(|s| self.start.elapsed().as_secs_f32() >= s)
+        {
+            let (fps, p95) = self.frame_stats();
+            println!(
+                "STRATA_SMOKE_COMPLETE presented={} skipped={} chunks={} triangles={} present_fps={fps:.1} present_p95_ms={p95:.2}",
+                self.frame_count,
+                self.skipped_frames,
+                self.renderer.chunk_count(),
+                self.renderer.triangle_count()
+            );
+            self.should_exit = true;
+        }
+    }
+
+    fn draw_ui(&mut self, ctx: &egui::Context) {
+        let bounds = ctx.content_rect();
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Background,
+            egui::Id::unique("world-overlay"),
+        ));
+        painter.text(
+            Pos2::new(34.0, 30.0),
+            Align2::LEFT_TOP,
+            "S T R A T A",
+            FontId::proportional(26.0),
+            IVORY,
+        );
+        painter.text(
+            Pos2::new(36.0, 65.0),
+            Align2::LEFT_TOP,
+            "T H E   E M E R A L D   R E A C H",
+            FontId::proportional(10.0),
+            ACCENT,
+        );
+        painter.text(
+            Pos2::new(bounds.right() - 28.0, 30.0),
+            Align2::RIGHT_TOP,
+            "DEVELOPMENT BUILD   /   0.1",
+            FontId::monospace(10.0),
+            IVORY,
+        );
+        if self.screen != Screen::Playing {
+            painter.rect_filled(bounds, 0.0, Color32::from_black_alpha(65));
+            let position = Pos2::new(56.0, (bounds.height() * 0.26).max(110.0));
+            egui::Area::new(egui::Id::unique("menu")).fixed_pos(position).show(ctx, |ui| {
+                egui::Frame::new().fill(PANEL).inner_margin(32.0).corner_radius(4).show(ui, |ui| {
+                    ui.set_width(350.0);
+                    match self.screen {
+                        Screen::Title => {
+                            ui.label(RichText::new("01  /  BEGIN AN EXPEDITION").color(ACCENT).size(11.0));
+                            ui.add_space(14.0);
+                            ui.label(RichText::new("A world\nto make your own.").size(38.0).strong());
+                            ui.add_space(14.0);
+                            ui.label(RichText::new("Walk the ridgelines. Carve into the earth.\nBuild something that belongs here.").size(15.0).color(MUTED));
+                            ui.add_space(24.0);
+                            if primary_button(ui,"ENTER THE REACH") { self.enter(); }
+                            if secondary_button(ui,"World settings") { self.settings_return=Screen::Title; self.screen=Screen::Settings; }
+                            if secondary_button(ui,"Quit") { self.should_exit=true; }
+                            ui.add_space(12.0);
+                            ui.label(RichText::new(format!("WORLD SEED  {:06}",self.world.seed())).monospace().size(10.0).color(MUTED));
+                        }
+                        Screen::Paused => {
+                            ui.label(RichText::new("TAKE A BREATH").color(ACCENT).size(11.0));
+                            ui.add_space(10.0);
+                            ui.label(RichText::new("The world can wait.").size(30.0).strong());
+                            ui.add_space(20.0);
+                            if primary_button(ui,"CONTINUE EXPLORING") { self.enter(); }
+                            if secondary_button(ui,"Save world") { self.save(); }
+                            if secondary_button(ui,"Settings") { self.settings_return=Screen::Paused; self.screen=Screen::Settings; }
+                            if secondary_button(ui,"Save and quit") && self.save() { self.should_exit=true; }
+                            ui.add_space(10.0);
+                            ui.label(RichText::new("WASD  Move     Space  Jump     Shift  Sprint\nF  Flight     1–8  Material     F5  Save\nLeft click / X  Break     Right click / C  Place\nArrows  Turn     F3  Performance     Esc  Pause").size(12.0).color(MUTED));
+                        }
+                        Screen::Settings => {
+                            ui.label(RichText::new("MAKE YOURSELF AT HOME").color(ACCENT).size(11.0));
+                            ui.add_space(10.0);
+                            ui.heading("World settings"); ui.add_space(18.0);
+                            ui.label("View distance");
+                            ui.add(egui::Slider::new(&mut self.radius,2..=6).suffix(" chunks"));
+                            ui.label(RichText::new("Each chunk is 32 blocks wide. Higher distances use more memory and take longer to stream.").color(MUTED).size(12.0));
+                            ui.add_space(12.0);
+                            ui.label("Mouse sensitivity");
+                            ui.add(egui::Slider::new(&mut self.sensitivity,0.3..=2.5));
+                            ui.checkbox(&mut self.debug,"Show performance overlay");
+                            ui.add_space(14.0);
+                            if primary_button(ui,"BACK") { self.screen=self.settings_return; }
+                        }
+                        Screen::Playing => {}
+                    }
+                });
+            });
+        } else {
+            let c = bounds.center();
+            for (a, b) in [
+                (Vec2::new(-9.0, 0.0), Vec2::new(-3.0, 0.0)),
+                (Vec2::new(3.0, 0.0), Vec2::new(9.0, 0.0)),
+                (Vec2::new(0.0, -9.0), Vec2::new(0.0, -3.0)),
+                (Vec2::new(0.0, 3.0), Vec2::new(0.0, 9.0)),
+            ] {
+                painter.line_segment([c + a, c + b], Stroke::new(1.6, IVORY));
+            }
+            let slot = 56.0;
+            let total = slot * 8.0;
+            let start = Pos2::new(bounds.center().x - total / 2.0, bounds.bottom() - 86.0);
+            for (i, block) in HOTBAR.iter().enumerate() {
+                let rect = Rect::from_min_size(
+                    start + Vec2::new(i as f32 * slot, 0.0),
+                    Vec2::splat(slot - 4.0),
+                );
+                painter.rect_filled(
+                    rect,
+                    4.0,
+                    if i == self.selected {
+                        Color32::from_rgba_premultiplied(66, 68, 51, 235)
+                    } else {
+                        PANEL
+                    },
+                );
+                if i == self.selected {
+                    painter.rect_stroke(
+                        rect,
+                        4.0,
+                        Stroke::new(1.5, ACCENT),
+                        egui::StrokeKind::Inside,
+                    );
+                }
+                let color = block.color();
+                let rgb = Color32::from_rgb(
+                    (color[0] * 255.0) as u8,
+                    (color[1] * 255.0) as u8,
+                    (color[2] * 255.0) as u8,
+                );
+                let icon =
+                    Rect::from_center_size(rect.center() + Vec2::new(0.0, -4.0), Vec2::splat(23.0));
+                painter.rect_filled(icon, 3.0, rgb);
+                painter.line_segment(
+                    [icon.left_top(), icon.right_top()],
+                    Stroke::new(3.0, Color32::from_white_alpha(65)),
+                );
+                painter.text(
+                    rect.center_bottom() + Vec2::new(0.0, -3.0),
+                    Align2::CENTER_BOTTOM,
+                    (i + 1).to_string(),
+                    FontId::monospace(9.0),
+                    MUTED,
+                );
+            }
+            painter.text(
+                Pos2::new(bounds.center().x, bounds.bottom() - 101.0),
+                Align2::CENTER_BOTTOM,
+                HOTBAR[self.selected].name(),
+                FontId::proportional(14.0),
+                IVORY,
+            );
+            painter.text(
+                Pos2::new(bounds.center().x, bounds.bottom() - 17.0),
+                Align2::CENTER_BOTTOM,
+                "BREAK  LMB    /    PLACE  RMB    /    FLIGHT  F    /    PAUSE  ESC",
+                FontId::monospace(10.0),
+                IVORY,
+            );
+            painter.text(
+                Pos2::new(36.0, 96.0),
+                Align2::LEFT_TOP,
+                if self.player.flying {
+                    "FREE FLIGHT"
+                } else {
+                    "EXPLORING"
+                },
+                FontId::monospace(10.0),
+                IVORY,
+            );
+        }
+        let (loaded, total) = self.streaming.progress();
+        if loaded < total {
+            egui::Area::new(egui::Id::unique("streaming-progress"))
+                .anchor(Align2::RIGHT_BOTTOM, Vec2::new(-28.0, -28.0))
+                .show(ctx, |ui| {
+                    egui::Frame::new()
+                        .fill(PANEL)
+                        .inner_margin(12.0)
+                        .corner_radius(4)
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new("THE WORLD IS UNFOLDING")
+                                    .size(10.0)
+                                    .color(ACCENT),
+                            );
+                            ui.add(
+                                egui::ProgressBar::new(loaded as f32 / total.max(1) as f32)
+                                    .desired_width(180.0)
+                                    .fill(ACCENT),
+                            );
+                        });
+                });
+        }
+        if Instant::now() < self.status_until {
+            let notification = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::unique("notification"),
+            ));
+            let rect = Rect::from_center_size(
+                Pos2::new(bounds.center().x, 116.0),
+                Vec2::new(
+                    (self.status.len() as f32 * 7.0 + 32.0).min(bounds.width() - 40.0),
+                    34.0,
+                ),
+            );
+            notification.rect_filled(rect, 4.0, PANEL);
+            notification.text(
+                rect.center(),
+                Align2::CENTER_CENTER,
+                &self.status,
+                FontId::proportional(13.0),
+                IVORY,
+            );
+        }
+        if self.debug {
+            let (fps, p95) = self.frame_stats();
+            egui::Area::new(egui::Id::unique("performance")).anchor(Align2::RIGHT_TOP,Vec2::new(-28.0,64.0)).show(ctx,|ui| {
+                egui::Frame::new().fill(PANEL).inner_margin(16.0).corner_radius(4).show(ui,|ui| {
+                    ui.label(RichText::new("FIELD NOTES").color(ACCENT).size(11.0));
+                    ui.monospace(format!("{fps:.0} fps  ·  p95 {p95:.2} ms\n{} chunks  ·  {} triangles\n{} workers  ·  {:.2} ms last mesh\nPosition {:.1}, {:.1}, {:.1}\n{}",self.renderer.chunk_count(),self.renderer.triangle_count(),self.streaming.workers,self.streaming.last_mesh_ms,self.player.eye.x,self.player.eye.y,self.player.eye.z,self.renderer.adapter_name));
+                });
+            });
+        }
+    }
+}
+
+fn primary_button(ui: &mut egui::Ui, label: &str) -> bool {
+    ui.add_sized(
+        [ui.available_width(), 48.0],
+        egui::Button::new(
+            RichText::new(label)
+                .size(13.0)
+                .strong()
+                .color(Color32::from_rgb(24, 34, 34)),
+        )
+        .fill(ACCENT)
+        .corner_radius(3),
+    )
+    .clicked()
+}
+fn secondary_button(ui: &mut egui::Ui, label: &str) -> bool {
+    ui.add_sized(
+        [ui.available_width(), 40.0],
+        egui::Button::new(RichText::new(label).size(13.0)).corner_radius(3),
+    )
+    .clicked()
+}
+
+struct Application {
+    options: Options,
+    game: Option<Game>,
+    error: Option<String>,
+}
+impl ApplicationHandler for Application {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.game.is_some() {
+            return;
+        }
+        let attributes = Window::default_attributes()
+            .with_title("STRATA — The Emerald Reach")
+            .with_inner_size(LogicalSize::new(1440.0, 900.0))
+            .with_min_inner_size(LogicalSize::new(900.0, 600.0))
+            .with_visible(false);
+        match event_loop
+            .create_window(attributes)
+            .map_err(|e| e.to_string())
+            .and_then(|window| Game::new(Arc::new(window), &self.options))
+        {
+            Ok(game) => {
+                game.window.set_visible(true);
+                game.window.request_redraw();
+                self.game = Some(game);
+            }
+            Err(error) => {
+                eprintln!("STRATA_START_FAILED {error}");
+                self.error = Some(error);
+                event_loop.exit();
+            }
+        }
+    }
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        let Some(game) = &mut self.game else {
+            return;
+        };
+        if game.window.id() != id {
+            return;
+        }
+        let response = game.egui_state.on_window_event(&game.window, &event);
+        match event {
+            WindowEvent::CloseRequested => {
+                if !game.has_entered || game.save() {
+                    game.should_exit = true;
+                } else {
+                    game.pause();
+                }
+            }
+            WindowEvent::Resized(size) => game.renderer.resize(size.width, size.height),
+            WindowEvent::Focused(focused) => {
+                game.focused = focused;
+                if !focused && game.screen == Screen::Playing {
+                    game.pause();
+                }
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                if let PhysicalKey::Code(code) = event.physical_key
+                    && (!response.consumed
+                        || matches!(
+                            code,
+                            KeyCode::Escape | KeyCode::F3 | KeyCode::F5 | KeyCode::Enter
+                        ))
+                {
+                    game.keyboard(code, event.state == ElementState::Pressed, event.repeat);
+                }
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button,
+                ..
+            } if !response.consumed && game.screen == Screen::Playing => match button {
+                MouseButton::Left => game.edit(false),
+                MouseButton::Right => game.edit(true),
+                _ => {}
+            },
+            WindowEvent::MouseWheel { delta, .. } if game.screen == Screen::Playing => {
+                let y = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y,
+                    MouseScrollDelta::PixelDelta(p) => p.y as f32,
+                };
+                if y != 0.0 {
+                    game.selected = (game.selected as i32 + if y > 0.0 { -1 } else { 1 })
+                        .rem_euclid(8) as usize;
+                }
+            }
+            WindowEvent::RedrawRequested => game.redraw(),
+            _ => {}
+        }
+        if game.should_exit {
+            if let Some(error) = game.fatal.take() {
+                // A controlled renderer failure does not invalidate the CPU world.
+                // Attempt preservation before teardown, retaining both diagnostics.
+                if game.has_entered {
+                    game.save();
+                }
+                self.error = Some(error);
+            }
+            event_loop.exit();
+        }
+    }
+    fn device_event(&mut self, _: &ActiveEventLoop, _: winit::event::DeviceId, event: DeviceEvent) {
+        if let Some(game) = &mut self.game
+            && game.screen == Screen::Playing
+            && game.focused
+            && let DeviceEvent::MouseMotion { delta } = event
+        {
+            game.player.look(
+                delta.0 as f32 * 0.002 * game.sensitivity,
+                -delta.1 as f32 * 0.002 * game.sensitivity,
+            );
+        }
+    }
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(game) = &self.game {
+            if game.window.is_minimized().unwrap_or(false) {
+                event_loop.set_control_flow(ControlFlow::Wait);
+            } else if Instant::now() < game.next_redraw {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(game.next_redraw));
+            } else {
+                event_loop.set_control_flow(ControlFlow::Wait);
+                game.window.request_redraw();
+            }
+        }
+    }
+}
+
+fn main() {
+    let options = match Options::parse() {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(2);
+        }
+    };
+    if let Some(output) = &options.benchmark_cpu {
+        match benchmark::run_cpu_benchmark(output) {
+            Ok(()) => println!("STRATA_CPU_BENCHMARK report={}", output.display()),
+            Err(error) => {
+                eprintln!("STRATA_CPU_BENCHMARK_FAILED {error}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+    if let Some(output) = &options.export_materials {
+        if let Err(error) = material_export::export_materials(output) {
+            eprintln!("STRATA_MATERIAL_EXPORT_FAILED {error}");
+            std::process::exit(1);
+        }
+        println!("STRATA_MATERIAL_EXPORT directory={}", output.display());
+        return;
+    }
+    let event_loop = match EventLoop::new() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("Cannot create window event loop: {e}");
+            std::process::exit(1);
+        }
+    };
+    let mut app = Application {
+        options,
+        game: None,
+        error: None,
+    };
+    if let Err(error) = event_loop.run_app(&mut app) {
+        eprintln!("Application event loop failed: {error}");
+        std::process::exit(1);
+    }
+    if app.error.is_some() {
+        std::process::exit(1);
+    }
+}

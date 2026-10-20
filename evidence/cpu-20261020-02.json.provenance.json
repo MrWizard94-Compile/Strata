@@ -1,0 +1,94 @@
+{
+  "recorded_utc": "2026-10-20T12:08:10.9179375Z",
+  "build_profile": "release",
+  "build_performed_by_this_invocation": false,
+  "compiler": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+  "git_commit": null,
+  "working_tree_changes": [
+    "?? .gitignore",
+    "?? AGENTS.md",
+    "?? Cargo.lock",
+    "?? Cargo.toml",
+    "?? README.md",
+    "?? benchmark-cpu.ps1",
+    "?? docs/",
+    "?? evidence/",
+    "?? run.ps1",
+    "?? rust-toolchain.toml",
+    "?? src/"
+  ],
+  "binary_sha256": "8987752CF362DBC4CB780B6DDC31AD8D78C54DCCE60ADC632E009E9B971DA8AB",
+  "source_inputs": [
+    {
+      "path": "Cargo.lock",
+      "sha256": "4297917DDD62B564975B2B993E759BA214BA8AD782F7923CC355CDDA5A5CEB99"
+    },
+    {
+      "path": "Cargo.toml",
+      "sha256": "C154750E238D31DEAD47D8365A9C209238846A8935EB770E8B8311349431739B"
+    },
+    {
+      "path": "rust-toolchain.toml",
+      "sha256": "A95E925E384C95EAB817A1862FDCB3E457028040825EA60DA6AD5E9663AF58BF"
+    },
+    {
+      "path": "src/benchmark.rs",
+      "sha256": "43666FC6046F19A1069524E79BD376CB86FCCD5DF31AD05D62A81AC0062F4FA8"
+    },
+    {
+      "path": "src/main.rs",
+      "sha256": "D581C51CA80F21C18226DF8DC728E0FFEBDA716194CF36DFD756E49B73BCBC63"
+    },
+    {
+      "path": "src/material_export.rs",
+      "sha256": "F37D93B8AF7681BDC23AA37FD0E107FE947F90058B084EE459816C0BE7133312"
+    },
+    {
+      "path": "src/materials.rs",
+      "sha256": "CBCD4606310F04082302F81BB0587160ED5C2DFE980007461C697D5063AB8646"
+    },
+    {
+      "path": "src/player.rs",
+      "sha256": "C9A2030F5EDDEAE704E9F6C6318E1F326215323947D20198EF892039E57BB118"
+    },
+    {
+      "path": "src/renderer.rs",
+      "sha256": "4643CAB4B790EAE2A70499FF880D6A0944ECB26A3D7007B80C8BF3B87B40B6DA"
+    },
+    {
+      "path": "src/save.rs",
+      "sha256": "29EF5C4B917E5735F08AD7342AB278BA1D8C62D51CF9A29EA2D1DED2611636A5"
+    },
+    {
+      "path": "src/shaders/world.wgsl",
+      "sha256": "E283A4DB400F78A1BC04B29380593EEDECB820EB0C0947BE51477840D168AFC6"
+    },
+    {
+      "path": "src/streaming.rs",
+      "sha256": "02E73DE51F72BC72776E6093FF0CFADB729299E27AE379F30793091BDE0DEDBC"
+    },
+    {
+      "path": "src/world.rs",
+      "sha256": "D8533F49D4E71968C3DBE4D5BC9A93BAE208244E88C6874E10FC7F3D67B3E355"
+    }
+  ],
+  "hardware": {
+    "cpu": {
+      "Name": "Intel(R) Core(TM) i7-9700 CPU @ 3.00GHz",
+      "NumberOfCores": 8,
+      "NumberOfLogicalProcessors": 8
+    },
+    "ram_bytes": 51409334272,
+    "os": {
+      "Caption": "Microsoft Windows 11 Home",
+      "Version": "10.0.26300",
+      "BuildNumber": "26300"
+    },
+    "gpu": {
+      "Name": "NVIDIA GeForce GTX 1660 Ti",
+      "DriverVersion": "32.0.16.1742"
+    },
+    "power_scheme": "Power Scheme GUID: 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c  (High performance)"
+  },
+  "limits": "Source inputs are observed after build; SkipBuild requires the caller to establish binary/source agreement. No process isolation, CPU affinity, thermal normalization or GPU/frame-time measurement."
+}

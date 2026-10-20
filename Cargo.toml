@@ -1,0 +1,39 @@
+[package]
+name = "strata"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+publish = false
+description = "An original Rust voxel world, built toward a premium exploration and creation game"
+
+[dependencies]
+bytemuck = { version = "=1.25.2", features = ["derive"] }
+egui = { version = "=0.37.0", features = ["default_fonts"] }
+egui-wgpu = "=0.37.0"
+egui-winit = "=0.37.0"
+glam = "=0.34.1"
+pollster = "=1.0.1"
+png = "=0.18.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+wgpu = "=30.0.1"
+winit = "=0.30.13"
+
+[profile.dev]
+opt-level = 1
+debug = 0
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
