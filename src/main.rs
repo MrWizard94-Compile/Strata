@@ -7,6 +7,7 @@ mod player;
 mod renderer;
 mod save;
 mod streaming;
+mod streaming_trace;
 mod world;
 
 use egui::{Align2, Color32, FontId, Pos2, Rect, RichText, Stroke, Vec2};
@@ -19,7 +20,8 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use streaming::Streaming;
+use streaming::{Streaming, UploadBudget, UploadStats};
+use streaming_trace::{StreamingTrace, TraceFrame, TraceHeader};
 use winit::{
     application::ApplicationHandler,
     dpi::LogicalSize,
@@ -51,6 +53,7 @@ struct Options {
     smoke_seconds: Option<f32>,
     benchmark_cpu: Option<PathBuf>,
     export_materials: Option<PathBuf>,
+    trace_streaming: Option<PathBuf>,
 }
 impl Options {
     fn parse() -> Result<Self, String> {
@@ -60,6 +63,7 @@ impl Options {
             smoke_seconds: None,
             benchmark_cpu: None,
             export_materials: None,
+            trace_streaming: None,
         };
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -86,6 +90,12 @@ impl Options {
                             .ok_or("--export-materials needs a new directory")?,
                     ));
                 }
+                "--trace-streaming" => {
+                    result.trace_streaming = Some(PathBuf::from(
+                        args.next()
+                            .ok_or("--trace-streaming needs a new trace path")?,
+                    ));
+                }
                 "--smoke-seconds" => {
                     let seconds: f32 = args
                         .next()
@@ -99,7 +109,7 @@ impl Options {
                 }
                 "--help" | "-h" => {
                     return Err(
-                        "STRATA: --seed <u64> --save-dir <directory> --smoke-seconds <1..120>\nCPU-only benchmark: --benchmark-cpu <new-report.json> (fixed dataset, no window or saves)\nMaterial PNG export: --export-materials <new-directory>"
+                        "STRATA: --seed <u64> --save-dir <directory> --smoke-seconds <1..120> --trace-streaming <new-trace.jsonl>\nCPU-only benchmark: --benchmark-cpu <new-report.json> (fixed dataset, no window or saves)\nMaterial PNG export: --export-materials <new-directory>"
                             .into(),
                     );
                 }
@@ -108,6 +118,11 @@ impl Options {
         }
         if result.benchmark_cpu.is_some() && result.export_materials.is_some() {
             return Err("Choose either a benchmark or a material export per invocation".into());
+        }
+        if result.trace_streaming.is_some()
+            && (result.benchmark_cpu.is_some() || result.export_materials.is_some())
+        {
+            return Err("Streaming traces require the native client".into());
         }
         Ok(result)
     }
@@ -130,6 +145,8 @@ struct Game {
     world: Arc<World>,
     player: Player,
     streaming: Streaming,
+    streaming_trace: Option<StreamingTrace>,
+    last_upload: UploadStats,
     saves: SaveStore,
     screen: Screen,
     settings_return: Screen,
@@ -205,6 +222,26 @@ impl Game {
             egui_wgpu::RendererOptions::default(),
         );
         let now = Instant::now();
+        let streaming = Streaming::new();
+        let budget = UploadBudget::default();
+        let streaming_trace = options.trace_streaming.as_ref().map(|path| {
+            StreamingTrace::create(path, &TraceHeader {
+                kind: "header",
+                schema_version: 1,
+                package_version: env!("CARGO_PKG_VERSION"),
+                seed: world.seed(),
+                adapter: &renderer.adapter_name,
+                physical_size: [renderer.config.width, renderer.config.height],
+                sample_count: renderer.sample_count(),
+                present_mode: format!("{:?}", renderer.config.present_mode),
+                workers: streaming.workers,
+                upload_max_meshes: budget.max_meshes,
+                upload_max_bytes: budget.max_bytes,
+                upload_max_cpu_ms: budget.max_cpu_time.as_secs_f64() * 1000.0,
+                source_label_external: std::env::var("STRATA_SOURCE_REVISION").ok(),
+                measurement: "CPU-observed admission/upload callback/queue waits and presentation submission intervals. No GPU timestamps, display timing or total RAM/VRAM. Buffered trace I/O is observer overhead. Byte/time budgets permit one oversized/slow callback for progress.",
+            })
+        }).transpose()?;
         Ok(Self {
             window,
             renderer,
@@ -213,7 +250,9 @@ impl Game {
             egui_renderer,
             world: Arc::new(world),
             player,
-            streaming: Streaming::new(),
+            streaming,
+            streaming_trace,
+            last_upload: UploadStats::default(),
             saves,
             screen: Screen::Title,
             settings_return: Screen::Title,
@@ -463,12 +502,23 @@ impl Game {
             self.accumulator = 0.0;
         }
         let camera = self.camera();
+        // UI actions below can change these for the next redraw. Keep each
+        // trace row aligned with this camera and this admission workload.
+        let trace_screen = match self.screen {
+            Screen::Title => "title",
+            Screen::Playing => "playing",
+            Screen::Paused => "paused",
+            Screen::Settings => "settings",
+        };
+        let trace_radius = self.radius;
         for key in self.streaming.update(camera.eye, self.radius, &self.world) {
             self.renderer.remove_chunk(key);
         }
-        for result in self.streaming.take_ready() {
-            self.renderer.upload_chunk(result.key, &result.mesh);
-        }
+        self.last_upload = self
+            .streaming
+            .upload_ready(UploadBudget::default(), |key, mesh| {
+                self.renderer.upload_chunk(key, mesh);
+            });
         if self.has_entered && now.duration_since(self.last_save) > Duration::from_secs(30) {
             self.last_save = now;
             self.save();
@@ -494,6 +544,9 @@ impl Game {
             self.window.set_cursor_visible(false);
         }
         let paint_jobs = context.tessellate(output.shapes, output.pixels_per_point);
+        let mut present_interval_ms = None;
+        let outcome;
+        let trace_eye = camera.eye;
         match self.renderer.render(
             camera,
             &mut self.egui_renderer,
@@ -502,8 +555,11 @@ impl Game {
             output.pixels_per_point,
         ) {
             Ok(PresentOutcome::Presented) => {
+                outcome = "presented";
                 let presented_at = Instant::now();
                 if let Some(previous) = self.last_present.replace(presented_at) {
+                    present_interval_ms =
+                        Some(presented_at.duration_since(previous).as_secs_f64() * 1000.0);
                     self.frame_times
                         .push_back(presented_at.duration_since(previous).as_secs_f32() * 1000.0);
                     if self.frame_times.len() > 240 {
@@ -519,12 +575,43 @@ impl Game {
                     };
             }
             Ok(PresentOutcome::Skipped) => {
+                outcome = "skipped";
                 self.skipped_frames += 1;
                 self.next_redraw = Instant::now() + Duration::from_millis(50);
             }
             Err(error) => {
+                outcome = "failed";
                 self.fatal = Some(format!("Rendering stopped: {error}"));
                 eprintln!("STRATA_RENDER_FAILED {error}");
+                self.should_exit = true;
+            }
+        }
+        if let Some(trace) = &mut self.streaming_trace {
+            let (current_chunks, desired_chunks) = self.streaming.progress();
+            let record = TraceFrame {
+                kind: "frame",
+                elapsed_ms: self.start.elapsed().as_secs_f64() * 1000.0,
+                redraw_interval_ms: f64::from(elapsed) * 1000.0,
+                present_interval_ms,
+                outcome,
+                screen: trace_screen,
+                focused: self.focused,
+                eye: trace_eye,
+                physical_size: [self.renderer.config.width, self.renderer.config.height],
+                radius_chunks: trace_radius,
+                presented: self.frame_count,
+                skipped: self.skipped_frames,
+                current_chunks,
+                desired_chunks,
+                resident_meshes: self.renderer.chunk_count(),
+                resident_mesh_payload_bytes: self.renderer.resident_mesh_payload_bytes(),
+                resident_triangles: self.renderer.triangle_count(),
+                uploads: self.last_upload,
+            };
+            if let Err(error) = trace.frame(&record) {
+                eprintln!("STRATA_TRACE_FAILED {error}");
+                self.streaming_trace = None;
+                self.fatal = Some(format!("Streaming trace failed: {error}"));
                 self.should_exit = true;
             }
         }
@@ -947,7 +1034,19 @@ fn main() {
     };
     if let Err(error) = event_loop.run_app(&mut app) {
         eprintln!("Application event loop failed: {error}");
-        std::process::exit(1);
+        if let Some(game) = &mut app.game
+            && game.has_entered
+        {
+            game.save();
+        }
+        app.error = Some(error.to_string());
+    }
+    if let Some(game) = &mut app.game
+        && let Some(trace) = game.streaming_trace.take()
+        && let Err(error) = trace.finish(app.error.is_none())
+    {
+        eprintln!("STRATA_TRACE_FINISH_FAILED {error}");
+        app.error = Some(error);
     }
     if app.error.is_some() {
         std::process::exit(1);

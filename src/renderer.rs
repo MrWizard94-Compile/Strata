@@ -41,6 +41,7 @@ struct GpuChunk {
     vertices: wgpu::Buffer,
     indices: wgpu::Buffer,
     index_count: u32,
+    payload_bytes: usize,
     min: Vec3,
     max: Vec3,
 }
@@ -231,6 +232,8 @@ impl Renderer {
                 vertices,
                 indices,
                 index_count: mesh.indices.len() as u32,
+                payload_bytes: std::mem::size_of_val(mesh.vertices.as_slice())
+                    + std::mem::size_of_val(mesh.indices.as_slice()),
                 min,
                 max,
             },
@@ -243,6 +246,16 @@ impl Renderer {
 
     pub fn chunk_count(&self) -> usize {
         self.chunks.len()
+    }
+
+    pub fn sample_count(&self) -> u32 {
+        self.sample_count
+    }
+
+    /// Requested vertex/index payload, excluding allocation padding, retained
+    /// in-flight buffers, staging resources, textures and other device memory.
+    pub fn resident_mesh_payload_bytes(&self) -> usize {
+        self.chunks.values().map(|chunk| chunk.payload_bytes).sum()
     }
 
     pub fn triangle_count(&self) -> usize {

@@ -3,6 +3,8 @@ param(
     [ValidateScript({ -not $_.Contains('"') })]
     [string]$SaveDirectory = 'saves/emerald-reach',
     [switch]$SkipBuild,
+    [ValidateScript({ -not $_.Contains('"') })]
+    [string]$TraceStreaming,
     [ValidateRange(1, 120)]
     [int]$SmokeSeconds
 )
@@ -30,6 +32,14 @@ try {
     $strataArguments = @('--seed', $Seed.ToString(), '--save-dir', ('"' + $strataSavePath.Replace('\', '/') + '"'))
     if ($PSBoundParameters.ContainsKey('SmokeSeconds')) {
         $strataArguments += @('--smoke-seconds', $SmokeSeconds.ToString())
+    }
+    if ($PSBoundParameters.ContainsKey('TraceStreaming')) {
+        $strataTracePath = if ([IO.Path]::IsPathRooted($TraceStreaming)) {
+            [IO.Path]::GetFullPath($TraceStreaming)
+        } else {
+            [IO.Path]::GetFullPath((Join-Path $PSScriptRoot $TraceStreaming))
+        }
+        $strataArguments += @('--trace-streaming', ('"' + $strataTracePath.Replace('\', '/') + '"'))
     }
     Write-Host "STRATA logs: $strataStdout"
     # The native game is intentionally visible. Redirected handles also preserve

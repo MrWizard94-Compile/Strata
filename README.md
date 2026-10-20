@@ -2,7 +2,9 @@
 
 An original Rust voxel engine and game in active development. **STRATA is a working title.** The full objective is a premium engine-led game spanning a living world, engineering/automation and exploration, eventually suitable for a credible Microsoft pitch. This initial build is not that finished product.
 
-The authoritative local project is `C:\WPAI\Software\Rust Based Voxel`, an independent Git repository. Its verified `origin` is [MrWizard94-Compile/Strata](https://github.com/MrWizard94-Compile/Strata), currently public and empty. Nothing has been pushed or published.
+The authoritative local project is `C:\WPAI\Software\Rust Based Voxel`, an independent Git repository. Its verified `origin` is [MrWizard94-Compile/Strata](https://github.com/MrWizard94-Compile/Strata), a public repository. The director authorized committing and pushing source checkpoints; the development branch contains ongoing engineering work, not a production release.
+
+![Original 32x32 material contact sheet](docs/assets/materials-32-contact-sheet.png)
 
 ## Build and play
 
@@ -65,3 +67,7 @@ Run `./benchmark-cpu.ps1` for a release CPU meshing report plus source/binary ha
 - [Game pillars and pitch acceptance criteria](docs/PRODUCT-BRIEF.md)
 
 Source is private/unpublished project work. No general redistribution license has been selected. Third-party crates retain their own licenses; dependency license/advisory review is a separate release gate.
+
+## Streaming diagnostics and CI
+
+`./trace-streaming.ps1 -TracePath evidence/new-trace.jsonl -SmokeSeconds 30` builds and records a native run with exact source/binary/hardware provenance. It starts on the title scene. See [STREAMING.md](docs/STREAMING.md) for admission limits, reproducible stress fixtures, observed costs and measurement limits. The Windows source-check workflow runs formatting, tests, strict linting, a locked release build and launcher syntax checks; it does not establish native GPU or interactive acceptance.

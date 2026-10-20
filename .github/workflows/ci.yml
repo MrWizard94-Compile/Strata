@@ -1,0 +1,49 @@
+name: Windows source checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-source-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned toolchain
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal --component rustfmt --component clippy
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustc --version
+          cargo --version
+      - name: Formatting
+        run: cargo fmt --check
+      - name: Source regression suite
+        run: cargo test --locked
+      - name: Strict linting
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Locked release build
+        run: cargo build --release --locked
+      - name: PowerShell entry point syntax
+        run: |
+          foreach ($script in @('run.ps1', 'benchmark-cpu.ps1', 'trace-streaming.ps1')) {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $PWD $script), [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count) { $errors; exit 1 }
+          }
+      # The explicitly ignored native GPU test and real client interaction run
+      # on the acceptance machine; CI success does not prove either boundary.
