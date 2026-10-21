@@ -20,7 +20,7 @@ Or run `./run.ps1` from PowerShell. The script builds when necessary, sets the w
 
 The client supports `--seed <u64>` for a new world and `--save-dir <path>` for a separate world. An existing world retains its stored seed. `--smoke-seconds <1..120>` launches the real native client and exits after the stated duration for graphics acceptance; this does not automate gameplay acceptance.
 
-One full day lasts 20 real minutes and advances only while playing. Pausing the game pauses the clock. The time is stored in the world save; a generator 2 save with no time opens at morning. Generator 1 worlds are rejected and left unchanged.
+One full day lasts 20 real minutes and advances only while playing. Pausing the game pauses the clock. The time is stored in the world save. A generator 3 file with no time opens at 08:00. Generator 1 and generator 2 worlds are rejected and left unchanged.
 
 | Control | Action |
 |---|---|
