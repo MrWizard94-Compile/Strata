@@ -1,6 +1,20 @@
 # Current checkpoint
 
-2026-10-20. **Goal active.** STRATA has a native editable-world foundation, original 32×32 materials and reproducible CPU meshing evidence. The requested production and studio grade survival/combat/building/exploration game and Microsoft pitch remain incomplete.
+2026-10-21. **Goal active.** STRATA has a native editable-world foundation, original 32×32 materials and reproducible CPU meshing evidence. The requested production and studio grade survival/combat/building/exploration game and Microsoft pitch remain incomplete. The 2026-10-20 counts below remain that checkpoint. Day/night evidence is the next section.
+
+## Day/night cycle
+
+Playing advances a 20-minute day on the fixed 60 Hz simulation tick. The title, pause menu, settings, and focus loss all go through the same step function and freeze that clock. Schema 1 generator 2 stores `time_of_day` in `[0, 1)` (midnight is 0). A generator 2 save without the field loads at 08:00. Generator 1 files are rejected and left untouched. Non-finite values, negatives, and exactly 1.0 are rejected and the file is kept. Sun direction, sky, fog, ambient, and sun color are appended camera uniforms. Night clouds and water use the same linear lighting as the terrain. The 44-byte vertex layout is unchanged.
+
+Linux verification for this change, Rust 1.97.1:
+
+- `cargo fmt --check`: passed.
+- `cargo test --locked`: **80 passed, 0 failed, 1 ignored** after rebasing onto generator 2 (`8af9548`). The generator 2 checkpoint below remains 65.
+- `cargo test --locked native_gpu_validates_all_world_shader_pipelines -- --ignored --nocapture`: **passed** on Mesa lavapipe (software Vulkan from mesa-vulkan-drivers 25.2.8). That is shader-pipeline and material-upload validation, not a GTX 1660 Ti and not a windowed playthrough.
+- `cargo clippy --locked --all-targets -- -D warnings`: passed.
+- `cargo build --release --locked`: passed.
+
+Unverified: interactive dawn, noon, dusk, and night appearance, mouse play, and the Windows / NVIDIA GTX 1660 Ti acceptance machine.
 
 The canonical local project is `C:\WPAI\Software\Rust Based Voxel`, an independent Git root. `origin` now points to `https://github.com/MrWizard94-Compile/Strata.git`; fetch succeeded. The repository is public. The director subsequently authorized committing and pushing all project changes. Source checkpoints and a Windows CI workflow are being delivered on development; this is not a production release.
 
