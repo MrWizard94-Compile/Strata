@@ -29,6 +29,13 @@ fn graphics_device_descriptor() -> wgpu::DeviceDescriptor<'static> {
     }
 }
 
+/// Startup refusal when the selected adapter cannot supply chunk-origin immediates.
+fn missing_immediates_message(adapter_name: &str) -> String {
+    format!(
+        "STRATA cannot start on {adapter_name}. Graphics device unavailable; save files left unchanged. The terrain renderer needs 16-byte per-draw chunk origins, which this adapter does not provide. On a GTX 1660 Ti, select Vulkan or Direct3D 12."
+    )
+}
+
 pub enum PresentOutcome {
     Presented,
     Skipped,
@@ -144,15 +151,16 @@ impl Renderer {
         if !adapter.features().contains(wgpu::Features::IMMEDIATES)
             || adapter.limits().max_immediate_size < CHUNK_ORIGIN_IMMEDIATE_BYTES
         {
-            return Err(
-                "This graphics adapter cannot provide 16-byte per-draw chunk origins. STRATA requires Vulkan, D3D12, or Metal."
-                    .into(),
-            );
+            return Err(missing_immediates_message(&adapter_name));
         }
         let (device, queue) = adapter
             .request_device(&graphics_device_descriptor())
             .await
-            .map_err(|error| format!("Could not initialize the graphics device: {error}"))?;
+            .map_err(|error| {
+                format!(
+                    "STRATA cannot start on {adapter_name}. Graphics device unavailable; save files left unchanged. The graphics device could not be created: {error}"
+                )
+            })?;
         let mut config = surface
             .get_default_config(&adapter, size.width.max(1), size.height.max(1))
             .ok_or("The graphics adapter cannot present to this window")?;
@@ -265,8 +273,44 @@ impl Renderer {
         });
     }
 
-    /// Copy one budgeted slice. The chunk stays invisible until `complete`,
-    /// replacing any previous drawable mesh only at that point.
+    /// Reserve the full destination buffer before a timed copy. The previous
+    /// drawable mesh stays in `chunks` until the last slice completes.
+    pub fn allocate_upload(&mut self, key: ChunkKey, revision: u64, mesh: &Mesh) {
+        if mesh.payload_bytes() == 0 {
+            return;
+        }
+        let ready = self.inflight.as_ref().is_some_and(|inflight| {
+            inflight.key == key
+                && inflight.revision == revision
+                && inflight.total_bytes == mesh.payload_bytes()
+        });
+        if ready {
+            return;
+        }
+        self.begin_inflight(key, revision, mesh);
+    }
+
+    fn begin_inflight(&mut self, key: ChunkKey, revision: u64, mesh: &Mesh) {
+        let total = mesh.payload_bytes();
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Chunk quad instances"),
+            size: total as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.inflight = Some(InflightMesh {
+            key,
+            revision,
+            buffer,
+            total_bytes: total,
+            written: 0,
+            origin: mesh.origin,
+        });
+    }
+
+    /// Copy one budgeted slice. Production allocates the buffer first, so this
+    /// copy does not create it. The chunk stays invisible until `complete`,
+    /// and any previous drawable mesh remains until that replacement finishes.
     pub fn upload_slice(&mut self, slice: streaming::UploadSlice<'_>) {
         if slice.mesh.quads.is_empty() {
             if slice.complete {
@@ -291,20 +335,7 @@ impl Renderer {
                 && inflight.written == slice.byte_offset
         });
         if slice.byte_offset == 0 && !matches {
-            let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Chunk quad instances"),
-                size: total as u64,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            self.inflight = Some(InflightMesh {
-                key: slice.key,
-                revision: slice.revision,
-                buffer,
-                total_bytes: total,
-                written: 0,
-                origin: slice.mesh.origin,
-            });
+            self.begin_inflight(slice.key, slice.revision, slice.mesh);
         } else if !matches {
             self.cancel_upload(slice.key);
             return;
@@ -923,6 +954,15 @@ mod tests {
         assert_eq!(layout.attributes[1].shader_location, 1);
         assert_eq!(layout.attributes[1].format, wgpu::VertexFormat::Uint32);
         assert_eq!(CHUNK_ORIGIN_IMMEDIATE_BYTES, 16);
+    }
+
+    #[test]
+    fn missing_immediates_reports_a_startup_refusal() {
+        let message = missing_immediates_message("Example GPU / Vulkan");
+        assert!(message.contains("STRATA cannot start on Example GPU / Vulkan"));
+        assert!(message.contains("Graphics device unavailable; save files left unchanged"));
+        assert!(message.contains("16-byte per-draw chunk origins"));
+        assert!(message.contains("Vulkan or Direct3D 12"));
     }
 
     #[test]

@@ -30,6 +30,17 @@ pub struct UploadSlice<'a> {
     pub complete: bool,
 }
 
+/// One admission step. `Reserve` allocates the destination before the timed
+/// `Write`. The previous drawable mesh stays visible until the final write.
+pub enum UploadAction<'a> {
+    Reserve {
+        key: ChunkKey,
+        revision: u64,
+        mesh: &'a Mesh,
+    },
+    Write(UploadSlice<'a>),
+}
+
 struct CompletedMesh {
     key: ChunkKey,
     mesh: Mesh,
@@ -264,22 +275,42 @@ impl Streaming {
     /// Apply valid results directly so the budget includes the real renderer
     /// callback. One result may wait outside the bounded channel. A mesh that
     /// does not fit is retained in `partial` and resumed before any new result.
-    pub fn upload_ready(
+    /// A non-empty partial upload emits `UploadAction::Reserve` once, before
+    /// the timed `Write`.
+    pub fn upload_ready_prepared(
         &mut self,
         budget: UploadBudget,
-        upload: impl FnMut(UploadSlice<'_>),
+        step: impl FnMut(UploadAction<'_>),
     ) -> UploadStats {
-        self.upload_ready_with_clock(budget, upload, Instant::now)
+        self.admit(budget, step, Instant::now)
     }
 
     pub fn take_cancelled_uploads(&mut self) -> Vec<ChunkKey> {
         std::mem::take(&mut self.cancelled)
     }
 
+    #[cfg(test)]
     fn upload_ready_with_clock(
         &mut self,
         budget: UploadBudget,
         mut upload: impl FnMut(UploadSlice<'_>),
+        now: impl FnMut() -> Instant,
+    ) -> UploadStats {
+        self.admit(
+            budget,
+            |action| {
+                if let UploadAction::Write(slice) = action {
+                    upload(slice);
+                }
+            },
+            now,
+        )
+    }
+
+    fn admit(
+        &mut self,
+        budget: UploadBudget,
+        mut step: impl FnMut(UploadAction<'_>),
         mut now: impl FnMut() -> Instant,
     ) -> UploadStats {
         let started = now();
@@ -335,7 +366,7 @@ impl Streaming {
                             complete: true,
                             callback_started,
                         },
-                        &mut upload,
+                        &mut |slice| step(UploadAction::Write(slice)),
                         &mut now,
                         &mut callback_time,
                         &mut stats,
@@ -354,6 +385,14 @@ impl Streaming {
                     completed: result,
                     uploaded_bytes: 0,
                 });
+                if let Some(partial) = self.partial.as_ref() {
+                    let completed = &partial.completed;
+                    step(UploadAction::Reserve {
+                        key: completed.key,
+                        revision: completed.revision,
+                        mesh: &completed.mesh,
+                    });
+                }
             }
             let (offset, total, queue_wait, ready_at, milliseconds) = {
                 let Some(partial) = self.partial.as_ref() else {
@@ -385,7 +424,7 @@ impl Streaming {
                     complete,
                     callback_started,
                 },
-                &mut upload,
+                &mut |slice| step(UploadAction::Write(slice)),
                 &mut now,
                 &mut callback_time,
                 &mut stats,
@@ -1037,6 +1076,54 @@ mod tests {
         assert!(!stats.deferred);
         assert!(!streaming.pending.contains(&keys[1]));
         assert!(!streaming.loaded.contains(&keys[1]));
+    }
+
+    #[test]
+    fn destination_allocation_is_outside_the_timed_slice_and_can_defer_the_copy() {
+        let (mut streaming, _jobs, results) = harness(8, 8);
+        let key = (5, 0, 0);
+        streaming.desired.push(key);
+        streaming.pending.insert(key);
+        results.send(sized_result(key, 0, 2)).unwrap();
+        let base = Instant::now();
+        let elapsed = Cell::new(Duration::ZERO);
+        let allocations = Cell::new(0u32);
+        let budget = UploadBudget {
+            max_bytes: std::mem::size_of::<PackedQuad>(),
+            ..UploadBudget::default()
+        };
+        let blocked = streaming.admit(
+            budget,
+            |action| match action {
+                UploadAction::Reserve { .. } => {
+                    allocations.set(allocations.get() + 1);
+                    elapsed.set(elapsed.get() + Duration::from_millis(3));
+                }
+                UploadAction::Write(_) => panic!("the copy must wait until a later frame"),
+            },
+            || base + elapsed.get(),
+        );
+        assert_eq!(allocations.get(), 1);
+        assert_eq!(blocked.meshes, 0);
+        assert_eq!(blocked.upload_ms, 0.0);
+        assert!(blocked.partial);
+        assert!(streaming.pending.contains(&key));
+        assert!(!streaming.loaded.contains(&key));
+
+        let mut copies = 0;
+        let copied = streaming.admit(
+            budget,
+            |action| match action {
+                UploadAction::Reserve { .. } => panic!("the destination is allocated once"),
+                UploadAction::Write(_) => copies += 1,
+            },
+            || base + elapsed.get(),
+        );
+        assert_eq!(copies, 1);
+        assert_eq!(copied.meshes, 1);
+        assert_eq!(copied.completed, 0);
+        assert!(copied.partial);
+        assert!(!streaming.loaded.contains(&key));
     }
 
     #[test]

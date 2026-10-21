@@ -2207,6 +2207,151 @@ mod tests {
         }
         assert_eq!(seen, 84);
         assert_eq!(std::mem::size_of::<PackedQuad>(), 8);
+        assert_eq!(lighting_index(0, 7, 2), 84);
+        assert!(
+            lighting_index(0, 7, 2) >= LIGHTING_TABLE.len() * 4,
+            "variation 7 is past the 84-entry table"
+        );
+    }
+
+    fn assert_quad_matches_wgsl_masks(quad: DecodedQuad) {
+        let packed = PackedQuad::pack(quad);
+        let word0 = packed.word0;
+        let word1 = packed.word1;
+        assert_eq!(word0 & 63, quad.local[0], "x mask");
+        assert_eq!((word0 >> 6) & 63, quad.local[1], "y mask");
+        assert_eq!((word0 >> 12) & 63, quad.local[2], "z mask");
+        assert_eq!(((word0 >> 18) & 31) + 1, quad.width, "width mask");
+        assert_eq!(((word0 >> 23) & 31) + 1, quad.height, "height mask");
+        assert_eq!((word0 >> 28) & 3, quad.axis, "axis mask");
+        assert_eq!((word0 >> 30) & 1 == 1, quad.positive, "positive mask");
+        assert_eq!(word0 >> 31 == 1, quad.diagonal_high, "diagonal mask");
+        assert_eq!(word1 & 3, u32::from(quad.ao[0]), "ao0 mask");
+        assert_eq!((word1 >> 2) & 3, u32::from(quad.ao[1]), "ao1 mask");
+        assert_eq!((word1 >> 4) & 3, u32::from(quad.ao[2]), "ao2 mask");
+        assert_eq!((word1 >> 6) & 3, u32::from(quad.ao[3]), "ao3 mask");
+        assert_eq!((word1 >> 8) & 31, quad.layer, "layer mask");
+        assert_eq!(
+            (word1 >> 13) & 7,
+            u32::from(quad.variation),
+            "variation mask"
+        );
+        assert_eq!((word1 >> 16) & 1 == 1, quad.water, "water mask");
+        assert_eq!(packed.decode(), quad);
+    }
+
+    #[test]
+    fn every_packed_quad_field_combination_round_trips_and_matches_wgsl_masks() {
+        let shader = include_str!("shaders/world.wgsl");
+        for needle in [
+            "input.word0 & 63u",
+            "(input.word0 >> 6u) & 63u",
+            "(input.word0 >> 12u) & 63u",
+            "((input.word0 >> 18u) & 31u) + 1u",
+            "((input.word0 >> 23u) & 31u) + 1u",
+            "(input.word0 >> 28u) & 3u",
+            "((input.word0 >> 30u) & 1u) == 1u",
+            "(input.word0 >> 31u) == 1u",
+            "(input.word1 >> (corner * 2u)) & 3u",
+            "(input.word1 >> 8u) & 31u",
+            "(input.word1 >> 13u) & 7u",
+            "(input.word1 >> 16u) & 1u",
+        ] {
+            assert!(shader.contains(needle), "WGSL unpack missing {needle}");
+        }
+        let mut cases = 0u32;
+        for width in 1..=32u32 {
+            for height in 1..=32u32 {
+                for axis in 0..3u32 {
+                    for positive in [false, true] {
+                        for diagonal_high in [false, true] {
+                            for variation in 0..7u8 {
+                                for water in [false, true] {
+                                    for layer in 0..crate::materials::LAYER_COUNT {
+                                        let shift = width + height + axis + u32::from(variation);
+                                        assert_quad_matches_wgsl_masks(DecodedQuad {
+                                            local: [
+                                                shift % 33,
+                                                (shift + 11) % 33,
+                                                (shift + 22) % 33,
+                                            ],
+                                            width,
+                                            height,
+                                            axis,
+                                            positive,
+                                            diagonal_high,
+                                            ao: [
+                                                (shift as u8) & 3,
+                                                ((shift + 1) as u8) & 3,
+                                                ((shift + 2) as u8) & 3,
+                                                ((shift + 3) as u8) & 3,
+                                            ],
+                                            layer,
+                                            variation,
+                                            water,
+                                        });
+                                        cases += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for ao0 in 0..4u8 {
+            for ao1 in 0..4u8 {
+                for ao2 in 0..4u8 {
+                    for ao3 in 0..4u8 {
+                        for layer in 0..crate::materials::LAYER_COUNT {
+                            for variation in 0..7u8 {
+                                for water in [false, true] {
+                                    for axis in 0..3u32 {
+                                        for positive in [false, true] {
+                                            for diagonal_high in [false, true] {
+                                                assert_quad_matches_wgsl_masks(DecodedQuad {
+                                                    local: [32, 0, 17],
+                                                    width: 32,
+                                                    height: 1,
+                                                    axis,
+                                                    positive,
+                                                    diagonal_high,
+                                                    ao: [ao0, ao1, ao2, ao3],
+                                                    layer,
+                                                    variation,
+                                                    water,
+                                                });
+                                                cases += 1;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for x in 0..=32u32 {
+            for y in 0..=32u32 {
+                for z in 0..=32u32 {
+                    assert_quad_matches_wgsl_masks(DecodedQuad {
+                        local: [x, y, z],
+                        width: 32,
+                        height: 32,
+                        axis: 2,
+                        positive: true,
+                        diagonal_high: false,
+                        ao: [0, 1, 2, 3],
+                        layer: 16,
+                        variation: 6,
+                        water: false,
+                    });
+                    cases += 1;
+                }
+            }
+        }
+        assert_eq!(cases, 2_924_544 + 731_136 + 35_937);
     }
 
     #[test]
