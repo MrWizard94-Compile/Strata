@@ -33,8 +33,17 @@ pub struct Snapshot {
 
 impl Snapshot {
     fn validate(&self) -> Result<(), String> {
+        if self.generator < GENERATOR_VERSION {
+            return Err(
+                "This world was made with an older version of the world generator and can't be opened in this version. Create a new world to play. Your old world files were left as they are."
+                    .into(),
+            );
+        }
         if self.schema != 1 || self.generator != GENERATOR_VERSION {
-            return Err("This world uses an unsupported save or terrain version; its files have been preserved.".into());
+            return Err(
+                "This world was saved by a different version of STRATA and can't be opened. Create a new world to play. Your old world files were left as they are."
+                    .into(),
+            );
         }
         if self.edits.len() > MAX_EDITS {
             return Err(format!(
@@ -287,8 +296,15 @@ mod tests {
         let Err(error) = SaveStore::open(&path) else {
             panic!("generator 1 save was accepted");
         };
-        assert!(error.contains("preserved"), "{error}");
+        assert!(
+            error.contains("older version of the world generator"),
+            "{error}"
+        );
+        assert!(error.contains("can't be opened"), "{error}");
+        assert!(error.contains("Create a new world"), "{error}");
         assert_eq!(fs::read(path.join("world-a.json")).unwrap(), body);
+        assert!(!path.join("world-a.json.pending").exists());
+        assert!(!path.join("world-b.json").exists());
         fs::remove_dir_all(path).unwrap();
     }
 

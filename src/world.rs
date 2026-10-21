@@ -338,9 +338,7 @@ impl World {
         let mut height = ocean_h * ocean + land_h * land;
         let beach_h = sea + 1.0 + detail * 0.45;
         height = lerp(height, beach_h, shore);
-        let height = height
-            .round()
-            .clamp(f64::from(MIN_SURFACE), f64::from(MAX_SURFACE)) as i32;
+        let height = round_half_away(height).clamp(MIN_SURFACE, MAX_SURFACE);
 
         let biome = if height < SEA_LEVEL {
             Biome::Ocean
@@ -931,10 +929,10 @@ fn smoothstep(low: f64, high: f64, value: f64) -> f64 {
 }
 
 fn noise2(seed: u64, x: f64, z: f64) -> f64 {
-    let ix = x.floor() as i32;
-    let iz = z.floor() as i32;
-    let fx = fade(x - x.floor());
-    let fz = fade(z - z.floor());
+    let (ix, fx) = floor_parts(x);
+    let (iz, fz) = floor_parts(z);
+    let fx = fade(fx);
+    let fz = fade(fz);
     lerp(
         lerp(
             random_signed(seed, ix, 0, iz),
@@ -951,12 +949,12 @@ fn noise2(seed: u64, x: f64, z: f64) -> f64 {
 }
 
 fn noise3(seed: u64, x: f64, y: f64, z: f64) -> f64 {
-    let ix = x.floor() as i32;
-    let iy = y.floor() as i32;
-    let iz = z.floor() as i32;
-    let fx = fade(x - x.floor());
-    let fy = fade(y - y.floor());
-    let fz = fade(z - z.floor());
+    let (ix, fx) = floor_parts(x);
+    let (iy, fy) = floor_parts(y);
+    let (iz, fz) = floor_parts(z);
+    let fx = fade(fx);
+    let fy = fade(fy);
+    let fz = fade(fz);
     let mut planes = [0.0; 2];
     for (index, plane) in planes.iter_mut().enumerate() {
         let z = iz + index as i32;
@@ -981,12 +979,42 @@ fn fbm2(seed: u64, mut x: f64, mut z: f64, octaves: u32) -> f64 {
     let mut result = 0.0;
     let mut amplitude = 0.57;
     for octave in 0..octaves {
+        // Separate multiply and add. Rust does not contract these into FMA.
         result += noise2(seed.wrapping_add(u64::from(octave) * 7919), x, z) * amplitude;
         amplitude *= 0.5;
         x *= 2.03;
         z *= 2.03;
     }
     result
+}
+
+/// Truncate toward zero. `f64 as i32` saturates outside the `i32` range.
+fn trunc_to_i32(value: f64) -> i32 {
+    value as i32
+}
+
+/// Floor without libm. Finite inputs that fit in `i32` match `f64::floor` cast to `i32`.
+fn floor_to_i32(value: f64) -> i32 {
+    let truncated = trunc_to_i32(value);
+    if value >= 0.0 || value == f64::from(truncated) {
+        truncated
+    } else {
+        truncated.saturating_sub(1)
+    }
+}
+
+fn floor_parts(value: f64) -> (i32, f64) {
+    let index = floor_to_i32(value);
+    (index, value - f64::from(index))
+}
+
+/// Round half away from zero without libm. Matches `f64::round` for finite values in `i32`.
+fn round_half_away(value: f64) -> i32 {
+    if value >= 0.0 {
+        trunc_to_i32(value + 0.5)
+    } else {
+        trunc_to_i32(value - 0.5)
+    }
 }
 
 #[cfg(test)]
@@ -1011,6 +1039,136 @@ mod tests {
                 (b - a).cross(c - a).length() * 0.5
             })
             .sum()
+    }
+
+    #[test]
+    fn floor_and_round_match_half_away_without_libm() {
+        for (value, floor, rounded) in [
+            (0.0, 0, 0),
+            (0.5, 0, 1),
+            (1.2, 1, 1),
+            (1.5, 1, 2),
+            (-0.2, -1, 0),
+            (-0.5, -1, -1),
+            (-1.5, -2, -2),
+            (-2.0, -2, -2),
+            (11.6, 11, 12),
+        ] {
+            assert_eq!(floor_to_i32(value), floor, "floor {value}");
+            assert_eq!(round_half_away(value), rounded, "round {value}");
+            let (index, fraction) = floor_parts(value);
+            assert_eq!(index, floor);
+            assert!((0.0..1.0).contains(&fraction), "{value} -> {fraction}");
+        }
+    }
+
+    /// Seed `20261021`. Chunk bytes are three little-endian `i32`s followed by
+    /// 32³ block ids in `generate_chunk` order. The digest is FNV-1a 64
+    /// (offset `0xCBF29CE484222325`, prime `0x100000001B3`), not `DefaultHasher`.
+    ///
+    /// Replace these digests only after an intentional, reviewed generator
+    /// change, using the actual values printed by
+    /// `golden_chunks_match_platform_independent_hashes`. A mismatch on
+    /// unchanged generator code is cross-platform drift; do not refresh the
+    /// table to hide it.
+    const GOLDEN_SEED: u64 = 20261021;
+    const GOLDEN_CHUNK_HASHES: &[((i32, i32, i32), u64, &str)] = &[
+        ((-1, 0, -8), 0xbdec_8b26_2b9a_9845, "ocean"),
+        ((20, 1, -25), 0x26f9_ca54_ab95_53c9, "desert surface"),
+        ((-2, 1, -2), 0xc802_ddd2_84ce_1d27, "forest canopy"),
+        ((-5, 0, -6), 0xf385_23ea_2448_a242, "caves and ores"),
+        (
+            (-25, 0, -27),
+            0x7ec8_79e1_b84f_eb60,
+            "far negative caves and ores",
+        ),
+    ];
+
+    #[test]
+    fn golden_chunks_match_platform_independent_hashes() {
+        let world = World::new(GOLDEN_SEED);
+        let mut report = String::new();
+        let mut mismatched = false;
+        for &(key, expected, label) in GOLDEN_CHUNK_HASHES {
+            let blocks = world
+                .generate_chunk(key)
+                .unwrap_or_else(|| panic!("chunk {key:?} ({label}) did not generate"));
+            assert_role(&blocks, key, label);
+            let actual = fnv1a64(&chunk_canonical_bytes(key, &blocks));
+            let mark = if actual == expected { "ok" } else { "MISMATCH" };
+            mismatched |= actual != expected;
+            report.push_str(&format!(
+                "  ({:>3},{:>2},{:>3}) {label:<28} expected {expected:016x} actual {actual:016x} {mark}\n",
+                key.0, key.1, key.2
+            ));
+        }
+        assert!(
+            !mismatched,
+            "World generation for seed {GOLDEN_SEED} no longer matches the golden chunk hashes.\n\
+             A mismatch means the world generator changed, or the same seed is not deterministic \
+             across platforms (noise or floating-point drift).\n\
+             If the generator change is intentional and reviewed, replace GOLDEN_CHUNK_HASHES in \
+             src/world.rs with the actual digests below. Do not update them merely to silence a \
+             cross-platform failure.\n{report}"
+        );
+    }
+
+    fn assert_role(blocks: &[Block], key: ChunkKey, label: &str) {
+        let count = |block: Block| {
+            blocks
+                .iter()
+                .filter(|candidate| **candidate == block)
+                .count()
+        };
+        match label {
+            "ocean" => {
+                assert!(count(Block::Water) > 1000, "{key:?} should be ocean");
+                assert_eq!(count(Block::Grass), 0, "{key:?} ocean cover");
+            }
+            "desert surface" => {
+                assert!(count(Block::Sand) > 1000, "{key:?} should be desert");
+                assert_eq!(count(Block::Grass), 0, "{key:?} desert cover");
+                assert_eq!(count(Block::Wood), 0, "{key:?} desert trees");
+            }
+            "forest canopy" => {
+                assert!(count(Block::Wood) > 0, "{key:?} should contain a trunk");
+                assert!(count(Block::Leaves) > 0, "{key:?} should contain leaves");
+            }
+            "caves and ores" | "far negative caves and ores" => {
+                assert!(
+                    key.0 < 0 && key.2 < 0,
+                    "{label} should use negative coordinates"
+                );
+                assert!(count(Block::CoalOre) > 0, "{key:?} coal");
+                assert!(count(Block::IronOre) > 0, "{key:?} iron");
+                assert!(count(Block::GoldOre) > 0, "{key:?} gold");
+                assert!(count(Block::DiamondOre) > 0, "{key:?} diamond");
+                let deep_air = blocks.iter().enumerate().any(|(index, block)| {
+                    let y = (index / (CHUNK_SIZE * CHUNK_SIZE) as usize) as i32;
+                    y <= 12 && *block == Block::Air
+                });
+                assert!(deep_air, "{key:?} should carve cave air at y <= 12");
+            }
+            _ => panic!("unknown golden role {label}"),
+        }
+    }
+
+    fn fnv1a64(bytes: &[u8]) -> u64 {
+        let mut hash = 0xCBF2_9CE4_8422_2325_u64;
+        for &byte in bytes {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
+        }
+        hash
+    }
+
+    fn chunk_canonical_bytes(key: ChunkKey, blocks: &[Block]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(12 + blocks.len());
+        for coord in [key.0, key.1, key.2] {
+            bytes.extend_from_slice(&coord.to_le_bytes());
+        }
+        bytes.extend(blocks.iter().map(|block| *block as u8));
+        bytes
     }
 
     #[test]
