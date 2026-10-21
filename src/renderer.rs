@@ -6,6 +6,7 @@ use wgpu::util::DeviceExt;
 use winit::window::Window;
 
 use crate::{
+    daylight::Daylight,
     materials,
     world::{ChunkKey, Mesh, Vertex},
 };
@@ -25,6 +26,7 @@ pub struct RenderCamera {
     pub time: f32,
     pub fog_distance: f32,
     pub selected: Option<[i32; 3]>,
+    pub daylight: Daylight,
 }
 
 #[repr(C)]
@@ -35,6 +37,14 @@ struct CameraUniform {
     eye_time: [f32; 4],
     sun_fog: [f32; 4],
     selected: [f32; 4],
+    /// rgb horizon (linear), w = sun glow.
+    sky_horizon: [f32; 4],
+    /// rgb zenith (linear), w = time of day.
+    sky_zenith: [f32; 4],
+    fog_color: [f32; 4],
+    ambient_ground: [f32; 4],
+    ambient_sky: [f32; 4],
+    sun_color: [f32; 4],
 }
 
 struct GpuChunk {
@@ -332,7 +342,7 @@ impl Renderer {
             camera.fog_distance.max(64.0) * 1.4,
         );
         let view_projection = projection * view;
-        let sun = Vec3::new(-0.38, 0.64, -0.64).normalize();
+        let daylight = camera.daylight;
         let selected = camera
             .selected
             .map(|p| [p[0] as f32, p[1] as f32, p[2] as f32, 1.0])
@@ -341,8 +351,19 @@ impl Renderer {
             view_projection: view_projection.to_cols_array_2d(),
             inverse_view_projection: view_projection.inverse().to_cols_array_2d(),
             eye_time: [eye.x, eye.y, eye.z, camera.time],
-            sun_fog: [sun.x, sun.y, sun.z, camera.fog_distance],
+            sun_fog: [
+                daylight.sun_direction[0],
+                daylight.sun_direction[1],
+                daylight.sun_direction[2],
+                camera.fog_distance,
+            ],
             selected,
+            sky_horizon: color_uniform(daylight.sky_horizon, daylight.sun_glow),
+            sky_zenith: color_uniform(daylight.sky_zenith, daylight.time_of_day),
+            fog_color: color_uniform(daylight.fog_color, 0.0),
+            ambient_ground: color_uniform(daylight.ambient_ground, 0.0),
+            ambient_sky: color_uniform(daylight.ambient_sky, 0.0),
+            sun_color: color_uniform(daylight.sun_color, 0.0),
         };
         self.queue
             .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uniform));
@@ -518,6 +539,10 @@ fn create_attachment_view(
         .create_view(&wgpu::TextureViewDescriptor::default())
 }
 
+fn color_uniform(rgb: [f32; 3], w: f32) -> [f32; 4] {
+    [rgb[0], rgb[1], rgb[2], w]
+}
+
 fn create_pipelines(
     device: &wgpu::Device,
     format: wgpu::TextureFormat,
@@ -685,8 +710,48 @@ mod tests {
     }
 
     #[test]
+    fn world_shader_appends_daylight_uniforms_without_reordering_the_camera_prefix() {
+        let shader = include_str!("shaders/world.wgsl");
+        let start = shader.find("struct Camera {").expect("camera uniform");
+        let end = shader[start..].find("};").expect("camera uniform end");
+        let fields: Vec<&str> = shader[start..start + end]
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim().trim_end_matches(',');
+                let (name, kind) = line.split_once(':')?;
+                if name.starts_with("//") || name.starts_with("struct") {
+                    return None;
+                }
+                kind.contains("f32").then_some(name.trim())
+            })
+            .collect();
+        assert_eq!(
+            fields,
+            [
+                "view_projection",
+                "inverse_view_projection",
+                "eye_time",
+                "sun_fog",
+                "selected",
+                "sky_horizon",
+                "sky_zenith",
+                "fog_color",
+                "ambient_ground",
+                "ambient_sky",
+                "sun_color",
+            ]
+        );
+    }
+
+    #[test]
     fn camera_uniform_and_textured_vertices_match_gpu_layout() {
-        assert_eq!(std::mem::size_of::<CameraUniform>(), 176);
+        assert_eq!(std::mem::size_of::<CameraUniform>(), 272);
+        assert_eq!(std::mem::offset_of!(CameraUniform, sky_horizon), 176);
+        assert_eq!(std::mem::offset_of!(CameraUniform, sky_zenith), 192);
+        assert_eq!(std::mem::offset_of!(CameraUniform, fog_color), 208);
+        assert_eq!(std::mem::offset_of!(CameraUniform, ambient_ground), 224);
+        assert_eq!(std::mem::offset_of!(CameraUniform, ambient_sky), 240);
+        assert_eq!(std::mem::offset_of!(CameraUniform, sun_color), 256);
         assert_eq!(std::mem::size_of::<Vertex>(), 44);
         assert_eq!(std::mem::offset_of!(Vertex, normal), 12);
         assert_eq!(std::mem::offset_of!(Vertex, color), 24);

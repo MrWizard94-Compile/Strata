@@ -1,3 +1,4 @@
+use crate::daylight::{self, validate_time_of_day};
 use crate::world::{Block, GENERATOR_VERSION, World};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -29,6 +30,13 @@ pub struct Snapshot {
     pub seed: u64,
     pub player: PlayerSave,
     pub edits: Vec<([i32; 3], u8)>,
+    /// Fraction of the day in `[0, 1)`, midnight at 0. Absent in older saves.
+    #[serde(default = "default_time_of_day")]
+    time_of_day: f32,
+}
+
+fn default_time_of_day() -> f32 {
+    daylight::MORNING
 }
 
 impl Snapshot {
@@ -62,6 +70,7 @@ impl Snapshot {
         {
             return Err("World contains an invalid player position or orientation.".into());
         }
+        validate_time_of_day(self.time_of_day)?;
         let mut seen = HashSet::with_capacity(self.edits.len());
         for (position, id) in &self.edits {
             if position
@@ -84,6 +93,10 @@ impl Snapshot {
             }
         }
         world
+    }
+
+    pub fn time_of_day(&self) -> f32 {
+        self.time_of_day
     }
 }
 
@@ -151,7 +164,12 @@ impl SaveStore {
         ))
     }
 
-    pub fn save(&mut self, world: &World, player: PlayerSave) -> Result<(), String> {
+    pub fn save(
+        &mut self,
+        world: &World,
+        player: PlayerSave,
+        time_of_day: f32,
+    ) -> Result<(), String> {
         let generation = self
             .generation
             .checked_add(1)
@@ -163,6 +181,7 @@ impl SaveStore {
             seed: world.seed(),
             player,
             edits: world.edits(),
+            time_of_day,
         };
         snapshot.validate()?;
         let bytes =
@@ -229,7 +248,7 @@ mod tests {
         assert!(initial.is_none());
         let mut world = World::new(42);
         world.set_block([-3, 90, 2], Block::Crystal);
-        store.save(&world, player()).unwrap();
+        store.save(&world, player(), daylight::MORNING).unwrap();
         drop(store);
         let (_, loaded) = SaveStore::open(&path).unwrap();
         let loaded = loaded.unwrap();
@@ -243,9 +262,9 @@ mod tests {
         let path = directory();
         let (mut store, _) = SaveStore::open(&path).unwrap();
         let mut world = World::new(9);
-        store.save(&world, player()).unwrap();
+        store.save(&world, player(), daylight::MORNING).unwrap();
         world.set_block([0, 110, 0], Block::Stone);
-        store.save(&world, player()).unwrap();
+        store.save(&world, player(), daylight::MORNING).unwrap();
         fs::write(path.join("world-b.json.pending"), b"{incomplete").unwrap();
         drop(store);
         let (_, loaded) = SaveStore::open(&path).unwrap();
@@ -272,6 +291,7 @@ mod tests {
             seed: 0,
             player: player(),
             edits: vec![],
+            time_of_day: daylight::MORNING,
         };
         assert!(snapshot.validate().is_err());
         snapshot.schema = 1;
@@ -285,6 +305,85 @@ mod tests {
         assert!(snapshot.validate().is_err());
         snapshot.edits = vec![([1, 2, 3], 255)];
         assert!(snapshot.validate().is_err());
+        snapshot.edits.clear();
+        snapshot.time_of_day = f32::NAN;
+        assert!(snapshot.validate().is_err());
+        snapshot.time_of_day = f32::INFINITY;
+        assert!(snapshot.validate().is_err());
+        snapshot.time_of_day = -0.01;
+        assert!(snapshot.validate().is_err());
+        snapshot.time_of_day = 1.0;
+        assert!(snapshot.validate().is_err());
+        snapshot.time_of_day = 0.0;
+        assert!(snapshot.validate().is_ok());
+    }
+
+    #[test]
+    fn time_of_day_round_trips() {
+        let path = directory();
+        let (mut store, _) = SaveStore::open(&path).unwrap();
+        let world = World::new(11);
+        store.save(&world, player(), 0.75).unwrap();
+        drop(store);
+        let (_, loaded) = SaveStore::open(&path).unwrap();
+        let loaded = loaded.unwrap();
+        assert_eq!(
+            daylight::DayClock::from_fraction(loaded.time_of_day())
+                .unwrap()
+                .tick(),
+            daylight::TICKS_PER_DAY * 3 / 4
+        );
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn old_save_without_time_of_day_loads_at_morning() {
+        let path = directory();
+        fs::create_dir_all(&path).unwrap();
+        fs::write(
+            path.join("world-a.json"),
+            format!(
+                r#"{{
+                "schema": 1,
+                "generator": {GENERATOR_VERSION},
+                "generation": 3,
+                "seed": 99,
+                "player": {{"eye": [4.0, 70.0, -2.0], "yaw": 0.5, "pitch": -0.2, "flying": true}},
+                "edits": [[[-8, 40, 1], 1]]
+            }}"#
+            ),
+        )
+        .unwrap();
+        let (_, loaded) = SaveStore::open(&path).unwrap();
+        let loaded = loaded.unwrap();
+        assert_eq!(loaded.time_of_day(), daylight::MORNING);
+        assert_eq!(
+            daylight::DayClock::from_fraction(loaded.time_of_day())
+                .unwrap()
+                .tick(),
+            daylight::DayClock::morning().tick()
+        );
+        assert_eq!(loaded.seed, 99);
+        assert!(loaded.player.flying);
+        assert_eq!(loaded.world().block_at(-8, 40, 1), Block::Grass);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn invalid_time_of_day_is_rejected_and_the_file_is_preserved() {
+        let path = directory();
+        let (mut store, _) = SaveStore::open(&path).unwrap();
+        store.save(&World::new(3), player(), 0.5).unwrap();
+        drop(store);
+        let slot = path.join("world-b.json");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&slot).unwrap()).unwrap();
+        value["time_of_day"] = serde_json::json!(4.0);
+        let tampered = serde_json::to_vec_pretty(&value).unwrap();
+        fs::write(&slot, &tampered).unwrap();
+        assert!(SaveStore::open(&path).is_err());
+        assert_eq!(fs::read(&slot).unwrap(), tampered);
+        fs::remove_dir_all(path).unwrap();
     }
 
     #[test]

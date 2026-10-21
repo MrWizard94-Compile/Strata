@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod benchmark;
+mod daylight;
 mod material_export;
 mod materials;
 mod player;
@@ -10,6 +11,7 @@ mod streaming;
 mod streaming_trace;
 mod world;
 
+use daylight::DayClock;
 use egui::{Align2, Color32, FontId, Pos2, Rect, RichText, Stroke, Vec2};
 use player::{Motion, Player};
 use renderer::{PresentOutcome, RenderCamera, Renderer};
@@ -144,6 +146,7 @@ struct Game {
     egui_renderer: egui_wgpu::Renderer,
     world: Arc<World>,
     player: Player,
+    day: DayClock,
     streaming: Streaming,
     streaming_trace: Option<StreamingTrace>,
     last_upload: UploadStats,
@@ -178,15 +181,16 @@ struct Game {
 impl Game {
     fn new(window: Arc<Window>, options: &Options) -> Result<Self, String> {
         let (saves, loaded) = SaveStore::open(&options.save_dir)?;
-        let (world, player, has_save) = match loaded {
+        let (world, player, day, has_save) = match loaded {
             Some(snapshot) => {
+                let day = DayClock::from_fraction(snapshot.time_of_day())?;
                 let world = snapshot.world();
-                (world, Player::restore(snapshot.player), true)
+                (world, Player::restore(snapshot.player), day, true)
             }
             None => {
                 let world = World::new(options.seed);
                 let player = Player::new(&world);
-                (world, player, false)
+                (world, player, DayClock::morning(), false)
             }
         };
         let renderer = pollster::block_on(Renderer::new(Arc::clone(&window)))?;
@@ -250,6 +254,7 @@ impl Game {
             egui_renderer,
             world: Arc::new(world),
             player,
+            day,
             streaming,
             streaming_trace,
             last_upload: UploadStats::default(),
@@ -328,7 +333,10 @@ impl Game {
     }
 
     fn save(&mut self) -> bool {
-        match self.saves.save(&self.world, self.player.snapshot()) {
+        match self
+            .saves
+            .save(&self.world, self.player.snapshot(), self.day.fraction())
+        {
             Ok(()) => {
                 self.dirty = false;
                 self.last_save = Instant::now();
@@ -403,6 +411,13 @@ impl Game {
                 self.enter()
             }
             KeyCode::F3 => self.debug = !self.debug,
+            KeyCode::F4 if self.debug => {
+                self.day.skip_hours(1.0);
+                if self.has_entered {
+                    self.dirty = true;
+                }
+                self.notify(self.day.label());
+            }
             KeyCode::F5 => {
                 self.save();
             }
@@ -457,6 +472,7 @@ impl Game {
             target: (eye + direction).to_array(),
             time: self.start.elapsed().as_secs_f32(),
             fog_distance: self.radius as f32 * 32.0 - 12.0,
+            daylight: self.day.sample(),
             selected: if self.screen == Screen::Playing {
                 self.world
                     .raycast(
@@ -494,9 +510,12 @@ impl Game {
         if self.screen == Screen::Playing && self.focused {
             self.accumulator += elapsed.min(0.1);
             let motion = self.motion();
-            while self.accumulator >= 1.0 / 60.0 {
-                self.player.tick(&self.world, motion, 1.0 / 60.0);
-                self.accumulator -= 1.0 / 60.0;
+            while self.accumulator >= daylight::SIM_TICK_SECONDS {
+                self.player
+                    .tick(&self.world, motion, daylight::SIM_TICK_SECONDS);
+                // Pause, the title, and settings never reach this loop.
+                self.day.advance(false);
+                self.accumulator -= daylight::SIM_TICK_SECONDS;
             }
         } else {
             self.accumulator = 0.0;
@@ -839,7 +858,18 @@ impl Game {
             egui::Area::new(egui::Id::unique("performance")).anchor(Align2::RIGHT_TOP,Vec2::new(-28.0,64.0)).show(ctx,|ui| {
                 egui::Frame::new().fill(PANEL).inner_margin(16.0).corner_radius(4).show(ui,|ui| {
                     ui.label(RichText::new("FIELD NOTES").color(ACCENT).size(11.0));
-                    ui.monospace(format!("{fps:.0} fps  ·  p95 {p95:.2} ms\n{} chunks  ·  {} triangles\n{} workers  ·  {:.2} ms last mesh\nPosition {:.1}, {:.1}, {:.1}\n{}",self.renderer.chunk_count(),self.renderer.triangle_count(),self.streaming.workers,self.streaming.last_mesh_ms,self.player.eye.x,self.player.eye.y,self.player.eye.z,self.renderer.adapter_name));
+                    ui.monospace(format!(
+                        "{fps:.0} fps  ·  p95 {p95:.2} ms\n{} chunks  ·  {} triangles\n{} workers  ·  {:.2} ms last mesh\nPosition {:.1}, {:.1}, {:.1}\n{}\nF4 +1 hour\n{}",
+                        self.renderer.chunk_count(),
+                        self.renderer.triangle_count(),
+                        self.streaming.workers,
+                        self.streaming.last_mesh_ms,
+                        self.player.eye.x,
+                        self.player.eye.y,
+                        self.player.eye.z,
+                        self.day.label(),
+                        self.renderer.adapter_name
+                    ));
                 });
             });
         }
