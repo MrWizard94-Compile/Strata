@@ -16,11 +16,6 @@ on:
   push:
     tags:
       - "v*"
-    # Temporary proof trigger for this pull-request branch. A branch push
-    # packages and uploads checksums, then stops. Remove before the branch
-    # is finished so later pushes do not rebuild the player zips.
-    branches:
-      - cursor/ci-release-playing-69d2
   workflow_dispatch:
     inputs:
       dry_run:
