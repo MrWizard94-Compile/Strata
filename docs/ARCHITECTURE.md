@@ -6,7 +6,21 @@ STRATA is an original Rust voxel engine/game under active development. This docu
 
 `winit ApplicationHandler → input/UI → fixed 60 Hz player tick → bounded CPU meshing workers → main-thread GPU uploads → wgpu world pass → egui overlay → surface presentation`.
 
-Walking acceleration, friction, coyote time, and jump buffering run inside that fixed tick. A rendered frame only decides how many ticks catch up, and each of those ticks receives the same sampled input and `dt` of 1/60 s.
+Walking acceleration, friction, coyote time, and jump buffering run inside that fixed tick. A rendered frame only decides how many ticks catch up, and each of those ticks receives the same sampled input and `dt` of 1/60 s. The day clock advances after the player tick in that same loop.
+
+## Player collision sweep
+
+The walking body is an axis-aligned box: 0.3 m half-width, feet 1.6 m below the eye, head 0.15 m above. It does not rotate, and it only collides with grid-aligned solid voxels. Flight skips the sweep.
+
+Each walking tick applies acceleration and gravity, then sweeps the remaining displacement:
+
+1. For each axis that still moves, walk the voxel planes its leading face will cross. At a plane, test the cells that face covers, with the other two axes already advanced to that same time. A solid cell is a hit. A body already inside a solid does not count as a new impact and is not pushed back out; further motion into that solid stops, and motion back out is allowed.
+2. Advance all three axes to the earliest hit, then stop `1.0e-4` m short of the plane. Zero that axis's velocity and its leftover displacement. A downward hit marks the body grounded.
+3. Repeat with whatever displacement remains. After four contacts, drop the rest and zero any velocity that still carried it, so the next tick cannot retry a move this tick refused to finish.
+
+Equal times use a fixed order: floor, then X, then Z, then a ceiling. Sneak adds a footing test on the same sweep, and a horizontal plane that would leave the supporting cells stops that axis. A landing that started in the air uses that same footing hold for the remainder of the landing tick only. Later ticks can walk off the lip unless sneak is still held.
+
+The sweep degrades in a few known ways. It has no rotational component and no collider that is not a grid cell. An overlap that already exists is left where it is. More than four contacts in one tick discards the tail of the move. A single axis query stops after 96 empty planes rather than skipping them. The discrete "am I inside a block?" test still insets the box by 0.001 m, separate from the 0.0001 m sweep gap, so a face the sweep stopped short of is not reported as a penetration. Unit tests call `Player::tick` directly; they do not drive `Game::redraw`.
 
 The player and world edits are owned by the application thread. Worker jobs share immutable `Arc<World>` snapshots. An edit uses copy-on-write, invalidates a conservative neighbour region and increments a mesh revision. Results from earlier revisions are discarded. Queues are bounded to twice the worker count. Admission allows up to two callbacks, 4 MiB of payload and 2 ms of CPU time per redraw; one oversized first mesh may run alone to avoid starvation, and an active callback cannot be interrupted. One deferred result retains ownership and is revalidated on retry. See STREAMING.md for measured costs and the remaining segmented-upload work. Workers use a shared receive lock only to take a job, then mesh independently; this is not described as lock-free.
 
