@@ -1,10 +1,11 @@
 name: Playable build
 
 # Manual runs upload downloadable zips as workflow artifacts (kept 30 days).
-# A push of a v* tag also publishes those zips on a GitHub Release. The
-# Windows zip is the primary artifact. This workflow does not run on pull
-# requests. The publish job is the only job that can write to the repository,
-# and only when the ref is a version tag.
+# A push of a v* tag also publishes those zips on a GitHub Release unless
+# workflow_dispatch sets dry_run. The Windows zip is the primary artifact.
+# This workflow does not run on pull requests. The publish job is the only
+# job that can write repository contents, and only when the ref is a version
+# tag and dry_run is not set.
 #
 # Another platform is another `package.strategy.matrix.include` row:
 #   family: windows   uses package-windows.ps1
@@ -15,7 +16,17 @@ on:
   push:
     tags:
       - "v*"
+    # Temporary proof trigger for this pull-request branch. A branch push
+    # packages and uploads checksums, then stops. Remove before the branch
+    # is finished so later pushes do not rebuild the player zips.
+    branches:
+      - cursor/ci-release-playing-69d2
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Upload zips and checksums without creating a GitHub Release
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -29,6 +40,9 @@ jobs:
     name: Package ${{ matrix.label }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
+    permissions:
+      contents: read
+      actions: write
     defaults:
       run:
         shell: ${{ matrix.shell }}
@@ -42,7 +56,6 @@ jobs:
             family: windows
             zip: strata-windows-x86_64.zip
             binary: strata.exe
-            rustflags: "-C target-feature=+crt-static"
             shaders: false
             binary_kind: ""
           # Ubuntu 22.04 keeps the published binary on glibc 2.35. The image
@@ -54,7 +67,6 @@ jobs:
             family: unix
             zip: strata-linux-x86_64.zip
             binary: strata
-            rustflags: ""
             shaders: true
             binary_kind: ELF 64-bit
     steps:
@@ -77,6 +89,8 @@ jobs:
       - name: Install the pinned toolchain
         run: |
           rustup show
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup target add x86_64-pc-windows-msvc
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           rustc --version
           cargo --version
@@ -109,13 +123,16 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Locked release build
-        env:
-          RUSTFLAGS: ${{ matrix.rustflags }}
+        if: matrix.family == 'windows'
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+
+      - name: Locked release build
+        if: matrix.family == 'unix'
         run: cargo build --release --locked
 
       - name: Validate and package Windows zip
         if: matrix.family == 'windows'
-        run: ./package-windows.ps1 -Executable target\release\${{ matrix.binary }} -ZipName ${{ matrix.zip }}
+        run: ./package-windows.ps1 -Executable target\x86_64-pc-windows-msvc\release\${{ matrix.binary }} -ZipName ${{ matrix.zip }}
 
       - name: Package Unix zip
         if: matrix.family == 'unix'
@@ -160,7 +177,7 @@ jobs:
           printf '%s\n' "$help" | grep -q 'STRATA'
           "unpack/${{ matrix.binary }}" --export-materials unpack/materials
           pngs="$(find unpack/materials -type f -name '*.png' | wc -l | tr -d ' ')"
-          test "$pngs" -ge 14
+          test "$pngs" -ge 18
           test -f unpack/materials/contact-sheet.png
           test -f unpack/materials/manifest.json
           sha256sum '${{ matrix.zip }}' | tee '${{ matrix.zip }}.sha256'
@@ -181,17 +198,56 @@ jobs:
           retention-days: 30
           archive: false
 
+  checksums:
+    name: Write checksums
+    needs: package
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Assemble SHA256SUMS.txt
+        run: |
+          set -eu
+          find dist -type f -print
+          cd dist
+          primary=strata-windows-x86_64.zip
+          test -f "$primary"
+          test -f "$primary.sha256"
+          mapfile -t extras < <(find . -maxdepth 1 -type f -name 'strata-*.zip' ! -name "$primary" | sort)
+          {
+            cat "$primary.sha256"
+            for extra in "${extras[@]}"; do
+              base="$(basename "$extra")"
+              test -f "$base.sha256"
+              cat "$base.sha256"
+            done
+          } > SHA256SUMS.txt
+          sha256sum -c SHA256SUMS.txt
+          echo 'Checksums verified. No GitHub Release is created by this job.'
+      - name: Upload combined checksums
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          path: dist/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
+          archive: false
+
   publish:
     name: Publish GitHub Release
-    needs: package
-    if: startsWith(github.ref, 'refs/tags/v')
+    needs: checksums
+    if: startsWith(github.ref, 'refs/tags/v') && inputs.dry_run != true
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       actions: read
       contents: write
     steps:
-      - uses: actions/download-artifact@9000827ccba6bdabf93d22962f4752f3646cd9 # v8.0.2
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: dist
           merge-multiple: true
@@ -232,8 +288,8 @@ jobs:
           ## Provenance
           - Source commit: SOURCE_SHA
           - Workflow run: RUN_URL
-          - Build: cargo build --release --locked with the toolchain in rust-toolchain.toml (Rust 1.97.1).
-          - The Windows executable is a release build. The windows_subsystem attribute is windows unless debug assertions are on, so this build does not open a console. Its C runtime is linked statically.
+          - Build: cargo build --release --locked. Windows uses --target x86_64-pc-windows-msvc. Toolchain: rust-toolchain.toml (Rust 1.97.1).
+          - The Windows executable is a release build. The windows_subsystem attribute is windows unless debug assertions are on, so this build does not open a console. Its C runtime is linked statically via .cargo/config.toml for that target only. A startup failure is written to strata-error.txt beside the exe.
           - One checksum proves the identity of that uploaded file. It does not prove a second clean build would hash the same.
 
           ## Saves and rollback

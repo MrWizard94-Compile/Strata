@@ -14,9 +14,11 @@ Rust 1.97.1 with the MSVC toolchain is required on Windows. The repository pins 
 
 ```powershell
 Set-Location 'C:\WPAI\Software\Rust Based Voxel'
-cargo build --release --locked
-.\target\release\strata.exe
+cargo build --release --locked --target x86_64-pc-windows-msvc
+.\target\x86_64-pc-windows-msvc\release\strata.exe
 ```
+
+`.cargo/config.toml` links the C runtime statically for `x86_64-pc-windows-msvc` only.
 
 Or run `./run.ps1` from PowerShell. The script builds when necessary, sets the working directory and records startup/runtime diagnostics under `logs/`. Saves live in `saves/emerald-reach`; retain both `world-a.json` and `world-b.json` when backing up. An OS lock rejects a second client opening the same world and releases on process exit; the empty `world.lock` marker can remain.
 
@@ -77,9 +79,9 @@ Source is private/unpublished project work. No general redistribution license ha
 
 `./trace-streaming.ps1 -TracePath evidence/new-trace.jsonl -SmokeSeconds 30` builds and records a native run with exact source/binary/hardware provenance. It starts on the title scene. See [STREAMING.md](docs/STREAMING.md) for admission limits, reproducible stress fixtures, observed costs and measurement limits.
 
-The [source-check workflow](.github/workflows/ci.yml) runs on every pull request into `development`, on pushes to that branch, and on `v*` tags. It does not run again for a push of a pull-request branch. Windows and Linux both run the same unfiltered `cargo test --locked` command, with no test name, `--lib`, or `--skip`. Windows then runs strict clippy and the same static-CRT release build that is zipped for players. That job then checks the exe is a Windows GUI program, imports no Visual C++ redistributable DLL, launches the unzipped `strata.exe` (help text and a material export, with no window), and checks the zip contains only that exe and `PLAYING.md`. Linux runs format, test, clippy, and a release build, and runs the ignored GPU test against lavapipe. Neither job is interactive play on the acceptance machine.
+The [source-check workflow](.github/workflows/ci.yml) runs on every pull request into `development`, on pushes to that branch, and on `v*` tags. It does not run again for a push of a pull-request branch. Windows and Linux both run the same unfiltered `cargo test --locked` command, with no test name, `--lib`, or `--skip`. Windows then runs strict clippy and `cargo build --release --locked --target x86_64-pc-windows-msvc`. That target is the one `.cargo/config.toml` builds with a static C runtime. The zip is made from `target\x86_64-pc-windows-msvc\release\strata.exe`. That job then checks the exe is a Windows GUI program, imports no Visual C++ redistributable DLL, launches the unzipped `strata.exe` (help text and a material export, with no window), and checks the zip contains only that exe and `PLAYING.md`. Linux runs format, test, clippy, and a release build, and runs the ignored GPU test against lavapipe. Neither job is interactive play on the acceptance machine.
 
-The [playable-build workflow](.github/workflows/release.yml) runs when someone starts it by hand, and when a `v*` tag is pushed. The primary file is `strata-windows-x86_64.zip` (the release exe, static C runtime, and `PLAYING.md`). `strata-linux-x86_64.zip` is the extra Linux build: that release binary plus `PLAYING.md`. A manual run keeps those files for 30 days. A version tag also attaches them and `SHA256SUMS.txt` to a GitHub Release, with the Windows zip first. Another platform is an extra matrix row in that workflow; none is enabled until it has been built. There is no Mac package. See [PLAYING.md](PLAYING.md).
+The [playable-build workflow](.github/workflows/release.yml) runs when someone starts it by hand, and when a `v*` tag is pushed. The primary file is `strata-windows-x86_64.zip` (the release exe, static C runtime, and `PLAYING.md`). `strata-linux-x86_64.zip` is the extra Linux build: that release binary plus `PLAYING.md`. A manual run keeps those files for 30 days. Set **dry_run** on that manual run to upload the zips and `SHA256SUMS.txt` without creating a Release. A version tag without dry_run attaches them to a GitHub Release, with the Windows zip first. Another platform is an extra matrix row in that workflow; none is enabled until it has been built. There is no Mac package. See [PLAYING.md](PLAYING.md).
 
 ## Stopping a broken change
 

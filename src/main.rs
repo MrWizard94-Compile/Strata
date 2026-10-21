@@ -436,10 +436,8 @@ impl Game {
             }
             KeyCode::KeyX => self.edit(false),
             KeyCode::KeyC => self.edit(true),
-            KeyCode::ArrowLeft if self.screen == Screen::Playing => self.player.look(-0.12, 0.0),
-            KeyCode::ArrowRight if self.screen == Screen::Playing => self.player.look(0.12, 0.0),
-            KeyCode::ArrowUp if self.screen == Screen::Playing => self.player.look(0.0, 0.12),
-            KeyCode::ArrowDown if self.screen == Screen::Playing => self.player.look(0.0, -0.12),
+            // Arrow keys stay in `self.keys`. Turning is applied once per
+            // simulation tick, so holding a key does not depend on OS repeat.
             KeyCode::Digit1 => self.selected = 0,
             KeyCode::Digit2 => self.selected = 1,
             KeyCode::Digit3 => self.selected = 2,
@@ -516,6 +514,10 @@ impl Game {
         if steps > 0 {
             let motion = self.motion();
             for _ in 0..steps {
+                let (yaw, pitch) = arrow_look_delta(&self.keys, self.screen);
+                if yaw != 0.0 || pitch != 0.0 {
+                    self.player.look(yaw, pitch);
+                }
                 self.player
                     .tick(&self.world, motion, daylight::SIM_TICK_SECONDS);
                 self.day.advance(false);
@@ -925,7 +927,7 @@ impl ApplicationHandler for Application {
                 self.game = Some(game);
             }
             Err(error) => {
-                eprintln!("STRATA_START_FAILED {error}");
+                report_startup_failure(&error);
                 self.error = Some(error);
                 event_loop.exit();
             }
@@ -1043,6 +1045,50 @@ fn simulation_steps(
 
 fn unfocused_play_pauses(screen: Screen, focused: bool) -> bool {
     !focused && screen == Screen::Playing
+}
+
+/// Radians applied on one 60 Hz tick while an arrow key is held. Two radians
+/// per second, so a held key keeps turning without OS key repeat.
+const ARROW_LOOK_PER_TICK: f32 = 2.0 * daylight::SIM_TICK_SECONDS;
+
+fn arrow_look_delta(keys: &HashSet<KeyCode>, screen: Screen) -> (f32, f32) {
+    if screen != Screen::Playing {
+        return (0.0, 0.0);
+    }
+    let axis = |negative: KeyCode, positive: KeyCode| {
+        let mut value = 0.0;
+        if keys.contains(&negative) {
+            value -= ARROW_LOOK_PER_TICK;
+        }
+        if keys.contains(&positive) {
+            value += ARROW_LOOK_PER_TICK;
+        }
+        value
+    };
+    (
+        axis(KeyCode::ArrowLeft, KeyCode::ArrowRight),
+        axis(KeyCode::ArrowDown, KeyCode::ArrowUp),
+    )
+}
+
+/// Writes `STRATA_START_FAILED` beside the executable. A Windows GUI-subsystem
+/// build has no console, so this file is the message the player can open.
+fn record_startup_failure(directory: &std::path::Path, error: &str) -> std::io::Result<()> {
+    std::fs::write(
+        directory.join("strata-error.txt"),
+        format!("STRATA_START_FAILED {error}\n"),
+    )
+}
+
+fn report_startup_failure(error: &str) {
+    eprintln!("STRATA_START_FAILED {error}");
+    let directory = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("."));
+    if let Err(write_error) = record_startup_failure(&directory, error) {
+        eprintln!("STRATA_START_FAILED could not write strata-error.txt: {write_error}");
+    }
 }
 
 fn game_key_reaches_game(code: KeyCode, egui_consumed: bool) -> bool {
@@ -1224,5 +1270,63 @@ mod tests {
         assert!(apply_debug_hour_skip(true, &mut day, true, &mut dirty));
         assert_eq!(day.label(), "10:00 morning");
         assert!(dirty);
+    }
+
+    #[test]
+    fn held_arrow_turns_on_each_simulation_tick() {
+        let mut keys = HashSet::new();
+        assert_eq!(arrow_look_delta(&keys, Screen::Playing), (0.0, 0.0));
+        keys.insert(KeyCode::ArrowRight);
+        keys.insert(KeyCode::ArrowUp);
+        assert_eq!(
+            arrow_look_delta(&keys, Screen::Paused),
+            (0.0, 0.0),
+            "pause and title do not turn"
+        );
+        let (yaw_step, pitch_step) = arrow_look_delta(&keys, Screen::Playing);
+        assert_eq!(yaw_step, ARROW_LOOK_PER_TICK);
+        assert_eq!(pitch_step, ARROW_LOOK_PER_TICK);
+        keys.insert(KeyCode::ArrowLeft);
+        keys.insert(KeyCode::ArrowDown);
+        assert_eq!(
+            arrow_look_delta(&keys, Screen::Playing),
+            (0.0, 0.0),
+            "opposite arrows cancel"
+        );
+
+        let mut player = Player::restore(save::PlayerSave {
+            eye: [0.0, 10.0, 0.0],
+            yaw: 0.0,
+            pitch: 0.0,
+            flying: false,
+        });
+        let held = HashSet::from([KeyCode::ArrowRight]);
+        let ticks = daylight::SIM_TICKS_PER_SECOND;
+        for _ in 0..ticks {
+            let (yaw, pitch) = arrow_look_delta(&held, Screen::Playing);
+            player.look(yaw, pitch);
+        }
+        assert!((player.yaw - 2.0).abs() < 1e-4);
+        assert_eq!(player.pitch, 0.0);
+    }
+
+    #[test]
+    fn startup_failure_is_written_beside_the_chosen_directory() {
+        let dir = std::env::temp_dir().join(format!(
+            "strata-start-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        record_startup_failure(&dir, "no Vulkan or DirectX 12 adapter").unwrap();
+        let text = std::fs::read_to_string(dir.join("strata-error.txt")).unwrap();
+        assert_eq!(
+            text,
+            "STRATA_START_FAILED no Vulkan or DirectX 12 adapter\n"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -13,7 +13,7 @@ On a Windows PC, download this file: **`strata-windows-x86_64.zip`**.
 
 Windows may say "Windows protected your PC". This build is not signed. Click **More info**, then **Run anyway**.
 
-The game does not open a black console window. If Windows says a DLL is missing, install the latest driver for your graphics card and try again.
+The game needs Vulkan or DirectX 12. It does not open a console window, so a startup failure does not appear as a Windows message. If no window appears, open `strata-error.txt` in the same folder as `strata.exe`. The first line starts with `STRATA_START_FAILED`. A missing graphics driver is the usual cause.
 
 `SHA256SUMS.txt` on that page is optional. It only checks that the zip was not corrupted.
 
@@ -48,9 +48,10 @@ On the title screen, click **ENTER THE REACH** or press Enter.
 | Left click, or X | Break the block you are looking at |
 | Right click, or C | Place the selected material |
 | 1 through 8, or the mouse wheel | Choose a material |
-| Arrow keys | Turn without the mouse |
+| Arrow keys | Turn without the mouse. Hold an arrow key to keep turning |
 | F5 | Save the world |
-| F3 | Show or hide frame time and world statistics |
+| F3 | Show or hide frame time, world statistics, and the clock |
+| F4 | With the F3 overlay open, skip the clock forward one hour |
 | Escape | Pause. Escape again resumes |
 
 **World settings** on the title screen changes how far you can see and how fast the mouse turns. **Quit** closes the game.
@@ -67,4 +68,4 @@ This download does not write a log file. The `logs` folder exists only when some
 
 Close the game and start it again. The last save should still be in `saves/emerald-reach`.
 
-To report a problem, open a [new issue](https://github.com/MrWizard94-Compile/Strata/issues/new). Say what you clicked, what you expected, and what happened. If no window appears, say that you used `strata-windows-x86_64.zip` and quote the exact Windows message, if there was one.
+To report a problem, open a [new issue](https://github.com/MrWizard94-Compile/Strata/issues/new). Say what you clicked, what you expected, and what happened. If no window appears, say that you used `strata-windows-x86_64.zip` and paste the `STRATA_START_FAILED` line from `strata-error.txt`.

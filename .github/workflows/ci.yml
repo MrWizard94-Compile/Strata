@@ -47,6 +47,8 @@ jobs:
         run: |
           rustup show
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup target add x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           rustc --version
           cargo --version
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -62,14 +64,12 @@ jobs:
         run: cargo test --locked
       - name: Strict linting
         run: cargo clippy --locked --all-targets -- -D warnings
+      # --target selects x86_64-pc-windows-msvc so .cargo/config.toml applies
+      # +crt-static only to that target. The output is not target\release.
       - name: Locked release build
-        env:
-          # Same link flags as the zip players download. A local cargo build
-          # without this flag is a different executable.
-          RUSTFLAGS: -C target-feature=+crt-static
-        run: cargo build --release --locked
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
       - name: Validate the Windows player zip
-        run: ./package-windows.ps1 -Executable target\release\strata.exe -ZipName strata-windows-x86_64.zip
+        run: ./package-windows.ps1 -Executable target\x86_64-pc-windows-msvc\release\strata.exe -ZipName strata-windows-x86_64.zip
       # The ignored GPU test runs on the Linux job with lavapipe. Neither job
       # proves interactive play on the acceptance machine.
 

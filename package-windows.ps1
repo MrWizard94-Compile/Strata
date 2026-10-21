@@ -137,7 +137,7 @@ try {
     $exported = Invoke-PackagedStrata $packed $unpack @('--export-materials', $export) 0
     if ($exported -notmatch 'STRATA_MATERIAL_EXPORT') { throw 'The packaged exe did not finish a material export.' }
     $pngs = @(Get-ChildItem -LiteralPath $export -Filter '*.png' -File)
-    if ($pngs.Count -lt 14) { throw "Material export wrote $($pngs.Count) PNGs; expected the runtime tiles and contact sheet." }
+    if ($pngs.Count -lt 18) { throw "Material export wrote $($pngs.Count) PNGs; expected the 17 runtime tiles and contact sheet." }
     if (-not (Test-Path -LiteralPath (Join-Path $export 'contact-sheet.png') -PathType Leaf)) {
         throw 'Material export did not write contact-sheet.png.'
     }
