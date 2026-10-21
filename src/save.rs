@@ -387,6 +387,8 @@ mod tests {
         assert!(snapshot.validate().is_err());
         snapshot.generator = GENERATOR_VERSION + 1;
         assert!(snapshot.validate().is_err());
+        snapshot.generator = 2;
+        assert!(snapshot.validate().is_err());
         snapshot.generator = GENERATOR_VERSION;
         snapshot.player.eye[0] = f32::NAN;
         assert!(snapshot.validate().is_err());
@@ -549,6 +551,45 @@ mod tests {
             assert_eq!(fs::read(&slot).unwrap(), tampered);
             fs::remove_dir_all(path).unwrap();
         }
+    }
+
+    /// Minimal schema-1 JSON. Optional fields (time of day, and any later
+    /// optional hotbar) stay absent so a sibling change can add them with
+    /// defaults without this rejection depending on those fields.
+    fn rejected_generator_file_is_unchanged(generator: u32, message: &str) {
+        let path = directory();
+        fs::create_dir_all(&path).unwrap();
+        let body = format!(
+            r#"{{"schema":1,"generator":{generator},"generation":1,"seed":7,"player":{{"eye":[0.0,80.0,0.0],"yaw":0.0,"pitch":0.0,"flying":false}},"edits":[]}}"#
+        );
+        fs::write(path.join("world-a.json"), &body).unwrap();
+        let Err(error) = SaveStore::open(&path) else {
+            panic!("generator {generator} save was accepted");
+        };
+        assert_eq!(error, message);
+        assert_eq!(
+            fs::read(path.join("world-a.json")).unwrap(),
+            body.as_bytes()
+        );
+        assert!(!path.join("world-a.json.pending").exists());
+        assert!(!path.join("world-b.json").exists());
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn generator_2_save_is_rejected_and_preserved() {
+        rejected_generator_file_is_unchanged(
+            2,
+            "This world was made with an older version of the world generator and can't be opened in this version. Create a new world to play. Your old world files were left as they are.",
+        );
+    }
+
+    #[test]
+    fn generator_4_save_is_rejected_and_preserved() {
+        rejected_generator_file_is_unchanged(
+            4,
+            "This world was saved by a different version of STRATA and can't be opened. Create a new world to play. Your old world files were left as they are.",
+        );
     }
 
     #[test]
