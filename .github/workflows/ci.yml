@@ -1,19 +1,31 @@
-name: Windows source checks
+name: Source checks
+
+# Runs on pull requests into development, on pushes to that branch, and on
+# version tags. Pushes of other branches are omitted so an open pull request
+# is not checked twice. These jobs do not block a merge until branch
+# protection requires them. See README.md, "Stopping a broken change".
 
 on:
-  push:
   pull_request:
+    branches:
+      - development
+  push:
+    branches:
+      - development
+    tags:
+      - "v*"
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: windows-source-${{ github.ref }}
+  group: source-checks-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  check:
+  windows:
+    name: Windows source checks
     runs-on: windows-latest
     timeout-minutes: 30
     defaults:
@@ -25,10 +37,11 @@ jobs:
           persist-credentials: false
       - name: Install the pinned toolchain
         run: |
-          rustup toolchain install 1.97.1 --profile minimal --component rustfmt --component clippy
+          rustup show
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           rustc --version
           cargo --version
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Formatting
         run: cargo fmt --check
       - name: Source regression suite
@@ -37,6 +50,20 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Locked release build
         run: cargo build --release --locked
+      - name: Release executable hides the console
+        run: |
+          $exe = Join-Path $PWD 'target\release\strata.exe'
+          $bytes = [System.IO.File]::ReadAllBytes($exe)
+          if ($bytes.Length -lt 96) { throw 'Release executable is too small to be a PE file.' }
+          $pe = [BitConverter]::ToInt32($bytes, 0x3C)
+          if ($pe -lt 0 -or ($pe + 96) -gt $bytes.Length) { throw "Invalid PE header offset: $pe" }
+          $signature = [BitConverter]::ToUInt32($bytes, $pe)
+          if ($signature -ne 0x00004550) { throw 'Missing PE signature.' }
+          $magic = [BitConverter]::ToUInt16($bytes, $pe + 24)
+          if ($magic -ne 0x20B) { throw "Expected a PE32+ executable, found magic 0x$($magic.ToString('X'))." }
+          $subsystem = [BitConverter]::ToUInt16($bytes, $pe + 24 + 68)
+          if ($subsystem -ne 2) { throw "Release subsystem is $subsystem; expected 2 (Windows GUI, no console)." }
+          Write-Host 'Release executable uses the Windows GUI subsystem.'
       - name: PowerShell entry point syntax
         run: |
           foreach ($script in @('run.ps1', 'benchmark-cpu.ps1', 'trace-streaming.ps1')) {
@@ -45,5 +72,46 @@ jobs:
             [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $PWD $script), [ref]$tokens, [ref]$errors) | Out-Null
             if ($errors.Count) { $errors; exit 1 }
           }
-      # The explicitly ignored native GPU test and real client interaction run
-      # on the acceptance machine; CI success does not prove either boundary.
+      # The ignored GPU test runs on the Linux job with lavapipe. Neither job
+      # proves interactive play on the acceptance machine.
+
+  linux:
+    name: Linux source checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install lavapipe
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers libvulkan1
+          icd="$(find /usr/share/vulkan/icd.d -name 'lvp_icd*.json' -print -quit)"
+          if [ -z "$icd" ]; then
+            echo 'lavapipe ICD was not installed'
+            find /usr/share/vulkan -type f || true
+            exit 1
+          fi
+          echo "LAVAPIPE_ICD=$icd" >> "$GITHUB_ENV"
+          echo "Using $icd"
+      - name: Install the pinned toolchain
+        run: |
+          rustup show
+          rustc --version
+          cargo --version
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Formatting
+        run: cargo fmt --check
+      - name: Source regression suite
+        run: cargo test --locked
+      - name: Shader pipeline validation
+        env:
+          VK_DRIVER_FILES: ${{ env.LAVAPIPE_ICD }}
+          VK_ICD_FILENAMES: ${{ env.LAVAPIPE_ICD }}
+          WGPU_BACKEND: vulkan
+        run: cargo test --locked native_gpu_validates_all_world_shader_pipelines -- --ignored --nocapture
+      - name: Strict linting
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Locked release build
+        run: cargo build --release --locked

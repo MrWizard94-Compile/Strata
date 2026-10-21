@@ -68,6 +68,14 @@ Rust/Cargo 1.97.1, MSVC target; wgpu 30.0.1, winit 0.30.13, egui 0.37.0 with def
 
 Historical CPU-baseline executable SHA256: `8987752CF362DBC4CB780B6DDC31AD8D78C54DCCE60ADC632E009E9B971DA8AB`.
 
+## Pull-request checks and playable packages
+
+2026-10-21. Pull requests into `development` run Windows and Linux source checks. The Linux job runs `native_gpu_validates_all_world_shader_pipelines` on lavapipe. A separate workflow packages a Windows release executable (GUI subsystem, no console, static C runtime) and a Linux release executable built on Ubuntu 22.04, each zipped with `PLAYING.md` and a SHA-256 checksum. A `v*` tag also publishes a GitHub Release. macOS is not packaged. Branch protection and the Actions write permission for releases are owner settings; the workflow files do not apply them.
+
+This change froze `MrWizard94-Compile/Agents-Constitution@0010a8353b00754fad31a30ed24327d3b6d05425` (6.16.4); `tools/check-frozen-load.py` passed on that checkout. A candidate rule that a workflow file is not a merge barrier is staged outside this repository and does not govern this change.
+
+Local Linux verification on this change, before the pull-request run: with `VK_DRIVER_FILES` pointed only at `lvp_icd.json`, the ignored GPU test passed. `cargo fmt --check`, `cargo test --locked` (55 passed, 1 ignored), `cargo clippy --locked --all-targets -- -D warnings`, and `cargo build --release --locked` passed. That local release binary links `libc`, `libm`, and `libgcc_s` and records `GLIBC_2.39` because this machine is Ubuntu 24.04. The published Linux zip is built on the Ubuntu 22.04 runner instead, so its glibc floor is that image's. The GitHub run is a separate result from this local check.
+
 ## Ownership and next work
 
 The [stage/phase tracker](PROJECT-TRACKER.md) preserves S0–S8 and the full objective. `world` contributed terrain, streaming regressions, CPU measurements tooling and materials; `renderer` contributed presentation and independent player/lifecycle review; `evolution` contributed primary research/product criteria and the separate governance candidate. Root reviewed, integrated and tested their output. Intermittent agent usage limits did not prevent local progress.

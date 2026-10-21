@@ -4,6 +4,8 @@ An original Rust voxel engine and game in active development. **STRATA is a work
 
 The authoritative local project is `C:\WPAI\Software\Rust Based Voxel`, an independent Git repository. Its verified `origin` is [MrWizard94-Compile/Strata](https://github.com/MrWizard94-Compile/Strata), a public repository. The director authorized committing and pushing source checkpoints; the development branch contains ongoing engineering work, not a production release.
 
+To download a build and play without installing Rust, read [PLAYING.md](PLAYING.md).
+
 ![Original 32x32 material contact sheet](docs/assets/materials-32-contact-sheet.png)
 
 ## Build and play
@@ -48,7 +50,7 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo build --release --locked
 ```
 
-The GPU test is opt-in because it requires real hardware. Running it validates shader pipelines, not the window/input/save lifecycle. Native playtest evidence and remaining gates are recorded in [docs/STATUS.md](docs/STATUS.md).
+The GPU test is opt-in on a developer machine because it needs a Vulkan adapter. Running it validates shader pipelines, not the window, input, or save lifecycle. The Linux source-check job runs that same test on lavapipe (software Vulkan). Native playtest evidence and remaining gates are recorded in [docs/STATUS.md](docs/STATUS.md).
 
 Flight is collision-free for development exploration; move clear of solid terrain before toggling back to walking. New spawns and fall recovery test the entire body against trees and construction.
 
@@ -73,4 +75,28 @@ Source is private/unpublished project work. No general redistribution license ha
 
 ## Streaming diagnostics and CI
 
-`./trace-streaming.ps1 -TracePath evidence/new-trace.jsonl -SmokeSeconds 30` builds and records a native run with exact source/binary/hardware provenance. It starts on the title scene. See [STREAMING.md](docs/STREAMING.md) for admission limits, reproducible stress fixtures, observed costs and measurement limits. The Windows source-check workflow runs formatting, tests, strict linting, a locked release build and launcher syntax checks; it does not establish native GPU or interactive acceptance.
+`./trace-streaming.ps1 -TracePath evidence/new-trace.jsonl -SmokeSeconds 30` builds and records a native run with exact source/binary/hardware provenance. It starts on the title scene. See [STREAMING.md](docs/STREAMING.md) for admission limits, reproducible stress fixtures, observed costs and measurement limits.
+
+The [source-check workflow](.github/workflows/ci.yml) runs on every pull request into `development`, on pushes to that branch, and on `v*` tags. It does not run again for a push of a pull-request branch. Windows runs formatting, locked tests, strict clippy, a locked release build, a check that the release executable is a Windows GUI program (no console window), and a PowerShell syntax check. Linux runs the same format, test, clippy, and release build, and runs the ignored GPU test against lavapipe. Neither job is interactive acceptance.
+
+The [playable-build workflow](.github/workflows/release.yml) runs when someone starts it by hand, and when a `v*` tag is pushed. A manual run uploads `strata-windows-x86_64.zip` and `strata-linux-x86_64.zip`, each with `PLAYING.md` and a SHA-256 file, and keeps them for 30 days. A version tag also attaches those zips and `SHA256SUMS.txt` to a GitHub Release. The Windows package is a release build with the C runtime linked statically. There is no Mac package. See [PLAYING.md](PLAYING.md).
+
+## Stopping a broken change
+
+A green workflow does not stop a merge by itself. GitHub only blocks the merge after an administrator requires the checks. An agent cannot turn that on.
+
+1. Open this repository on GitHub as an administrator.
+2. Go to **Settings → Rules → Rulesets → New ruleset → New branch ruleset**. (The older page is **Settings → Branches → Add branch protection rule**.)
+3. Target the `development` branch. Turn on **Require a pull request before merging**.
+4. Turn on **Require status checks to pass before merging**. Search for these names after they have run at least once, and add both:
+   - `Windows source checks`
+   - `Linux source checks`
+5. Save the ruleset.
+
+Publishing a Release needs a second setting. The playable-build workflow asks for write access only on the job that runs for a `v*` tag. If the repository caps Actions at read-only, that job fails and the zip artifacts from the package jobs are still produced.
+
+1. **Settings → Actions → General → Workflow permissions**.
+2. Choose **Read and write permissions**.
+3. Save.
+
+Do not mark the playable-build jobs as required pull-request checks. That workflow does not run on pull requests.
