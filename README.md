@@ -41,7 +41,7 @@ One full day lasts 20 real minutes and advances only while playing. Pausing the 
 | F5 | Save world |
 | F3 | Toggle frame-time, clock, and world statistics |
 | F4 | With the F3 overlay open, skip the clock forward one hour |
-| Escape | Pause / resume |
+| Escape | Close the material picker, or pause / resume |
 
 ## Verification
 

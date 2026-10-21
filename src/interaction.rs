@@ -14,6 +14,11 @@ pub const REACH_BLOCKS: f32 = 5.0;
 /// The press itself edits immediately. Further edits run on the fixed 60 Hz tick.
 pub const EDIT_REPEAT_SECONDS: f32 = 0.25;
 
+/// Held repeats are counted in simulation ticks so a 144 Hz frame that drains
+/// zero ticks cannot stretch or cancel the interval. `0.25 s × 60 Hz = 15`.
+pub const EDIT_REPEAT_TICKS: u32 =
+    (EDIT_REPEAT_SECONDS * daylight::SIM_TICKS_PER_SECOND as f32) as u32;
+
 /// A single frame may catch up at most this much simulation time.
 /// The cap is shorter than [`EDIT_REPEAT_SECONDS`], so a hitch cannot burst edits.
 pub const FRAME_HITCH_CAP_SECONDS: f32 = 0.1;
@@ -41,8 +46,8 @@ pub struct RepeatFires {
 pub struct EditRepeat {
     break_held: bool,
     place_held: bool,
-    break_cooldown: f32,
-    place_cooldown: f32,
+    break_ticks: u32,
+    place_ticks: u32,
 }
 
 impl EditRepeat {
@@ -51,9 +56,10 @@ impl EditRepeat {
     }
 
     /// Arm `place` (right button) or break (left button).
-    /// Always returns true: the caller edits on the press, then waits out the cooldown
-    /// across [`Self::simulation_tick`] steps. The frame hitch cap is shorter than the
-    /// cooldown, so the ticks drained on the press frame cannot fire a second edit.
+    /// Always returns true: the caller edits on the press, then waits
+    /// [`EDIT_REPEAT_TICKS`] simulation steps. The frame hitch cap is shorter
+    /// than that interval, so the ticks drained on the press frame cannot fire
+    /// a second edit.
     pub fn press(&mut self, place: bool) -> bool {
         self.arm(place);
         true
@@ -62,10 +68,10 @@ impl EditRepeat {
     pub fn release(&mut self, place: bool) {
         if place {
             self.place_held = false;
-            self.place_cooldown = 0.0;
+            self.place_ticks = 0;
         } else {
             self.break_held = false;
-            self.break_cooldown = 0.0;
+            self.break_ticks = 0;
         }
     }
 
@@ -75,40 +81,36 @@ impl EditRepeat {
 
     /// One fixed simulation step. The playing loop calls this once per drained tick.
     pub fn simulation_tick(&mut self) -> RepeatFires {
-        self.advance(daylight::SIM_TICK_SECONDS)
-    }
-
-    fn advance(&mut self, dt: f32) -> RepeatFires {
         RepeatFires {
-            break_block: self.tick(false, dt),
-            place_block: self.tick(true, dt),
+            break_block: self.tick(false),
+            place_block: self.tick(true),
         }
     }
 
     fn arm(&mut self, place: bool) {
         if place {
             self.place_held = true;
-            self.place_cooldown = EDIT_REPEAT_SECONDS;
+            self.place_ticks = EDIT_REPEAT_TICKS;
         } else {
             self.break_held = true;
-            self.break_cooldown = EDIT_REPEAT_SECONDS;
+            self.break_ticks = EDIT_REPEAT_TICKS;
         }
     }
 
-    fn tick(&mut self, place: bool, dt: f32) -> bool {
-        let (held, cooldown) = if place {
-            (self.place_held, &mut self.place_cooldown)
+    fn tick(&mut self, place: bool) -> bool {
+        let (held, remaining) = if place {
+            (self.place_held, &mut self.place_ticks)
         } else {
-            (self.break_held, &mut self.break_cooldown)
+            (self.break_held, &mut self.break_ticks)
         };
-        if !held || !dt.is_finite() || dt <= 0.0 {
+        if !held {
             return false;
         }
-        *cooldown -= dt;
-        if *cooldown > 0.0 {
+        *remaining = remaining.saturating_sub(1);
+        if *remaining > 0 {
             return false;
         }
-        *cooldown = EDIT_REPEAT_SECONDS;
+        *remaining = EDIT_REPEAT_TICKS;
         true
     }
 }
@@ -337,9 +339,10 @@ mod tests {
             "a one-second frame is capped and must not repeat"
         );
         let fired = repeat_after(&mut repeat, hitch, false);
+        assert_eq!(fired, EDIT_REPEAT_TICKS);
         assert!(hitch < fired);
         let again = repeat_after(&mut repeat, 0, false);
-        assert!(again > 1);
+        assert_eq!(again, EDIT_REPEAT_TICKS);
     }
 
     #[test]

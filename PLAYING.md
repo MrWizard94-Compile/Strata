@@ -45,14 +45,15 @@ On the title screen, click **ENTER THE REACH** or press Enter.
 | Left Shift | Sprint |
 | F | Turn flight on or off. You must move clear of solid ground before flight can turn off |
 | Left Ctrl | Descend while flying |
-| Left click, or X | Break the block you are looking at |
-| Right click, or C | Place the selected material |
-| 1 through 8, or the mouse wheel | Choose a material |
+| Left click, or X | Break the block you are looking at, up to five blocks away. Hold the mouse button to repeat |
+| Right click, or C | Place the selected material, up to five blocks away. Hold the mouse button to repeat |
+| 1 through 8, or the mouse wheel | Select a hotbar slot |
+| E | Open or close the material picker for the selected hotbar slot |
 | Arrow keys | Turn without the mouse. Hold an arrow key to keep turning |
 | F5 | Save the world |
 | F3 | Show or hide frame time, world statistics, and the clock |
 | F4 | With the F3 overlay open, skip the clock forward one hour |
-| Escape | Pause. Escape again resumes |
+| Escape | Close the material picker, or pause. Escape again resumes |
 
 **World settings** on the title screen changes how far you can see and how fast the mouse turns. **Quit** closes the game.
 
