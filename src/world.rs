@@ -203,46 +203,44 @@ struct OreRule {
     block: Block,
 }
 
-fn ore_rules() -> [OreRule; 4] {
-    [
-        OreRule {
-            salt: 0xD1A0,
-            cell: 13,
-            min_y: 1,
-            max_y: 12,
-            chance: 8,
-            radius_sq: 1,
-            block: Block::DiamondOre,
-        },
-        OreRule {
-            salt: 0x60D0,
-            cell: 11,
-            min_y: 1,
-            max_y: 22,
-            chance: 14,
-            radius_sq: 1,
-            block: Block::GoldOre,
-        },
-        OreRule {
-            salt: 0x1A0,
-            cell: 9,
-            min_y: 1,
-            max_y: 46,
-            chance: 34,
-            radius_sq: 2,
-            block: Block::IronOre,
-        },
-        OreRule {
-            salt: 0xC0A1,
-            cell: 8,
-            min_y: 6,
-            max_y: 70,
-            chance: 46,
-            radius_sq: 2,
-            block: Block::CoalOre,
-        },
-    ]
-}
+const ORE_RULES: [OreRule; 4] = [
+    OreRule {
+        salt: 0xD1A0,
+        cell: 13,
+        min_y: 1,
+        max_y: 12,
+        chance: 8,
+        radius_sq: 1,
+        block: Block::DiamondOre,
+    },
+    OreRule {
+        salt: 0x60D0,
+        cell: 11,
+        min_y: 1,
+        max_y: 22,
+        chance: 14,
+        radius_sq: 1,
+        block: Block::GoldOre,
+    },
+    OreRule {
+        salt: 0x1A0,
+        cell: 9,
+        min_y: 1,
+        max_y: 46,
+        chance: 34,
+        radius_sq: 2,
+        block: Block::IronOre,
+    },
+    OreRule {
+        salt: 0xC0A1,
+        cell: 8,
+        min_y: 6,
+        max_y: 70,
+        chance: 46,
+        radius_sq: 2,
+        block: Block::CoalOre,
+    },
+];
 
 impl World {
     pub fn new(seed: u64) -> Self {
@@ -391,33 +389,38 @@ impl World {
         let zf = f64::from(z);
         let warp = noise3(self.seed ^ 0x0A11, xf / 31.0, yf / 27.0, zf / 31.0) * 5.0;
         let sheet = noise3(self.seed ^ 0xCA7E, (xf + warp) / 18.0, yf / 12.0, zf / 18.0);
+        // The tube sample cannot open a cave once the sheet misses. Skipping it
+        // keeps the same boolean result.
+        if sheet.abs() >= 0.085 {
+            return false;
+        }
         let tube = noise3(
             self.seed ^ 0x71BE,
             xf / 18.0,
             (yf - warp) / 14.0,
             (zf + warp) / 18.0,
         );
-        sheet.abs() < 0.085 && tube.abs() < 0.15
+        tube.abs() < 0.15
     }
 
     fn ore_at(&self, x: i32, y: i32, z: i32) -> Option<Block> {
         if !(1..=70).contains(&y) {
             return None;
         }
-        for rule in ore_rules() {
+        for rule in &ORE_RULES {
             if !(rule.min_y..=rule.max_y).contains(&y) {
                 continue;
             }
-            let min_cx = (x - 1).div_euclid(rule.cell);
-            let max_cx = (x + 1).div_euclid(rule.cell);
-            let min_cy = (y - 1).div_euclid(rule.cell);
-            let max_cy = (y + 1).div_euclid(rule.cell);
-            let min_cz = (z - 1).div_euclid(rule.cell);
-            let max_cz = (z + 1).div_euclid(rule.cell);
+            let min_cx = x.saturating_sub(1).div_euclid(rule.cell);
+            let max_cx = x.saturating_add(1).div_euclid(rule.cell);
+            let min_cy = y.saturating_sub(1).div_euclid(rule.cell);
+            let max_cy = y.saturating_add(1).div_euclid(rule.cell);
+            let min_cz = z.saturating_sub(1).div_euclid(rule.cell);
+            let max_cz = z.saturating_add(1).div_euclid(rule.cell);
             for cz in min_cz..=max_cz {
                 for cy in min_cy..=max_cy {
                     for cx in min_cx..=max_cx {
-                        if self.vein_hits(&rule, [cx, cy, cz], [x, y, z]) {
+                        if self.vein_hits(rule, [cx, cy, cz], [x, y, z]) {
                             return Some(rule.block);
                         }
                     }

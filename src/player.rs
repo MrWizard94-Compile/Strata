@@ -155,7 +155,7 @@ impl Player {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::world::Block;
+    use crate::world::{Biome, Block};
     fn platform() -> World {
         let mut world = World::new(3);
         for x in -3..=3 {
@@ -227,9 +227,10 @@ mod tests {
     fn spawn_and_fall_recovery_clear_trees_and_player_construction() {
         let mut tree_world = World::new(396);
         let ground = tree_world.surface_height(64, -64);
-        // Generator 2 moved the forests, so seed 396 no longer promises a trunk
-        // in this spawn column. Plant one when the column is open; recovery
-        // still has to lift the body clear of that solid.
+        // Spawn is fixed at (64, -64). Trunks only sit on offsets 2..=6 of a
+        // 9-block grid, and 64 rem 9 is 1, so this column is never a natural
+        // trunk. Plant one and require recovery to clear it. The natural case
+        // is `a_natural_trunk_grows_without_being_planted`.
         if !tree_world.block_at(64, ground + 1, -64).is_solid() {
             tree_world.set_block([64, ground + 1, -64], Block::Wood);
             tree_world.set_block([64, ground + 2, -64], Block::Leaves);
@@ -248,5 +249,20 @@ mod tests {
         player.tick(&world, Motion::default(), 1.0 / 60.0);
         assert!(!Player::collides(player.eye, &world));
         assert!(player.eye.y > (ground + 12) as f32 + 1.6);
+    }
+    #[test]
+    fn a_natural_trunk_grows_without_being_planted() {
+        let world = World::new(20261021);
+        assert!(
+            world.edits().is_empty(),
+            "the trunk must come from the generator"
+        );
+        assert_eq!(world.biome_at(-321, -354), Biome::Forest);
+        assert_eq!(world.surface_height(-321, -354), 35);
+        assert_eq!(world.block_at(-321, 35, -354), Block::Grass);
+        for y in 36..=40 {
+            assert_eq!(world.block_at(-321, y, -354), Block::Wood, "y={y}");
+        }
+        assert_eq!(world.block_at(-321, 41, -354), Block::Leaves);
     }
 }
