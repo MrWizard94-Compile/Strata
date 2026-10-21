@@ -34,6 +34,19 @@ The canonical local project is `C:\WPAI\Software\Rust Based Voxel`, an independe
 
 The original 40-byte vertex assertion failed when adding the texture-layer field intentionally changed the contract to 44 bytes. The test now verifies size, normal/color/layer offsets and GPU attribute format. Geometry-area and intended-behavior assertions were not weakened.
 
+## Walking controller
+
+2026-10-21. Walking accelerates and brakes instead of snapping to the wish velocity. At the fixed 60 Hz tick: walk 5 m/s, forward sprint 8 m/s, sneak 1.6 m/s, ground accel 10, ground friction 8, air accel 2, air drag 0.15, jump 8.2 m/s, gravity 25 m/s², terminal velocity 48 m/s. Coyote time and the jump buffer are 6 ticks. Sprint applies only while moving forward. Holding jump takes off once per landing. Sneak does not walk off a supporting edge. Full blocks are not auto-stepped. Axis sweeps stop flush on walls, ceilings, and fast landings. Save schema 1 is unchanged. Flight speeds stay 14 and 36 m/s.
+
+Linux verification of this change, Rust 1.97.1:
+
+- `cargo fmt --check`: passed.
+- `cargo test --locked`: **68 passed, 0 failed, 1 ignored GPU test**.
+- `cargo clippy --locked --all-targets -- -D warnings`: passed.
+- `cargo build --release --locked`: passed.
+
+The ignored GPU test was not re-run. No Windows playtest of the new walk, jump, sneak, or collision feel was done. These unit tests do not prove the rendered player flow.
+
 ## Native evidence and limits
 
 The runs in this section are the 2026-10-20 checkpoint. They predate generator 2. The retained seed 728491 save is a generator 1 file: current code rejects it and leaves the bytes in place. Those runs are not evidence that the current generator loads that world.
