@@ -22,9 +22,9 @@ The canonical local project is `C:\WPAI\Software\Rust Based Voxel`, an independe
 
 Linux cloud VM: Intel Xeon, 4 logical CPUs, 16,387,280 kB MemTotal, no GPU adapter. This is not the Windows / GTX 1660 Ti acceptance machine.
 
-Terrain draws are 8-byte greedy quads plus a 16-byte chunk-origin immediate. The logical corner used by geometry digests stays 44 bytes and is not uploaded. The camera uniform is unchanged; the historical brightness table is a separate vertex uniform. Each upload callback copies at most the remaining byte budget, aligned to 8 bytes, and cannot be interrupted. A larger mesh stays hidden until its last slice. There is no oversized exception. The first slice still allocates the full GPU buffer inside the callback.
+Terrain draws are 8-byte greedy quads plus a 16-byte chunk-origin immediate. The logical corner used by geometry digests stays 44 bytes and is not uploaded. Day/night appends sky, fog, and sun fields, so the camera uniform is 272 bytes. The historical brightness table stays a separate vertex uniform. Each upload callback copies at most the remaining byte budget, aligned to 8 bytes, and cannot be interrupted. The destination buffer is allocated before that timed copy. A larger mesh stays hidden until its last slice, and the previous visible mesh stays on screen until the replacement completes. There is no oversized exception. The 4 MiB cap remains. An adapter without 16-byte immediates stops at startup with a readable error.
 
-`cargo fmt --check`, `cargo test --locked` (62 passed, 0 failed, 1 ignored), `cargo clippy --locked --all-targets -- -D warnings` and `cargo build --release --locked` passed on this VM. The ignored GPU pipeline test was run and failed immediately: no wgpu adapter (`supported_backends` Vulkan and GL, `active_backends` empty). Packed shader pipelines were not validated on a GPU. The 2026-10-20 Windows GPU pass does not cover this shader.
+`cargo fmt --check`, `cargo test --locked` (91 passed, 0 failed, 1 ignored) and `cargo clippy --locked --all-targets -- -D warnings` passed on this VM after rebasing onto `188b322` (world gen and day/night). The ignored GPU pipeline test was run on this rebase and failed immediately: no wgpu adapter (`supported_backends` Vulkan and GL, `active_backends` empty). Packed shader pipelines were not validated on a GPU here. The 2026-10-20 Windows GPU pass does not cover this shader.
 
 Release CPU report: `evidence/cpu-20261021-linux-vm-01.json`. Geometry digests and triangle counts match `evidence/cpu-20261020-01.json`. Payload bytes are `quads × 8`.
 
@@ -38,7 +38,7 @@ Release CPU report: `evidence/cpu-20261021-linux-vm-01.json`. Geometry digests a
 
 Linux VM meshing medians in that report, one release thread: route 35.434 ms, checkerboard 6.578 ms. These are a different CPU from the i7-9700 table and are not a speedup claim. Upload callback milliseconds were not measured.
 
-Twenty-two streaming tests cover aligned slices, a slow slice stopping the frame, edit and unload cancellation, a paused budget, stale revisions and shutdown. A 2 ms check between callbacks does not time the copy inside one callback. Native Windows / GTX 1660 Ti confirmation of that copy remains open.
+Twenty-three streaming tests cover aligned slices, a slow slice stopping the frame, allocation outside the timed copy, edit and unload cancellation, a paused budget, stale revisions and shutdown. A 2 ms check between callbacks does not time the copy inside one callback. Native Windows / GTX 1660 Ti confirmation of that copy remains open.
 
 Not in this change: camera-relative rendering and f32 far-coordinate precision; per-region edit invalidation generations; choosing an ECS before the gameplay loop.
 

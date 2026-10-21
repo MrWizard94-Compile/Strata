@@ -22,7 +22,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use streaming::{Streaming, UploadBudget, UploadStats};
+use streaming::{Streaming, UploadAction, UploadBudget, UploadStats};
 use streaming_trace::{StreamingTrace, TraceFrame, TraceHeader};
 use winit::{
     application::ApplicationHandler,
@@ -537,11 +537,18 @@ impl Game {
         for key in self.streaming.take_cancelled_uploads() {
             self.renderer.cancel_upload(key);
         }
-        self.last_upload = self
-            .streaming
-            .upload_ready(UploadBudget::default(), |slice| {
-                self.renderer.upload_slice(slice);
-            });
+        self.last_upload =
+            self.streaming
+                .upload_ready_prepared(UploadBudget::default(), |action| match action {
+                    UploadAction::Reserve {
+                        key,
+                        revision,
+                        mesh,
+                    } => {
+                        self.renderer.allocate_upload(key, revision, mesh);
+                    }
+                    UploadAction::Write(slice) => self.renderer.upload_slice(slice),
+                });
         if self.has_entered && now.duration_since(self.last_save) > Duration::from_secs(30) {
             self.last_save = now;
             self.save();
