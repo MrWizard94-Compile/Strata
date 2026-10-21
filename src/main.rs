@@ -2,6 +2,7 @@
 
 mod benchmark;
 mod daylight;
+mod interaction;
 mod material_export;
 mod materials;
 mod player;
@@ -13,6 +14,7 @@ mod world;
 
 use daylight::DayClock;
 use egui::{Align2, Color32, FontId, Pos2, Rect, RichText, Stroke, Vec2};
+use interaction::{EditOutcome, EditQuery, EditRepeat, Hotbar};
 use player::{Motion, Player};
 use renderer::{PresentOutcome, RenderCamera, Renderer};
 use save::SaveStore;
@@ -32,22 +34,12 @@ use winit::{
     keyboard::{KeyCode, PhysicalKey},
     window::{CursorGrabMode, Window, WindowId},
 };
-use world::{Block, World};
+use world::World;
 
 const ACCENT: Color32 = Color32::from_rgb(225, 184, 111);
 const IVORY: Color32 = Color32::from_rgb(242, 238, 225);
 const MUTED: Color32 = Color32::from_rgb(160, 178, 177);
 const PANEL: Color32 = Color32::from_rgba_premultiplied(12, 24, 28, 236);
-const HOTBAR: [Block; 8] = [
-    Block::Grass,
-    Block::Stone,
-    Block::Wood,
-    Block::Leaves,
-    Block::Sand,
-    Block::Clay,
-    Block::Crystal,
-    Block::Basalt,
-];
 
 struct Options {
     seed: u64,
@@ -156,7 +148,9 @@ struct Game {
     has_entered: bool,
     focused: bool,
     keys: HashSet<KeyCode>,
-    selected: usize,
+    hotbar: Hotbar,
+    edit_repeat: EditRepeat,
+    picker_open: bool,
     debug: bool,
     radius: i32,
     sensitivity: f32,
@@ -181,16 +175,17 @@ struct Game {
 impl Game {
     fn new(window: Arc<Window>, options: &Options) -> Result<Self, String> {
         let (saves, loaded) = SaveStore::open(&options.save_dir)?;
-        let (world, player, day, has_save) = match loaded {
+        let (world, player, hotbar, day, has_save) = match loaded {
             Some(snapshot) => {
                 let day = DayClock::from_fraction(snapshot.time_of_day())?;
+                let hotbar = Hotbar::from_saved(snapshot.hotbar(), snapshot.selected_slot());
                 let world = snapshot.world();
-                (world, Player::restore(snapshot.player), day, true)
+                (world, Player::restore(snapshot.player), hotbar, day, true)
             }
             None => {
                 let world = World::new(options.seed);
                 let player = Player::new(&world);
-                (world, player, DayClock::morning(), false)
+                (world, player, Hotbar::default(), DayClock::morning(), false)
             }
         };
         let renderer = pollster::block_on(Renderer::new(Arc::clone(&window)))?;
@@ -264,7 +259,9 @@ impl Game {
             has_entered: false,
             focused: true,
             keys: HashSet::new(),
-            selected: 0,
+            hotbar,
+            edit_repeat: EditRepeat::new(),
+            picker_open: false,
             debug: false,
             radius: 4,
             sensitivity: 1.0,
@@ -321,22 +318,47 @@ impl Game {
         self.frame_times.clear();
         self.next_redraw = Instant::now();
         self.accumulator = 0.0;
+        self.picker_open = false;
+        self.edit_repeat.clear();
         self.capture_cursor(true);
-        self.notify("WASD to explore · mouse to look · Esc to pause");
+        self.notify("WASD to explore · mouse to look · E for blocks · Esc to pause");
         println!("STRATA_ENTER eye={:?}", self.player.eye.to_array());
     }
 
     fn pause(&mut self) {
         self.screen = Screen::Paused;
+        self.picker_open = false;
+        self.edit_repeat.clear();
         self.keys.clear();
         self.capture_cursor(false);
     }
 
+    fn toggle_picker(&mut self) {
+        if self.picker_open {
+            self.close_picker();
+        } else {
+            self.picker_open = true;
+            self.edit_repeat.clear();
+            self.keys.clear();
+            self.capture_cursor(false);
+        }
+    }
+
+    fn close_picker(&mut self) {
+        self.picker_open = false;
+        if self.screen == Screen::Playing {
+            self.capture_cursor(true);
+        }
+    }
+
     fn save(&mut self) -> bool {
-        match self
-            .saves
-            .save(&self.world, self.player.snapshot(), self.day.fraction())
-        {
+        match self.saves.save(
+            &self.world,
+            self.player.snapshot(),
+            self.day.fraction(),
+            self.hotbar.slots(),
+            self.hotbar.selected() as u8,
+        ) {
             Ok(()) => {
                 self.dirty = false;
                 self.last_save = Instant::now();
@@ -353,42 +375,48 @@ impl Game {
     }
 
     fn edit(&mut self, place: bool) {
-        if self.screen != Screen::Playing {
+        if self.screen != Screen::Playing || self.picker_open {
             return;
         }
-        let Some(hit) = self.world.raycast(
-            self.player.eye.to_array(),
-            self.player.direction().to_array(),
-            8.0,
-        ) else {
-            return;
-        };
-        let position = if place { hit.previous } else { hit.block };
-        if place && self.player.occupies(position) {
-            self.notify("Step back to place a block here.");
-            return;
-        }
-        if !(-30..159).contains(&position[1]) {
-            self.notify("This build supports edits between -30 and 158 blocks high.");
-            return;
-        }
-        if self.world.edits().len() >= 99_999 {
-            self.notify("This world's current edit limit has been reached.");
-            return;
-        }
-        let block = if place {
-            HOTBAR[self.selected]
-        } else {
-            Block::Air
-        };
-        Arc::make_mut(&mut self.world).set_block(position, block);
-        self.streaming.invalidate_edit(position);
-        self.dirty = true;
-        println!(
-            "STRATA_EDIT action={} position={position:?} material={}",
-            if place { "place" } else { "break" },
-            block.name()
+        let edit_count = self.world.edits().len();
+        let eye = self.player.eye.to_array();
+        let direction = self.player.direction().to_array();
+        let material = self.hotbar.selected_block();
+        let outcome = interaction::plan_edit(
+            &EditQuery {
+                world: &self.world,
+                eye,
+                direction,
+                place,
+                material,
+                edit_count,
+            },
+            |position| self.player.occupies(position),
         );
+        match outcome {
+            EditOutcome::Miss => {}
+            EditOutcome::Rejected(message) => self.notify(message),
+            EditOutcome::Applied { position, block } => {
+                Arc::make_mut(&mut self.world).set_block(position, block);
+                self.streaming.invalidate_edit(position);
+                self.dirty = true;
+                println!(
+                    "STRATA_EDIT action={} position={position:?} material={}",
+                    if place { "place" } else { "break" },
+                    block.name()
+                );
+            }
+        }
+    }
+
+    fn repeat_edits(&mut self) {
+        let fires = self.edit_repeat.simulation_tick();
+        if fires.break_block {
+            self.edit(false);
+        }
+        if fires.place_block {
+            self.edit(true);
+        }
     }
 
     fn keyboard(&mut self, code: KeyCode, pressed: bool, repeat: bool) {
@@ -402,11 +430,13 @@ impl Game {
         }
         match code {
             KeyCode::Escape => match self.screen {
+                Screen::Playing if self.picker_open => self.close_picker(),
                 Screen::Playing => self.pause(),
                 Screen::Paused => self.enter(),
                 Screen::Settings => self.screen = self.settings_return,
                 Screen::Title => {}
             },
+            KeyCode::KeyE if self.screen == Screen::Playing => self.toggle_picker(),
             KeyCode::Enter if self.screen == Screen::Title || self.screen == Screen::Paused => {
                 self.enter()
             }
@@ -438,14 +468,14 @@ impl Game {
             KeyCode::KeyC => self.edit(true),
             // Arrow keys stay in `self.keys`. Turning is applied once per
             // simulation tick, so holding a key does not depend on OS repeat.
-            KeyCode::Digit1 => self.selected = 0,
-            KeyCode::Digit2 => self.selected = 1,
-            KeyCode::Digit3 => self.selected = 2,
-            KeyCode::Digit4 => self.selected = 3,
-            KeyCode::Digit5 => self.selected = 4,
-            KeyCode::Digit6 => self.selected = 5,
-            KeyCode::Digit7 => self.selected = 6,
-            KeyCode::Digit8 => self.selected = 7,
+            KeyCode::Digit1 => self.hotbar.select(0),
+            KeyCode::Digit2 => self.hotbar.select(1),
+            KeyCode::Digit3 => self.hotbar.select(2),
+            KeyCode::Digit4 => self.hotbar.select(3),
+            KeyCode::Digit5 => self.hotbar.select(4),
+            KeyCode::Digit6 => self.hotbar.select(5),
+            KeyCode::Digit7 => self.hotbar.select(6),
+            KeyCode::Digit8 => self.hotbar.select(7),
             _ => {}
         }
     }
@@ -474,14 +504,12 @@ impl Game {
             time: self.start.elapsed().as_secs_f32(),
             fog_distance: self.radius as f32 * 32.0 - 12.0,
             daylight: self.day.sample(),
-            selected: if self.screen == Screen::Playing {
-                self.world
-                    .raycast(
-                        self.player.eye.to_array(),
-                        self.player.direction().to_array(),
-                        8.0,
-                    )
-                    .map(|h| h.block)
+            selected: if self.screen == Screen::Playing && !self.picker_open {
+                interaction::outline_target(
+                    &self.world,
+                    self.player.eye.to_array(),
+                    self.player.direction().to_array(),
+                )
             } else {
                 None
             },
@@ -508,8 +536,13 @@ impl Game {
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_frame).as_secs_f32();
         self.last_frame = now;
-        let (steps, accumulator) =
-            simulation_steps(self.screen, self.focused, self.accumulator, elapsed);
+        let simulating = self.screen == Screen::Playing && self.focused && !self.picker_open;
+        let (steps, accumulator) = if simulating {
+            simulation_steps(self.screen, self.focused, self.accumulator, elapsed)
+        } else {
+            // Title, pause, settings, focus loss, and the material picker freeze the clock.
+            simulation_steps(Screen::Paused, false, self.accumulator, elapsed)
+        };
         self.accumulator = accumulator;
         if steps > 0 {
             let motion = self.motion();
@@ -521,7 +554,10 @@ impl Game {
                 self.player
                     .tick(&self.world, motion, daylight::SIM_TICK_SECONDS);
                 self.day.advance(false);
+                self.repeat_edits();
             }
+        } else if !self.picker_open {
+            self.edit_repeat.clear();
         }
         let camera = self.camera();
         // UI actions below can change these for the next redraw. Keep each
@@ -563,7 +599,7 @@ impl Game {
         self.egui_state
             .handle_platform_output(&self.window, output.platform_output);
         if self.screen == Screen::Playing {
-            self.window.set_cursor_visible(false);
+            self.window.set_cursor_visible(self.picker_open);
         }
         let paint_jobs = context.tessellate(output.shapes, output.pixels_per_point);
         let mut present_interval_ms = None;
@@ -710,7 +746,7 @@ impl Game {
                             if secondary_button(ui,"Settings") { self.settings_return=Screen::Paused; self.screen=Screen::Settings; }
                             if secondary_button(ui,"Save and quit") && self.save() { self.should_exit=true; }
                             ui.add_space(10.0);
-                            ui.label(RichText::new("WASD  Move     Space  Jump     Shift  Sprint\nF  Flight     1–8  Material     F5  Save\nLeft click / X  Break     Right click / C  Place\nArrows  Turn     F3  Performance     Esc  Pause").size(12.0).color(MUTED));
+                            ui.label(RichText::new("WASD  Move     Space  Jump     Shift  Sprint\nF  Flight     1–8 / Wheel  Hotbar     E  Blocks\nLeft click / X  Break     Right click / C  Place\nHold the mouse button to repeat     F5  Save\nArrows  Turn     F3  Performance     Esc  Pause").size(12.0).color(MUTED));
                         }
                         Screen::Settings => {
                             ui.label(RichText::new("MAKE YOURSELF AT HOME").color(ACCENT).size(11.0));
@@ -741,9 +777,9 @@ impl Game {
                 painter.line_segment([c + a, c + b], Stroke::new(1.6, IVORY));
             }
             let slot = 56.0;
-            let total = slot * 8.0;
+            let total = slot * interaction::HOTBAR_SLOTS as f32;
             let start = Pos2::new(bounds.center().x - total / 2.0, bounds.bottom() - 86.0);
-            for (i, block) in HOTBAR.iter().enumerate() {
+            for (i, block) in self.hotbar.slots().into_iter().enumerate() {
                 let rect = Rect::from_min_size(
                     start + Vec2::new(i as f32 * slot, 0.0),
                     Vec2::splat(slot - 4.0),
@@ -751,13 +787,13 @@ impl Game {
                 painter.rect_filled(
                     rect,
                     4.0,
-                    if i == self.selected {
+                    if i == self.hotbar.selected() {
                         Color32::from_rgba_premultiplied(66, 68, 51, 235)
                     } else {
                         PANEL
                     },
                 );
-                if i == self.selected {
+                if i == self.hotbar.selected() {
                     painter.rect_stroke(
                         rect,
                         4.0,
@@ -789,21 +825,23 @@ impl Game {
             painter.text(
                 Pos2::new(bounds.center().x, bounds.bottom() - 101.0),
                 Align2::CENTER_BOTTOM,
-                HOTBAR[self.selected].name(),
+                self.hotbar.selected_block().name(),
                 FontId::proportional(14.0),
                 IVORY,
             );
             painter.text(
                 Pos2::new(bounds.center().x, bounds.bottom() - 17.0),
                 Align2::CENTER_BOTTOM,
-                "BREAK  LMB    /    PLACE  RMB    /    FLIGHT  F    /    PAUSE  ESC",
+                "BREAK  LMB    /    PLACE  RMB    /    BLOCKS  E    /    FLIGHT  F    /    PAUSE  ESC",
                 FontId::monospace(10.0),
                 IVORY,
             );
             painter.text(
                 Pos2::new(36.0, 96.0),
                 Align2::LEFT_TOP,
-                if self.player.flying {
+                if self.picker_open {
+                    "CHOOSING A MATERIAL"
+                } else if self.player.flying {
                     "FREE FLIGHT"
                 } else {
                     "EXPLORING"
@@ -811,6 +849,9 @@ impl Game {
                 FontId::monospace(10.0),
                 IVORY,
             );
+            if self.picker_open {
+                self.draw_picker(ctx);
+            }
         }
         let (loaded, total) = self.streaming.progress();
         if loaded < total {
@@ -876,6 +917,109 @@ impl Game {
                 });
             });
         }
+    }
+
+    fn draw_picker(&mut self, ctx: &egui::Context) {
+        egui::Area::new(egui::Id::unique("block-picker"))
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(PANEL)
+                    .inner_margin(20.0)
+                    .corner_radius(4.0)
+                    .show(ui, |ui| {
+                        ui.set_width(560.0);
+                        ui.label(RichText::new("MATERIALS").color(ACCENT).size(11.0));
+                        ui.add_space(6.0);
+                        ui.label(
+                            RichText::new(format!(
+                                "Slot {}  ·  {}",
+                                self.hotbar.selected() + 1,
+                                self.hotbar.selected_block().name()
+                            ))
+                            .size(18.0)
+                            .strong(),
+                        );
+                        ui.label(
+                            RichText::new(
+                                "Click a material to fill the selected slot. 1–8 or the wheel change the slot. E or Esc closes.",
+                            )
+                            .color(MUTED)
+                            .size(12.0),
+                        );
+                        ui.add_space(10.0);
+                        let equipped = self.hotbar.selected_block();
+                        egui::Grid::new("placeable-blocks")
+                            .spacing(Vec2::new(8.0, 8.0))
+                            .show(ui, |ui| {
+                                for (index, block) in interaction::placeable_blocks().into_iter().enumerate()
+                                {
+                                    let color = block.color();
+                                    let fill = Color32::from_rgb(
+                                        (color[0] * 255.0) as u8,
+                                        (color[1] * 255.0) as u8,
+                                        (color[2] * 255.0) as u8,
+                                    );
+                                    let mut button = egui::Button::new(
+                                        RichText::new(block.name()).size(13.0).color(swatch_text(color)),
+                                    )
+                                    .fill(fill)
+                                    .min_size(Vec2::new(132.0, 40.0));
+                                    if block == equipped {
+                                        button = button.stroke(Stroke::new(2.0, ACCENT));
+                                    }
+                                    if ui.add(button).clicked() && self.hotbar.assign(block) {
+                                        self.dirty = true;
+                                        self.notify(format!(
+                                            "{} is in slot {}.",
+                                            block.name(),
+                                            self.hotbar.selected() + 1
+                                        ));
+                                    }
+                                    if (index + 1).is_multiple_of(4) {
+                                        ui.end_row();
+                                    }
+                                }
+                            });
+                    });
+            });
+    }
+}
+
+fn swatch_text(color: [f32; 4]) -> Color32 {
+    let luminance = color[0] * 0.3 + color[1] * 0.59 + color[2] * 0.11;
+    if luminance > 0.62 {
+        Color32::from_rgb(24, 34, 34)
+    } else {
+        IVORY
+    }
+}
+
+fn gameplay_key(code: KeyCode) -> bool {
+    matches!(
+        code,
+        KeyCode::Escape
+            | KeyCode::KeyE
+            | KeyCode::F3
+            | KeyCode::F4
+            | KeyCode::F5
+            | KeyCode::Enter
+            | KeyCode::Digit1
+            | KeyCode::Digit2
+            | KeyCode::Digit3
+            | KeyCode::Digit4
+            | KeyCode::Digit5
+            | KeyCode::Digit6
+            | KeyCode::Digit7
+            | KeyCode::Digit8
+    )
+}
+
+fn mouse_places(button: MouseButton) -> Option<bool> {
+    match button {
+        MouseButton::Left => Some(false),
+        MouseButton::Right => Some(true),
+        _ => None,
     }
 }
 
@@ -963,23 +1107,28 @@ impl ApplicationHandler for Application {
                     game.keyboard(code, event.state == ElementState::Pressed, event.repeat);
                 }
             }
-            WindowEvent::MouseInput {
-                state: ElementState::Pressed,
-                button,
-                ..
-            } if !response.consumed && game.screen == Screen::Playing => match button {
-                MouseButton::Left => game.edit(false),
-                MouseButton::Right => game.edit(true),
-                _ => {}
-            },
+            WindowEvent::MouseInput { state, button, .. }
+                if game.screen == Screen::Playing && !game.picker_open =>
+            {
+                if let Some(place) = mouse_places(button) {
+                    match state {
+                        ElementState::Pressed if !response.consumed => {
+                            if game.edit_repeat.press(place) {
+                                game.edit(place);
+                            }
+                        }
+                        ElementState::Released => game.edit_repeat.release(place),
+                        _ => {}
+                    }
+                }
+            }
             WindowEvent::MouseWheel { delta, .. } if game.screen == Screen::Playing => {
                 let y = match delta {
                     MouseScrollDelta::LineDelta(_, y) => y,
                     MouseScrollDelta::PixelDelta(p) => p.y as f32,
                 };
                 if y != 0.0 {
-                    game.selected = (game.selected as i32 + if y > 0.0 { -1 } else { 1 })
-                        .rem_euclid(8) as usize;
+                    game.hotbar.scroll(if y > 0.0 { -1 } else { 1 });
                 }
             }
             WindowEvent::RedrawRequested => game.redraw(),
@@ -1001,6 +1150,7 @@ impl ApplicationHandler for Application {
         if let Some(game) = &mut self.game
             && game.screen == Screen::Playing
             && game.focused
+            && !game.picker_open
             && let DeviceEvent::MouseMotion { delta } = event
         {
             game.player.look(
@@ -1034,12 +1184,7 @@ fn simulation_steps(
     if !(screen == Screen::Playing && focused) {
         return (0, 0.0);
     }
-    accumulator += elapsed.min(0.1);
-    let mut steps = 0u32;
-    while accumulator >= daylight::SIM_TICK_SECONDS {
-        accumulator -= daylight::SIM_TICK_SECONDS;
-        steps += 1;
-    }
+    let steps = interaction::drain_simulation_ticks(&mut accumulator, elapsed);
     (steps, accumulator)
 }
 
@@ -1092,11 +1237,7 @@ fn report_startup_failure(error: &str) {
 }
 
 fn game_key_reaches_game(code: KeyCode, egui_consumed: bool) -> bool {
-    !egui_consumed
-        || matches!(
-            code,
-            KeyCode::Escape | KeyCode::F3 | KeyCode::F4 | KeyCode::F5 | KeyCode::Enter
-        )
+    !egui_consumed || gameplay_key(code)
 }
 
 fn apply_debug_hour_skip(
@@ -1244,7 +1385,7 @@ mod tests {
         assert_eq!(clock.tick(), start.tick());
         assert!(accumulator.abs() < 1e-4);
         let (burst, left) = simulation_steps(Screen::Playing, true, 0.0, 10.0);
-        let capped = 0.1_f32;
+        let capped = interaction::FRAME_HITCH_CAP_SECONDS;
         assert!((left + burst as f32 * daylight::SIM_TICK_SECONDS - capped).abs() < 1e-5);
         assert!(left < daylight::SIM_TICK_SECONDS);
         assert!(burst < 60);
@@ -1254,6 +1395,8 @@ mod tests {
     fn f4_reaches_the_game_and_skips_one_hour_only_while_debugging() {
         assert!(game_key_reaches_game(KeyCode::F4, true));
         assert!(game_key_reaches_game(KeyCode::F4, false));
+        assert!(game_key_reaches_game(KeyCode::KeyE, true));
+        assert!(game_key_reaches_game(KeyCode::Digit1, true));
         assert!(!game_key_reaches_game(KeyCode::KeyW, true));
         assert!(game_key_reaches_game(KeyCode::Escape, true));
 

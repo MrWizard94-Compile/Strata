@@ -107,6 +107,17 @@ impl Block {
         !matches!(self, Self::Air | Self::Water)
     }
 
+    /// Solid blocks can be placed. Air and fluids such as water cannot.
+    /// A new solid variant is placeable as soon as [`Self::from_id`] knows it.
+    pub fn is_placeable(self) -> bool {
+        self.is_solid()
+    }
+
+    /// Every block id the save format can name, in stable id order.
+    pub fn all() -> impl Iterator<Item = Self> {
+        (0..=u8::MAX).filter_map(Self::from_id)
+    }
+
     pub fn from_id(id: u8) -> Option<Self> {
         Some(match id {
             0 => Self::Air,
