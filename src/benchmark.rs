@@ -1,13 +1,12 @@
 //! Reproducible, single-threaded CPU measurements of the production world mesher.
 //! Dataset creation, mesh inspection, destruction, and report I/O are not timed.
 
-use crate::world::{Block, CHUNK_SIZE, ChunkKey, Mesh, Vertex, World};
+use crate::world::{Block, CHUNK_SIZE, ChunkKey, Mesh, World};
 use serde::Serialize;
 use std::{
     fs::{self, OpenOptions},
     hint::black_box,
     io::Write,
-    mem::size_of,
     path::Path,
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
@@ -33,6 +32,7 @@ const ROUTE: [ChunkKey; 12] = [
 #[derive(Serialize)]
 struct Report {
     schema_version: u32,
+    payload_encoding: &'static str,
     dataset_version: u32,
     measured_at_unix_seconds: u64,
     measurement: &'static str,
@@ -68,6 +68,7 @@ struct ScenarioReport {
     elapsed_ms: Summary,
     samples_ms: Vec<f64>,
     vertices_per_run: usize,
+    quads_per_run: usize,
     triangles_per_run: usize,
     mesh_payload_bytes_per_run: usize,
     surface_area_per_run: f64,
@@ -86,6 +87,7 @@ struct Summary {
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Geometry {
     vertices: usize,
+    quads: usize,
     triangles: usize,
     bytes: usize,
     surface_area: f64,
@@ -143,6 +145,7 @@ pub fn run_cpu_benchmark(output: &Path) -> Result<(), String> {
             elapsed_ms: summarize(&samples)?,
             samples_ms: samples,
             vertices_per_run: expected.vertices,
+            quads_per_run: expected.quads,
             triangles_per_run: expected.triangles,
             mesh_payload_bytes_per_run: expected.bytes,
             surface_area_per_run: expected.surface_area,
@@ -151,7 +154,8 @@ pub fn run_cpu_benchmark(output: &Path) -> Result<(), String> {
         });
     }
     let report = Report {
-        schema_version: 1,
+        schema_version: 2,
+        payload_encoding: "packed_quad_8",
         dataset_version: 1,
         measured_at_unix_seconds: SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -174,7 +178,7 @@ pub fn run_cpu_benchmark(output: &Path) -> Result<(), String> {
         chunk_size: CHUNK_SIZE,
         warmup_runs_per_scenario: 1,
         measured_runs_per_scenario: RUNS,
-        digest_algorithm: "FNV-1a-64 over chunk keys/counts and ordered little-endian vertex f32 bits, texture-layer u32 and index u32 values; noncryptographic",
+        digest_algorithm: "FNV-1a-64 over chunk keys, logical corner/index counts, ordered little-endian expanded corner f32 bits, texture-layer u32 and index u32 values; noncryptographic. GPU payload is packed quads and is not hashed.",
         scenarios: reports,
     };
     let mut bytes = serde_json::to_vec_pretty(&report)
@@ -278,6 +282,7 @@ fn measure(scenario: &Scenario) -> Result<(f64, Geometry), String> {
     let mut elapsed_ms = 0.0;
     let mut geometry = Geometry {
         vertices: 0,
+        quads: 0,
         triangles: 0,
         bytes: 0,
         surface_area: 0.0,
@@ -294,16 +299,17 @@ fn measure(scenario: &Scenario) -> Result<(f64, Geometry), String> {
 }
 
 fn inspect_mesh(mesh: &Mesh, key: ChunkKey, geometry: &mut Geometry) -> Result<(), String> {
-    if !mesh.indices.len().is_multiple_of(3) {
+    let expanded = mesh.expand();
+    if !expanded.indices.len().is_multiple_of(3) {
         return Err("index count is not divisible by three".into());
     }
     for value in [key.0, key.1, key.2] {
         digest_bytes(&mut geometry.digest, &value.to_le_bytes());
     }
-    for count in [mesh.vertices.len(), mesh.indices.len()] {
+    for count in [expanded.vertices.len(), expanded.indices.len()] {
         digest_bytes(&mut geometry.digest, &(count as u64).to_le_bytes());
     }
-    for vertex in &mesh.vertices {
+    for vertex in &expanded.vertices {
         for value in vertex
             .position
             .iter()
@@ -317,16 +323,22 @@ fn inspect_mesh(mesh: &Mesh, key: ChunkKey, geometry: &mut Geometry) -> Result<(
         }
         digest_bytes(&mut geometry.digest, &vertex.texture_layer.to_le_bytes());
     }
-    for &index in &mesh.indices {
-        if index as usize >= mesh.vertices.len() {
+    for &index in &expanded.indices {
+        if index as usize >= expanded.vertices.len() {
             return Err("index outside vertex buffer".into());
         }
         digest_bytes(&mut geometry.digest, &index.to_le_bytes());
     }
-    for triangle in mesh.indices.chunks_exact(3) {
-        let a = mesh.vertices[triangle[0] as usize].position.map(f64::from);
-        let b = mesh.vertices[triangle[1] as usize].position.map(f64::from);
-        let c = mesh.vertices[triangle[2] as usize].position.map(f64::from);
+    for triangle in expanded.indices.chunks_exact(3) {
+        let a = expanded.vertices[triangle[0] as usize]
+            .position
+            .map(f64::from);
+        let b = expanded.vertices[triangle[1] as usize]
+            .position
+            .map(f64::from);
+        let c = expanded.vertices[triangle[2] as usize]
+            .position
+            .map(f64::from);
         let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
         let ac = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
         let cross = [
@@ -340,10 +352,10 @@ fn inspect_mesh(mesh: &Mesh, key: ChunkKey, geometry: &mut Geometry) -> Result<(
         }
         geometry.surface_area += area;
     }
-    geometry.vertices += mesh.vertices.len();
-    geometry.triangles += mesh.indices.len() / 3;
-    geometry.bytes +=
-        mesh.vertices.len() * size_of::<Vertex>() + mesh.indices.len() * size_of::<u32>();
+    geometry.vertices += expanded.vertices.len();
+    geometry.quads += mesh.quads.len();
+    geometry.triangles += expanded.indices.len() / 3;
+    geometry.bytes += mesh.payload_bytes();
     Ok(())
 }
 
@@ -458,6 +470,59 @@ mod tests {
             if scenario.name == "edited_terrain_route" {
                 edited_route = Some(geometry);
             }
+            if scenario.name == "seeded_route" || scenario.name == "edited_terrain_route" {
+                let mut opaque = 0u32;
+                let mut cutout = 0u32;
+                let mut translucent = 0u32;
+                for key in &scenario.chunks {
+                    let mesh = scenario.world.mesh_chunk(*key);
+                    opaque += mesh.opaque_quads;
+                    cutout += mesh.cutout_quads;
+                    translucent += mesh.translucent_quads;
+                    assert_eq!(
+                        mesh.opaque_quads as usize
+                            + mesh.cutout_quads as usize
+                            + mesh.translucent_quads as usize,
+                        mesh.quads.len()
+                    );
+                }
+                let expected: (usize, usize, usize, String, u32, u32, u32) =
+                    if scenario.name == "seeded_route" {
+                        (
+                            13551,
+                            108_408,
+                            27_102,
+                            "d732c9d403bf9a68".to_string(),
+                            10_792,
+                            2_759,
+                            0,
+                        )
+                    } else {
+                        (
+                            13_589,
+                            108_712,
+                            27_178,
+                            "553186af4f85dbdf".to_string(),
+                            10_830,
+                            2_759,
+                            0,
+                        )
+                    };
+                assert_eq!(
+                    (
+                        geometry.quads,
+                        geometry.bytes,
+                        geometry.triangles,
+                        format!("{:016x}", geometry.digest),
+                        opaque,
+                        cutout,
+                        translucent
+                    ),
+                    expected,
+                    "{}",
+                    scenario.name
+                );
+            }
         }
         assert_ne!(route.unwrap().digest, edited_route.unwrap().digest);
         assert!(route.unwrap().triangles > 0);
@@ -467,6 +532,21 @@ mod tests {
             .unwrap();
         let (_, geometry) = measure(checkerboard).unwrap();
         assert_eq!(geometry.triangles, (CHUNK_SIZE as usize).pow(3) / 2 * 12);
+        assert_eq!(geometry.bytes, 786_432);
+        assert_eq!(
+            format!("{:016x}", geometry.digest),
+            "9b90a6ba4714f004",
+            "all-stone checkerboard has no leaves, so the digest stays"
+        );
+        let isolated = scenarios
+            .iter()
+            .find(|scenario| scenario.name == "isolated_solid_chunk")
+            .unwrap();
+        let (_, isolated_geometry) = measure(isolated).unwrap();
+        assert_eq!(
+            format!("{:016x}", isolated_geometry.digest),
+            "41be41bea5c6c402"
+        );
     }
 
     #[test]

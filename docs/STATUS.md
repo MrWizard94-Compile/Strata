@@ -18,6 +18,51 @@ Unverified: interactive dawn, noon, dusk, and night appearance, mouse play, and 
 
 The canonical local project is `C:\WPAI\Software\Rust Based Voxel`, an independent Git root. `origin` now points to `https://github.com/MrWizard94-Compile/Strata.git`; fetch succeeded. The repository is public. The director subsequently authorized committing and pushing all project changes. Source checkpoints and a Windows CI workflow are being delivered on development; this is not a production release.
 
+## 2026-10-21 packed quads and segmented uploads
+
+Linux cloud VM: Intel Xeon, 4 logical CPUs, 16,387,280 kB MemTotal, no GPU adapter. This is not the Windows / GTX 1660 Ti acceptance machine.
+
+Terrain draws are 8-byte greedy quads plus a 16-byte chunk-origin immediate. The logical corner used by geometry digests stays 44 bytes and is not uploaded. Day/night appends sky, fog, and sun fields, so the camera uniform is 272 bytes. The historical brightness table stays a separate vertex uniform. Each upload callback copies at most the remaining byte budget, aligned to 8 bytes, and cannot be interrupted. The destination buffer is allocated before that timed copy. A larger mesh stays hidden until its last slice, and the previous visible mesh stays on screen until the replacement completes. There is no oversized exception. The 4 MiB cap remains. An adapter without 16-byte immediates stops at startup with a readable error.
+
+`cargo fmt --check`, `cargo test --locked` (91 passed, 0 failed, 1 ignored) and `cargo clippy --locked --all-targets -- -D warnings` passed on this VM after rebasing onto `188b322` (world gen and day/night). The ignored GPU pipeline test was run on this rebase and failed immediately: no wgpu adapter (`supported_backends` Vulkan and GL, `active_backends` empty). Packed shader pipelines were not validated on a GPU here. The 2026-10-20 Windows GPU pass does not cover this shader.
+
+Release CPU report: `evidence/cpu-20261021-linux-vm-01.json`. Geometry digests and triangle counts match `evidence/cpu-20261020-01.json`. Payload bytes are `quads × 8`.
+
+| Scenario | Triangles | Quads | Packed payload bytes | 2026-10-20 payload bytes |
+|---|---:|---:|---:|---:|
+| Seeded terrain route | 27,306 | 13,653 | 109,224 | 2,730,600 |
+| Edited terrain route | 27,320 | 13,660 | 109,280 | 2,732,000 |
+| Isolated solid chunk | 612 | 306 | 2,448 | 61,200 |
+| Checkerboard | 196,608 | 98,304 | 786,432 | 19,660,800 |
+| Empty and enclosed | 0 | 0 | 0 | 0 |
+
+Linux VM meshing medians in that report, one release thread: route 35.434 ms, checkerboard 6.578 ms. These are a different CPU from the i7-9700 table and are not a speedup claim. Upload callback milliseconds were not measured.
+
+Twenty-three streaming tests cover aligned slices, a slow slice stopping the frame, allocation outside the timed copy, edit and unload cancellation, a paused budget, stale revisions and shutdown. A 2 ms check between callbacks does not time the copy inside one callback. Native Windows / GTX 1660 Ti confirmation of that copy remains open.
+
+Not in this change: camera-relative rendering and f32 far-coordinate precision; per-region edit invalidation generations; choosing an ECS before the gameplay loop.
+
+## 2026-10-21 leaf cutout and translucent water
+
+Same Linux cloud VM as the packed-quad section. Geometry counts below are from the locked test suite after generator 2, not from `evidence/cpu-20261021-linux-vm-01.json` and not from the GTX 1660 Ti.
+
+Leaves stay solid for collision and ambient occlusion and do not occlude the block behind them. A leaf face is emitted only against air or water, in a depth-writing cutout pass that discards texel alpha below 0.5. Water is emitted only against air, then drawn in a later alpha-blended pass with depth testing and no depth write. The chunk is one packed-quad upload, ordered opaque, cutout, water. `payload_bytes` is still `quads × 8`. Nothing in that buffer is drawn until the last slice.
+
+Compared with the same generator and the previous face rule (a solid neighbor hid its face), the seed `728491` route grows by 296 quads, 592 triangles, and 2,368 bytes. Those are the solid faces leaves used to hide. Cutout count and water count on that route do not change; the route's twelve chunks contain no water surface. Checkerboard payload stays 786,432 bytes and digest `9b90a6ba4714f004`. Isolated solid digest stays `41be41bea5c6c402`.
+
+| Scenario | Triangles | Quads | Bytes | Opaque | Cutout | Water | Digest |
+|---|---:|---:|---:|---:|---:|---:|---|
+| Seeded route, previous face rule | 26,510 | 13,255 | 106,040 | 10,496 | 2,759 | 0 | `c1c77e5fe9a99379` |
+| Seeded route, leaves keep the solid face | 27,102 | 13,551 | 108,408 | 10,792 | 2,759 | 0 | `d732c9d403bf9a68` |
+| Edited route, previous face rule | 26,586 | 13,293 | 106,344 | 10,534 | 2,759 | 0 | `03d404629247c01f` |
+| Edited route, leaves keep the solid face | 27,178 | 13,589 | 108,712 | 10,830 | 2,759 | 0 | `553186af4f85dbdf` |
+| Ocean chunk `(-8, 0, -8)` | 3,062 | 1,531 | 12,248 | 1,485 | 0 | 46 | |
+| Checkerboard | 196,608 | 98,304 | 786,432 | 98,304 | 0 | 0 | `9b90a6ba4714f004` |
+
+The extra 2,368 route bytes still fit in one 4 MiB callback. Upload milliseconds were not measured. Leaf holes are 208 of 1,024 texels. The 1-pixel leaf mip alpha is 203. Non-leaf mips stay opaque, including the sRGB black/white average of 188.
+
+`cargo fmt --check`, `cargo test --locked` (94 passed, 0 failed, 1 ignored) and `cargo clippy --locked --all-targets -- -D warnings` passed on this VM. The ignored GPU pipeline test was run here and failed immediately: no wgpu adapter (`supported_backends` Vulkan and GL, `active_backends` empty). Opaque, cutout, and water pipelines were not validated on a GPU. The 2026-10-20 Windows GPU pass and the lavapipe pass recorded for day/night do not cover this shader.
+
 ## Source and artifact verification
 
 - Deterministic generator 2 terrain is integrated: plains, forest, desert, ocean, and beach, with sea-level water, caves, grid-anchored trees, and coal, iron, gold, and diamond. Sparse edits, greedy meshing, DDA targeting, walking/jump/flight, body collision, bounded streaming and versioned two-slot saves are integrated. Generator 1 saves are rejected and left untouched.
@@ -76,32 +121,27 @@ Next: split oversized GPU uploads, measure observer overhead and moving-world/GP
 
 ## Section 0 completion audit
 
-This is scored against the full requested result. FAIL rows prevent a production/completion claim, while the checkpoint evidence above remains valid.
+The 2026-10-20 narrative above is unchanged. This table is the audit after the packed-quad change. FAIL rows still prevent a production or playable-acceptance claim.
 
 | # | Score | Evidence or gap |
 |---|---|---|
 | 1 | FAIL | Full production game and pitch incomplete |
-| 2 | PASS | Current implemented dependencies resolved and exercised |
-| 3 | PASS | Current format/tests/lint/GPU validation/release build clean |
-| 4 | FAIL | Regressions pass; full interactive/adversarial/lifecycle matrix incomplete |
-| 5 | PASS | README, architecture, measurement/material contracts and tracker synchronized |
+| 2 | PASS | Current implemented dependencies resolved and exercised by the locked Linux build |
+| 3 | FAIL | Linux VM format, tests, clippy and release build passed. The GPU pipeline test found no adapter, so the packed shader was not validated on a device. The 2026-10-20 Windows GPU pass predates this shader |
+| 4 | FAIL | Streaming regressions pass, including segmented upload. Full interactive, adversarial and lifecycle matrix incomplete |
+| 5 | PASS | Architecture, streaming, benchmark and status docs describe the packed contract. Historical 2026-10-20 tables were kept |
 | 6 | PASS | Current local boundaries, save validation/locking and no-overwrite behavior reviewed |
-| 7 | FAIL | CPU baseline and native upload/queue traces measured; full frame/GPU/movement/resource budgets open |
+| 7 | FAIL | Packed payload bytes measured on the Linux VM. Upload milliseconds and frame admission on the GTX 1660 Ti were not remeasured. One callback of up to 4 MiB remains uninterruptible |
 | 8 | PASS | Declared toolchain and library graph respected |
-| 9 | FAIL | Coherent source checkpoint; production installation/update/recovery package incomplete |
+| 9 | FAIL | Source checkpoint in progress; production installation, update and recovery package incomplete |
 | 10 | PASS | Hardware/storage considered; authority and user data preserved |
-| 11 | FAIL | Locked local build/hashes; Windows CI added, independent result and release reproducibility remain separate gates |
-| 12 | FAIL | Original material provenance; full dependency/license/advisory/name review open |
-| 13 | PASS | Bounded specialist ownership and root integration recorded |
-| 14 | PASS | Commands, provenance, review artifacts, limits and next actions recorded |
-| 15 | PASS | Self-audit below separates evidence classes |
+| 11 | FAIL | Locked local build. Windows CI for this commit is a separate gate and was not observed here |
+| 12 | FAIL | Original material provenance; full dependency, license, advisory and name review open |
+| 13 | PASS | Renderer, streaming and world ownership stayed in their modules |
+| 14 | PASS | Commands, Linux-versus-Windows limits and next actions recorded |
+| 15 | PASS | This audit separates source tests, the Linux CPU report and the absent GPU upload timing |
 
-Source tests and native GPU validation passed for the textured implementation.
-The executable loaded the retained save, presented the scene, closed and rejected a concurrent writer.
-Exported materials were decoded against runtime bytes and the contact sheet was inspected.
-Three CPU runs retained matching geometry with exact source/binary provenance.
-Interactive re-entry and complete presentation quality remain unverified because current UI control failed.
-Production gameplay, integrated budgets, release/license gates, external playtests and pitch readiness remain incomplete.
+Source tests passed on the Linux VM. They do not prove a rendered player flow. The packed shader was not pipeline-validated here. Production gameplay, native upload timing, release and license gates, external playtests and pitch readiness remain incomplete.
 
 Frozen law remains `MrWizard94-Compile/Agents-Constitution@0010a8353b00754fad31a30ed24327d3b6d05425` (6.16.4) for this continuing invocation. Byte-exact load/source and accepted workflow were verified earlier.
 
