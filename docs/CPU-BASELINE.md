@@ -21,6 +21,8 @@ Machine: i7-9700, 8 cores/8 logical, 51,409,334,272 RAM bytes, Windows 11 Home 1
 
 Exact release SHA256: `8987752CF362DBC4CB780B6DDC31AD8D78C54DCCE60ADC632E009E9B971DA8AB`. Reports were taken before the initial Git source commit; sidecars disclose the uncommitted tree and SHA256 every source input instead of pretending a commit identified it. Root built and checked the source immediately before these `-SkipBuild` runs. PNG export and texturing were integrated in this measured build; each vertex is 44 bytes, including its texture layer.
 
+These payload bytes are the 44-byte expanded corner format plus indices, measured on 2026-10-20. A later packed-quad format changes the GPU payload and does not rewrite this table. See the 2026-10-21 section of [STATUS.md](STATUS.md).
+
 This is partial evidence for S2.P1/R01 and PITCH-07. GPU times, frame-time traces during movement/edits, upload/queue latency, peak RAM/VRAM, cold startup distributions, long sessions and equivalent competing-engine comparisons remain open. No full-game performance target is claimed as passed.
 
 The initial source checkpoint removes trailing blank lines from Cargo.toml and rust-toolchain.toml and normalizes Git text line endings. These cosmetic changes occurred after measurement; the retained raw input hashes describe the measured files. Rust and WGSL behavior is unchanged. Evidence files retain their exact original bytes in Git.
