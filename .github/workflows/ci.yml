@@ -35,6 +35,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: PowerShell entry point syntax
+        run: |
+          foreach ($script in @('run.ps1', 'benchmark-cpu.ps1', 'trace-streaming.ps1', 'package-windows.ps1')) {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $PWD $script), [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count) { $errors; exit 1 }
+          }
       - name: Install the pinned toolchain
         run: |
           rustup show
@@ -44,34 +52,24 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Formatting
         run: cargo fmt --check
-      - name: Source regression suite
+      # Same command as the Linux job: no test name, --lib, --bins, or --skip.
+      # Cargo still omits #[ignore] on every OS. The only ignored test is the
+      # GPU pipeline check, which the Linux job runs afterwards on lavapipe.
+      # golden_chunks_match_platform_independent_hashes is a normal #[test]
+      # with no target cfg, so this command runs it on Windows whenever the
+      # revision under test contains it.
+      - name: Full locked test suite
         run: cargo test --locked
       - name: Strict linting
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Locked release build
+        env:
+          # Same link flags as the zip players download. A local cargo build
+          # without this flag is a different executable.
+          RUSTFLAGS: -C target-feature=+crt-static
         run: cargo build --release --locked
-      - name: Release executable hides the console
-        run: |
-          $exe = Join-Path $PWD 'target\release\strata.exe'
-          $bytes = [System.IO.File]::ReadAllBytes($exe)
-          if ($bytes.Length -lt 96) { throw 'Release executable is too small to be a PE file.' }
-          $pe = [BitConverter]::ToInt32($bytes, 0x3C)
-          if ($pe -lt 0 -or ($pe + 96) -gt $bytes.Length) { throw "Invalid PE header offset: $pe" }
-          $signature = [BitConverter]::ToUInt32($bytes, $pe)
-          if ($signature -ne 0x00004550) { throw 'Missing PE signature.' }
-          $magic = [BitConverter]::ToUInt16($bytes, $pe + 24)
-          if ($magic -ne 0x20B) { throw "Expected a PE32+ executable, found magic 0x$($magic.ToString('X'))." }
-          $subsystem = [BitConverter]::ToUInt16($bytes, $pe + 24 + 68)
-          if ($subsystem -ne 2) { throw "Release subsystem is $subsystem; expected 2 (Windows GUI, no console)." }
-          Write-Host 'Release executable uses the Windows GUI subsystem.'
-      - name: PowerShell entry point syntax
-        run: |
-          foreach ($script in @('run.ps1', 'benchmark-cpu.ps1', 'trace-streaming.ps1')) {
-            $tokens = $null
-            $errors = $null
-            [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $PWD $script), [ref]$tokens, [ref]$errors) | Out-Null
-            if ($errors.Count) { $errors; exit 1 }
-          }
+      - name: Validate the Windows player zip
+        run: ./package-windows.ps1 -Executable target\release\strata.exe -ZipName strata-windows-x86_64.zip
       # The ignored GPU test runs on the Linux job with lavapipe. Neither job
       # proves interactive play on the acceptance machine.
 
@@ -103,7 +101,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Formatting
         run: cargo fmt --check
-      - name: Source regression suite
+      - name: Full locked test suite
         run: cargo test --locked
       - name: Shader pipeline validation
         env:

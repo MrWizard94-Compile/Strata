@@ -1,11 +1,15 @@
 name: Playable build
 
 # Manual runs upload downloadable zips as workflow artifacts (kept 30 days).
-# A push of a v* tag also publishes those zips on a GitHub Release. This
-# workflow does not run on pull requests. The publish job is the only job
-# that can write to the repository, and only when the ref is a version tag.
-# macOS is omitted: hosted macOS minutes are a separate cost, and this
-# repository has no verified Mac build.
+# A push of a v* tag also publishes those zips on a GitHub Release. The
+# Windows zip is the primary artifact. This workflow does not run on pull
+# requests. The publish job is the only job that can write to the repository,
+# and only when the ref is a version tag.
+#
+# Another platform is another `package.strategy.matrix.include` row:
+#   family: windows   uses package-windows.ps1
+#   family: unix      copies matrix.binary, checks matrix.binary_kind, zips it
+# Leave a row out until that OS has actually been built. macOS is not a row.
 
 on:
   push:
@@ -35,21 +39,31 @@ jobs:
           - os: windows-latest
             label: windows-x86_64
             shell: pwsh
+            family: windows
             zip: strata-windows-x86_64.zip
+            binary: strata.exe
+            rustflags: "-C target-feature=+crt-static"
+            shaders: false
+            binary_kind: ""
           # Ubuntu 22.04 keeps the published binary on glibc 2.35. The image
           # is scheduled for removal in April 2027; when it goes, move this
-          # job forward and update the glibc note in PLAYING.md.
+          # row forward and update the glibc note in PLAYING.md.
           - os: ubuntu-22.04
             label: linux-x86_64
             shell: bash
+            family: unix
             zip: strata-linux-x86_64.zip
+            binary: strata
+            rustflags: ""
+            shaders: true
+            binary_kind: ELF 64-bit
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Install lavapipe
-        if: runner.os == 'Linux'
+        if: matrix.shaders == true
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers libvulkan1 zip
@@ -66,24 +80,25 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           rustc --version
           cargo --version
-        if: runner.os == 'Windows'
+        if: matrix.family == 'windows'
       - name: Install the pinned toolchain
         run: |
           rustup show
           rustc --version
           cargo --version
-        if: runner.os == 'Linux'
+        if: matrix.family == 'unix'
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Formatting
         run: cargo fmt --check
 
-      - name: Source regression suite
+      # Unfiltered on every OS row. Do not add a test name or --skip here.
+      - name: Full locked test suite
         run: cargo test --locked
 
       - name: Shader pipeline validation
-        if: runner.os == 'Linux'
+        if: matrix.shaders == true
         env:
           VK_DRIVER_FILES: ${{ env.LAVAPIPE_ICD }}
           VK_ICD_FILENAMES: ${{ env.LAVAPIPE_ICD }}
@@ -93,58 +108,61 @@ jobs:
       - name: Strict linting
         run: cargo clippy --locked --all-targets -- -D warnings
 
-      - name: Locked Windows release build
-        if: runner.os == 'Windows'
-        shell: pwsh
+      - name: Locked release build
         env:
-          # The distributed executable must not ask for the Visual C++ runtime.
-          RUSTFLAGS: -C target-feature=+crt-static
+          RUSTFLAGS: ${{ matrix.rustflags }}
         run: cargo build --release --locked
 
-      - name: Locked Linux release build
-        if: runner.os == 'Linux'
-        run: cargo build --release --locked
+      - name: Validate and package Windows zip
+        if: matrix.family == 'windows'
+        run: ./package-windows.ps1 -Executable target\release\${{ matrix.binary }} -ZipName ${{ matrix.zip }}
 
-      - name: Release executable hides the console
-        if: runner.os == 'Windows'
-        shell: pwsh
+      - name: Package Unix zip
+        if: matrix.family == 'unix'
         run: |
-          $exe = Join-Path $PWD 'target\release\strata.exe'
-          $bytes = [System.IO.File]::ReadAllBytes($exe)
-          if ($bytes.Length -lt 96) { throw 'Release executable is too small to be a PE file.' }
-          $pe = [BitConverter]::ToInt32($bytes, 0x3C)
-          if ($pe -lt 0 -or ($pe + 96) -gt $bytes.Length) { throw "Invalid PE header offset: $pe" }
-          $signature = [BitConverter]::ToUInt32($bytes, $pe)
-          if ($signature -ne 0x00004550) { throw 'Missing PE signature.' }
-          $magic = [BitConverter]::ToUInt16($bytes, $pe + 24)
-          if ($magic -ne 0x20B) { throw "Expected a PE32+ executable, found magic 0x$($magic.ToString('X'))." }
-          $subsystem = [BitConverter]::ToUInt16($bytes, $pe + 24 + 68)
-          if ($subsystem -ne 2) { throw "Release subsystem is $subsystem; expected 2 (Windows GUI, no console)." }
-          Write-Host 'Release executable uses the Windows GUI subsystem.'
-
-      - name: Package Windows zip
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item -LiteralPath 'target\release\strata.exe' -Destination 'dist\strata.exe'
-          Copy-Item -LiteralPath 'PLAYING.md' -Destination 'dist\PLAYING.md'
-          if (Test-Path -LiteralPath '${{ matrix.zip }}') { Remove-Item -LiteralPath '${{ matrix.zip }}' }
-          tar -a -c -f '${{ matrix.zip }}' -C dist strata.exe PLAYING.md
-          $zip = Join-Path $PWD '${{ matrix.zip }}'
-          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash.ToLowerInvariant()
-          [System.IO.File]::WriteAllText("$zip.sha256", "$hash  ${{ matrix.zip }}`n")
-          Write-Host "$hash  ${{ matrix.zip }}"
-
-      - name: Package Linux zip
-        if: runner.os == 'Linux'
-        run: |
+          set -eu
+          kind='${{ matrix.binary_kind }}'
+          if [ -z "$kind" ]; then
+            echo 'A unix matrix row needs binary_kind, for example: ELF 64-bit'
+            exit 1
+          fi
+          if ! command -v zip >/dev/null 2>&1 || ! command -v file >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends zip file
+          fi
           mkdir -p dist
-          cp target/release/strata dist/strata
-          chmod 755 dist/strata
+          cp "target/release/${{ matrix.binary }}" "dist/${{ matrix.binary }}"
+          chmod 755 "dist/${{ matrix.binary }}"
           cp PLAYING.md dist/PLAYING.md
-          file dist/strata | grep -q 'ELF 64-bit'
-          zip -j '${{ matrix.zip }}' dist/strata dist/PLAYING.md
+          file "dist/${{ matrix.binary }}" | grep -q "$kind"
+          zip -j '${{ matrix.zip }}' "dist/${{ matrix.binary }}" dist/PLAYING.md
+          rm -rf unpack
+          mkdir unpack
+          python3 -m zipfile -e '${{ matrix.zip }}' unpack
+          names="$(cd unpack && find . -type f -print | sed 's|^\./||' | sort | paste -sd, -)"
+          if [ "$names" != "PLAYING.md,${{ matrix.binary }}" ]; then
+            echo "Unix zip contains [$names]; expected ${{ matrix.binary }} and PLAYING.md."
+            exit 1
+          fi
+          # Python's extractor drops the Unix mode. Check the mode stored in
+          # the zip, then mark the unpacked file executable so this job can launch it.
+          python3 -c 'import sys,zipfile; info=zipfile.ZipFile(sys.argv[1]).getinfo(sys.argv[2]); mode=(info.external_attr>>16)&0o777; sys.exit(0 if mode & 0o111 else "zip mode %s is not executable" % oct(mode))' '${{ matrix.zip }}' '${{ matrix.binary }}'
+          chmod 755 "unpack/${{ matrix.binary }}"
+          set +e
+          help="$( "unpack/${{ matrix.binary }}" --help 2>&1 )"
+          code=$?
+          set -e
+          if [ "$code" -ne 2 ]; then
+            printf '%s\n' "$help"
+            echo "Packaged unix binary exited $code; expected 2 from --help."
+            exit 1
+          fi
+          printf '%s\n' "$help" | grep -q 'STRATA'
+          "unpack/${{ matrix.binary }}" --export-materials unpack/materials
+          pngs="$(find unpack/materials -type f -name '*.png' | wc -l | tr -d ' ')"
+          test "$pngs" -ge 14
+          test -f unpack/materials/contact-sheet.png
+          test -f unpack/materials/manifest.json
           sha256sum '${{ matrix.zip }}' | tee '${{ matrix.zip }}.sha256'
 
       - name: Upload zip
@@ -184,11 +202,18 @@ jobs:
           set -eu
           find dist -type f -print
           cd dist
-          test -f strata-windows-x86_64.zip
-          test -f strata-linux-x86_64.zip
-          test -f strata-windows-x86_64.zip.sha256
-          test -f strata-linux-x86_64.zip.sha256
-          sort -o SHA256SUMS.txt strata-windows-x86_64.zip.sha256 strata-linux-x86_64.zip.sha256
+          primary=strata-windows-x86_64.zip
+          test -f "$primary"
+          test -f "$primary.sha256"
+          mapfile -t extras < <(find . -maxdepth 1 -type f -name 'strata-*.zip' ! -name "$primary" | sort)
+          {
+            cat "$primary.sha256"
+            for extra in "${extras[@]}"; do
+              base="$(basename "$extra")"
+              test -f "$base.sha256"
+              cat "$base.sha256"
+            done
+          } > SHA256SUMS.txt
           sha256sum -c SHA256SUMS.txt
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             echo "Release $GITHUB_REF_NAME already exists. Refusing to replace it."
@@ -198,8 +223,8 @@ jobs:
           Early playable build of STRATA, a working title. This is not a finished game and it is not a signed installer.
 
           ## Files
-          - strata-windows-x86_64.zip — 64-bit Windows. Unzip it and run strata.exe. If SmartScreen warns, choose More info, then Run anyway.
-          - strata-linux-x86_64.zip — 64-bit Linux, built on Ubuntu 22.04. It needs glibc 2.35 or newer, a Vulkan driver, and a desktop session.
+          - strata-windows-x86_64.zip — download this on Windows. Unzip it and run strata.exe. If SmartScreen warns, choose More info, then Run anyway. The zip is only that exe and PLAYING.md.
+          - strata-linux-x86_64.zip — extra Linux build, made on Ubuntu 22.04. It needs glibc 2.35 or newer, a Vulkan driver, and a desktop session.
           - SHA256SUMS.txt — checksums of those zip files.
 
           There is no Mac download. Playing, saves, and how to report a problem are in PLAYING.md inside each zip.
@@ -238,10 +263,13 @@ jobs:
             echo
             cat SHA256SUMS.txt
           } >> release-notes.md
+          release_files=("$primary")
+          for extra in "${extras[@]}"; do
+            release_files+=("$(basename "$extra")")
+          done
+          release_files+=(SHA256SUMS.txt)
           gh release create "$GITHUB_REF_NAME" \
             --verify-tag \
             --title "STRATA $GITHUB_REF_NAME" \
             --notes-file release-notes.md \
-            strata-windows-x86_64.zip \
-            strata-linux-x86_64.zip \
-            SHA256SUMS.txt
+            "${release_files[@]}"

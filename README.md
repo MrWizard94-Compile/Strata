@@ -4,7 +4,7 @@ An original Rust voxel engine and game in active development. **STRATA is a work
 
 The authoritative local project is `C:\WPAI\Software\Rust Based Voxel`, an independent Git repository. Its verified `origin` is [MrWizard94-Compile/Strata](https://github.com/MrWizard94-Compile/Strata), a public repository. The director authorized committing and pushing source checkpoints; the development branch contains ongoing engineering work, not a production release.
 
-To download a build and play without installing Rust, read [PLAYING.md](PLAYING.md).
+On Windows, download `strata-windows-x86_64.zip` and follow [PLAYING.md](PLAYING.md). You do not need Rust.
 
 ![Original 32x32 material contact sheet](docs/assets/materials-32-contact-sheet.png)
 
@@ -77,9 +77,9 @@ Source is private/unpublished project work. No general redistribution license ha
 
 `./trace-streaming.ps1 -TracePath evidence/new-trace.jsonl -SmokeSeconds 30` builds and records a native run with exact source/binary/hardware provenance. It starts on the title scene. See [STREAMING.md](docs/STREAMING.md) for admission limits, reproducible stress fixtures, observed costs and measurement limits.
 
-The [source-check workflow](.github/workflows/ci.yml) runs on every pull request into `development`, on pushes to that branch, and on `v*` tags. It does not run again for a push of a pull-request branch. Windows runs formatting, locked tests, strict clippy, a locked release build, a check that the release executable is a Windows GUI program (no console window), and a PowerShell syntax check. Linux runs the same format, test, clippy, and release build, and runs the ignored GPU test against lavapipe. Neither job is interactive acceptance.
+The [source-check workflow](.github/workflows/ci.yml) runs on every pull request into `development`, on pushes to that branch, and on `v*` tags. It does not run again for a push of a pull-request branch. Windows and Linux both run the same unfiltered `cargo test --locked` command, with no test name, `--lib`, or `--skip`. Windows then runs strict clippy and the same static-CRT release build that is zipped for players. That job then checks the exe is a Windows GUI program, imports no Visual C++ redistributable DLL, launches the unzipped `strata.exe` (help text and a material export, with no window), and checks the zip contains only that exe and `PLAYING.md`. Linux runs format, test, clippy, and a release build, and runs the ignored GPU test against lavapipe. Neither job is interactive play on the acceptance machine.
 
-The [playable-build workflow](.github/workflows/release.yml) runs when someone starts it by hand, and when a `v*` tag is pushed. A manual run uploads `strata-windows-x86_64.zip` and `strata-linux-x86_64.zip`, each with `PLAYING.md` and a SHA-256 file, and keeps them for 30 days. A version tag also attaches those zips and `SHA256SUMS.txt` to a GitHub Release. The Windows package is a release build with the C runtime linked statically. There is no Mac package. See [PLAYING.md](PLAYING.md).
+The [playable-build workflow](.github/workflows/release.yml) runs when someone starts it by hand, and when a `v*` tag is pushed. The primary file is `strata-windows-x86_64.zip` (the release exe, static C runtime, and `PLAYING.md`). `strata-linux-x86_64.zip` is the extra Linux build: that release binary plus `PLAYING.md`. A manual run keeps those files for 30 days. A version tag also attaches them and `SHA256SUMS.txt` to a GitHub Release, with the Windows zip first. Another platform is an extra matrix row in that workflow; none is enabled until it has been built. There is no Mac package. See [PLAYING.md](PLAYING.md).
 
 ## Stopping a broken change
 
