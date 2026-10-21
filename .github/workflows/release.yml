@@ -206,10 +206,13 @@ jobs:
     permissions:
       actions: write
     steps:
+      # A player zip is itself a .zip. Without this, download-artifact
+      # unpacks it and the checksum job cannot see the file that was uploaded.
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: dist
           merge-multiple: true
+          skip-decompress: true
       - name: Assemble SHA256SUMS.txt
         run: |
           set -eu
@@ -251,6 +254,7 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+          skip-decompress: true
       - name: Check checksums and publish
         env:
           GH_TOKEN: ${{ github.token }}
