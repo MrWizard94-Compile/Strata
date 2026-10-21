@@ -38,10 +38,10 @@ The original 40-byte vertex assertion failed when adding the texture-layer field
 
 2026-10-21. Walking accelerates and brakes instead of snapping to the wish velocity. At the fixed 60 Hz tick: walk 5 m/s, forward sprint 8 m/s, sneak 1.6 m/s, ground accel 10, ground friction 8, air accel 2, air drag 0.15, jump 8.2 m/s, gravity 25 m/s², terminal velocity 48 m/s. Coyote time and the jump buffer are 6 ticks. Sprint applies only while moving forward. Holding jump takes off once per landing. Sneak does not walk off a supporting edge. Full blocks are not auto-stepped. Each tick is split into 3D substeps whose largest component is at most 0.25 m; every substep resolves X, then Z, then Y and flushes to contact. A fast fall therefore meets a block lip before the rest of that tick's horizontal move. An impact from the air ends the ballistic sweep so the leftover slice does not walk off the lip. Save schema 1 is unchanged. Flight speeds stay 14 and 36 m/s.
 
-Linux verification of this change, Rust 1.97.1:
+Linux verification of this change, Rust 1.97.1, after rebasing onto day/night `188b322`:
 
 - `cargo fmt --check`: passed.
-- `cargo test --locked`: **73 passed, 0 failed, 1 ignored GPU test**.
+- `cargo test --locked`: **98 passed, 0 failed, 1 ignored GPU test**.
 - `cargo clippy --locked --all-targets -- -D warnings`: passed.
 - `cargo build --release --locked`: passed.
 
