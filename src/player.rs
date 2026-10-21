@@ -4,8 +4,8 @@
 //! starts and stops take a few fixed ticks instead of snapping. Callers pass
 //! the same `dt` for every tick (the app uses 60 Hz); a repeated input
 //! sequence is therefore deterministic. Render frame time only chooses how
-//! many of those ticks run. Full blocks are not auto-stepped — a one-block
-//! ledge is a jump.
+//! many of those ticks run. The body is an axis-aligned box swept against
+//! the voxel grid; full blocks are not auto-stepped.
 
 use crate::{save::PlayerSave, world::World};
 use glam::Vec3;
@@ -41,14 +41,15 @@ const FLIGHT_SPRINT_SPEED: f32 = 36.0;
 const HALF_WIDTH: f32 = 0.3;
 const FEET_BELOW_EYE: f32 = 1.6;
 const HEAD_ABOVE_EYE: f32 = 0.15;
-/// Shrinks the collision sample so a body flush with a face is not inside it.
+/// Shrinks the discrete overlap sample so a body flush with a face is not inside it.
 const SKIN: f32 = 0.001;
-/// Less than one block, so one 3D substep cannot step over a solid cell.
-const MAX_SUBSTEP: f32 = 0.25;
-const CONTACT_ITERS: u32 = 16;
-/// Bounds a pathological displacement. Each substep still stays within
-/// [`MAX_SUBSTEP`] on its largest axis; the cap does not enlarge steps.
-const MAX_SWEEP_STEPS: u32 = 256;
+/// Gap left between a leading face and the voxel plane it hits.
+const SWEEP_SKIN: f32 = 1.0e-4;
+/// Solid contacts resolved in one tick. Leftover motion is dropped.
+const MAX_SWEEP_ITERS: u32 = 4;
+/// Empty planes one axis query may cross. A fixed tick is well under this;
+/// the bound also covers the oversized steps used by tests.
+const MAX_SWEEP_PLANES: u32 = 96;
 
 pub struct Player {
     pub eye: Vec3,
@@ -80,12 +81,14 @@ pub struct Motion {
     pub sneak: bool,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum AxisHit {
-    None,
-    Wall,
-    Floor,
-    Ceiling,
+#[derive(Clone, Copy)]
+struct SweepHit {
+    /// Fraction of the current remaining displacement, in `(0, 1]`, or `0`
+    /// when the body is already inside a solid and moving deeper.
+    t: f32,
+    axis: usize,
+    /// Downward contact with a floor. Ceilings and walls leave this false.
+    floor: bool,
 }
 
 impl Player {
@@ -323,40 +326,53 @@ impl Player {
     }
 
     fn collide_move(&mut self, world: &World, dt: f32, edge_guard: bool) {
+        if dt <= 0.0 {
+            return;
+        }
         let had_ground = self.grounded;
         self.grounded = false;
-        // Integrate from the live velocity. A floor or ceiling hit zeros that
-        // component, so later substeps must not keep replaying the pre-impact slice.
-        let mut time_left = dt;
-        for _ in 0..MAX_SWEEP_STEPS {
-            if time_left <= 1.0e-8 || self.velocity.length_squared() <= 1.0e-12 {
+        let mut disp = self.velocity * dt;
+        if !disp.is_finite() {
+            self.velocity = Vec3::ZERO;
+            return;
+        }
+        // Sneak holds the edge for the whole tick. An arrival from the air
+        // keeps the support it just hit for the rest of this tick only, so the
+        // pre-impact horizontal remainder cannot walk off that lip.
+        let mut footing_guard = edge_guard;
+        for _ in 0..MAX_SWEEP_ITERS {
+            if disp.length_squared() <= 1.0e-12 {
                 break;
             }
-            let displacement = self.velocity * time_left;
-            let span = displacement
-                .x
-                .abs()
-                .max(displacement.y.abs())
-                .max(displacement.z.abs());
-            if !span.is_finite() {
+            let Some(hit) = earliest_hit(self.eye, disp, world, footing_guard) else {
+                self.eye += disp;
+                disp = Vec3::ZERO;
                 break;
-            }
-            let used = if span <= MAX_SUBSTEP {
-                time_left
-            } else {
-                time_left * (MAX_SUBSTEP / span)
             };
-            let step = self.velocity * used;
-            let hit = self.resolve_substep(world, step, edge_guard);
-            time_left -= used;
-            if hit == AxisHit::Floor {
+            let span = disp[hit.axis].abs();
+            let skin_t = if span > 1.0e-8 {
+                SWEEP_SKIN / span
+            } else {
+                0.0
+            };
+            let t = (hit.t - skin_t).clamp(0.0, hit.t);
+            self.eye += disp * t;
+            disp *= 1.0 - t;
+            disp[hit.axis] = 0.0;
+            self.velocity[hit.axis] = 0.0;
+            if hit.floor {
                 self.grounded = true;
-                // An airborne impact ends the ballistic sweep. Finishing the
-                // pre-impact horizontal slice would step off the lip that just
-                // stopped the fall. A tick that was already on the ground keeps
-                // sliding for the rest of its horizontal substeps.
                 if !had_ground {
-                    break;
+                    footing_guard = true;
+                }
+            }
+        }
+        // Four contacts were not enough. Drop the rest instead of tunneling,
+        // and clear the velocity that would try the same move again next tick.
+        if disp.length_squared() > 1.0e-12 {
+            for axis in 0..3 {
+                if disp[axis].abs() > 1.0e-8 {
+                    self.velocity[axis] = 0.0;
                 }
             }
         }
@@ -367,69 +383,6 @@ impl Player {
         if resting {
             self.grounded = true;
         }
-    }
-
-    /// One 3D slice: X, then Z, then Y, each flushed to contact.
-    fn resolve_substep(&mut self, world: &World, step: Vec3, edge_guard: bool) -> AxisHit {
-        self.move_axis(world, 0, step.x, edge_guard);
-        self.move_axis(world, 2, step.z, edge_guard);
-        self.move_axis(world, 1, step.y, false)
-    }
-
-    fn move_axis(&mut self, world: &World, axis: usize, delta: f32, edge_guard: bool) -> AxisHit {
-        if !delta.is_finite() || delta == 0.0 {
-            return AxisHit::None;
-        }
-        let mut remaining = delta;
-        for _ in 0..MAX_SWEEP_STEPS {
-            if remaining.abs() <= 1.0e-6 {
-                return AxisHit::None;
-            }
-            let step = remaining.clamp(-MAX_SUBSTEP, MAX_SUBSTEP);
-            if !self.blocked(axis, step, world, edge_guard) {
-                self.eye[axis] += step;
-                remaining -= step;
-                continue;
-            }
-            let resolved = self.contact_distance(axis, step, world, edge_guard);
-            if !self.blocked(axis, resolved, world, edge_guard) {
-                self.eye[axis] += resolved;
-            }
-            self.velocity[axis] = 0.0;
-            if axis != 1 {
-                return AxisHit::Wall;
-            }
-            return if delta < 0.0 {
-                AxisHit::Floor
-            } else {
-                AxisHit::Ceiling
-            };
-        }
-        AxisHit::None
-    }
-
-    fn contact_distance(&self, axis: usize, step: f32, world: &World, edge_guard: bool) -> f32 {
-        // `free` stays on the clear side of the contact, including zero.
-        let mut free = 0.0;
-        let mut blocked = step;
-        for _ in 0..CONTACT_ITERS {
-            let mid = free + (blocked - free) * 0.5;
-            if self.blocked(axis, mid, world, edge_guard) {
-                blocked = mid;
-            } else {
-                free = mid;
-            }
-        }
-        free
-    }
-
-    fn blocked(&self, axis: usize, delta: f32, world: &World, edge_guard: bool) -> bool {
-        let mut eye = self.eye;
-        eye[axis] += delta;
-        if !eye.is_finite() || Self::collides(eye, world) {
-            return true;
-        }
-        edge_guard && axis != 1 && !Self::has_footing(eye, world)
     }
 
     fn contain(&mut self, world: &World) {
@@ -459,6 +412,224 @@ impl Player {
     #[cfg(test)]
     fn horizontal_speed(&self) -> f32 {
         self.velocity.x.hypot(self.velocity.z)
+    }
+}
+
+fn earliest_hit(eye: Vec3, disp: Vec3, world: &World, footing_guard: bool) -> Option<SweepHit> {
+    let solid = earliest_solid(eye, disp, world);
+    let footing = if footing_guard {
+        earliest_footing_loss(eye, disp, world)
+    } else {
+        None
+    };
+    match (solid, footing) {
+        (Some(solid), Some(edge)) if hit_before(edge, solid) => Some(edge),
+        (Some(solid), _) => Some(solid),
+        (None, edge) => edge,
+    }
+}
+
+fn earliest_solid(eye: Vec3, disp: Vec3, world: &World) -> Option<SweepHit> {
+    let mut best: Option<SweepHit> = None;
+    for axis in 0..3 {
+        let delta = disp[axis];
+        if delta.abs() <= 1.0e-8 {
+            continue;
+        }
+        let Some(t) = axis_solid_time(eye, disp, axis, world) else {
+            continue;
+        };
+        consider(
+            &mut best,
+            SweepHit {
+                t,
+                axis,
+                floor: axis == 1 && delta < 0.0,
+            },
+        );
+    }
+    best
+}
+
+/// Earliest fraction at which the leading face enters a solid cell.
+fn axis_solid_time(eye: Vec3, disp: Vec3, axis: usize, world: &World) -> Option<f32> {
+    let delta = disp[axis];
+    let (min, max) = body_extents(eye);
+    let lead = if delta > 0.0 { max[axis] } else { min[axis] };
+    if let Some(cell) = interior_cell(lead)
+        && face_is_solid(eye, axis, cell, world)
+    {
+        return Some(0.0);
+    }
+    let mut plane = first_plane(lead, delta);
+    let step = if delta > 0.0 { 1.0 } else { -1.0 };
+    for _ in 0..MAX_SWEEP_PLANES {
+        let t = (plane - lead) / delta;
+        if t > 1.0 + 1.0e-5 {
+            return None;
+        }
+        if t >= -1.0e-6 {
+            let t = t.clamp(0.0, 1.0);
+            let cell = entered_cell(plane, delta);
+            if face_is_solid(eye + disp * t, axis, cell, world) {
+                return Some(t);
+            }
+        }
+        plane += step;
+    }
+    // The plane walk gave up while displacement remains. Treat that as an
+    // immediate stop so the body cannot skip the unsearched cells.
+    Some(0.0)
+}
+
+fn interior_cell(lead: f32) -> Option<i32> {
+    let floor = lead.floor();
+    let frac = lead - floor;
+    if !(1.0e-4..=1.0 - 1.0e-4).contains(&frac) {
+        return None;
+    }
+    Some(floor as i32)
+}
+
+fn first_plane(lead: f32, delta: f32) -> f32 {
+    if delta > 0.0 {
+        if (lead - lead.floor()).abs() <= 1.0e-5 {
+            lead
+        } else {
+            lead.ceil()
+        }
+    } else {
+        lead.floor()
+    }
+}
+
+fn entered_cell(plane: f32, delta: f32) -> i32 {
+    let index = plane.floor() as i32;
+    if delta > 0.0 { index } else { index - 1 }
+}
+
+fn face_is_solid(eye: Vec3, axis: usize, cell: i32, world: &World) -> bool {
+    let (min, max) = body_extents(eye);
+    let mut span = [(0, -1); 3];
+    for other in 0..3 {
+        if other == axis {
+            span[other] = (cell, cell);
+            continue;
+        }
+        let Some(range) = covered_cells(min[other], max[other]) else {
+            return false;
+        };
+        span[other] = range;
+    }
+    for z in span[2].0..=span[2].1 {
+        for y in span[1].0..=span[1].1 {
+            for x in span[0].0..=span[0].1 {
+                if world.block_at(x, y, z).is_solid() {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Cells the box covers on one axis. An exact far boundary is excluded so a
+/// body flush with a ceiling or wall can still slide along it.
+fn covered_cells(min_v: f32, max_v: f32) -> Option<(i32, i32)> {
+    let lo = min_v.floor() as i32;
+    let hi = (max_v - 1.0e-4).floor() as i32;
+    if hi < lo { None } else { Some((lo, hi)) }
+}
+
+fn earliest_footing_loss(eye: Vec3, disp: Vec3, world: &World) -> Option<SweepHit> {
+    if !Player::has_footing(eye, world) {
+        return None;
+    }
+    let mut best: Option<SweepHit> = None;
+    let (min, max) = body_extents(eye);
+    for axis in [0usize, 2] {
+        let delta = disp[axis];
+        if delta.abs() <= 1.0e-8 {
+            continue;
+        }
+        for edge in [min[axis] + SKIN, max[axis] - SKIN] {
+            let mut plane = if delta > 0.0 {
+                let ceil = edge.ceil();
+                if (ceil - edge).abs() <= 1.0e-5 {
+                    edge + 1.0
+                } else {
+                    ceil
+                }
+            } else {
+                let floor = edge.floor();
+                if (edge - floor).abs() <= 1.0e-5 {
+                    edge - 1.0
+                } else {
+                    floor
+                }
+            };
+            let step = if delta > 0.0 { 1.0 } else { -1.0 };
+            for _ in 0..4 {
+                let t = (plane - edge) / delta;
+                if t > 1.0 {
+                    break;
+                }
+                if t > 1.0e-6 {
+                    // Step far enough past the integer that floor() changes.
+                    // A 0.1 mm probe can sit exactly on the plane, where the
+                    // cell is still counted and the ledge looks safe.
+                    let past = if delta > 0.0 {
+                        plane + 1.0e-3
+                    } else {
+                        plane - 1.0e-3
+                    };
+                    let t_past = ((past - edge) / delta).min(1.0);
+                    if t_past > 0.0 && !Player::has_footing(eye + disp * t_past, world) {
+                        consider(
+                            &mut best,
+                            SweepHit {
+                                t,
+                                axis,
+                                floor: false,
+                            },
+                        );
+                        break;
+                    }
+                }
+                plane += step;
+            }
+        }
+    }
+    best
+}
+
+fn consider(best: &mut Option<SweepHit>, hit: SweepHit) {
+    if best.is_none_or(|current| hit_before(hit, current)) {
+        *best = Some(hit);
+    }
+}
+
+/// Earlier time wins. Equal times prefer a floor, then X, then Z, then a ceiling.
+fn hit_before(hit: SweepHit, other: SweepHit) -> bool {
+    const TIE: f32 = 1.0e-5;
+    if hit.t + TIE < other.t {
+        return true;
+    }
+    if other.t + TIE < hit.t {
+        return false;
+    }
+    hit_rank(hit) < hit_rank(other)
+}
+
+fn hit_rank(hit: SweepHit) -> u8 {
+    if hit.floor {
+        0
+    } else if hit.axis == 0 {
+        1
+    } else if hit.axis == 2 {
+        2
+    } else {
+        3
     }
 }
 
@@ -1322,7 +1493,7 @@ mod tests {
             player.eye.y
         );
         assert!(
-            (1.21..1.29).contains(&player.eye.x),
+            (1.20..1.31).contains(&player.eye.x),
             "slid past the lip to x {}",
             player.eye.x
         );
@@ -1650,5 +1821,200 @@ mod tests {
         let start = cruising.eye.z;
         cruising.tick(&world, walk(-1.0, 0.0, false), DT);
         assert!(cruising.eye.z - start < 0.3);
+    }
+
+    fn lip_eye(overlap: f32, vx: f32, vz: f32) -> Vec3 {
+        let x = if vx > 0.0 {
+            1.0 - overlap + HALF_WIDTH
+        } else if vx < 0.0 {
+            overlap - HALF_WIDTH
+        } else {
+            0.5
+        };
+        let z = if vz > 0.0 {
+            1.0 - overlap + HALF_WIDTH
+        } else if vz < 0.0 {
+            overlap - HALF_WIDTH
+        } else {
+            0.5
+        };
+        Vec3::new(x, 201.0 + 0.02 + FEET_BELOW_EYE, z)
+    }
+
+    fn supported(player: &Player, world: &World) -> bool {
+        player.grounded
+            && (202.59..202.76).contains(&player.eye.y)
+            && Player::has_footing(player.eye, world)
+            && !Player::collides(player.eye, world)
+    }
+
+    #[test]
+    fn swept_lip_matrix_lands_for_every_overlap() {
+        let angles = [0.0_f32, 15.0, 30.0, 45.0, 60.0, 90.0];
+        let signs = [(1.0_f32, 1.0_f32), (-1.0, 1.0), (1.0, -1.0), (-1.0, -1.0)];
+        let vys = [-8.0_f32, -15.0, -32.0, -48.0];
+        let overlaps = [0.02_f32, 0.05, 0.10, 0.15, 0.20];
+        for &vy in &vys {
+            let mut passed = 0usize;
+            let mut total = 0usize;
+            let mut first_miss = String::new();
+            for &deg in &angles {
+                let radians = deg.to_radians();
+                for &(sign_x, sign_z) in &signs {
+                    let vx = 8.0 * radians.cos() * sign_x;
+                    let vz = 8.0 * radians.sin() * sign_z;
+                    for &overlap in &overlaps {
+                        total += 1;
+                        let mut world = World::new(3);
+                        world.set_block([0, 200, 0], Block::Stone);
+                        let mut player = Player::new(&world);
+                        place(&mut player, lip_eye(overlap, vx, vz));
+                        player.velocity = Vec3::new(vx, vy, vz);
+                        player.tick(&world, Motion::default(), DT);
+                        if supported(&player, &world) {
+                            passed += 1;
+                        } else if first_miss.is_empty() {
+                            first_miss = format!(
+                                "deg={deg} sign=({sign_x},{sign_z}) overlap={overlap} eye={} grounded={} footing={}",
+                                player.eye,
+                                player.grounded,
+                                Player::has_footing(player.eye, &world)
+                            );
+                        }
+                    }
+                }
+            }
+            println!("lip vy={vy}: {passed}/{total}");
+            assert!(
+                first_miss.is_empty(),
+                "vy={vy} passed {passed}/{total}; first miss {first_miss}"
+            );
+        }
+    }
+
+    #[test]
+    fn negative_corner_lip_lands() {
+        let mut passed = 0usize;
+        for &overlap in &[0.04_f32, 0.08] {
+            for &vy in &[-8.0_f32, -48.0] {
+                let mut world = World::new(3);
+                world.set_block([-1, 200, -1], Block::Stone);
+                let speed = 8.0 / std::f32::consts::SQRT_2;
+                let mut player = Player::new(&world);
+                place(
+                    &mut player,
+                    Vec3::new(
+                        -1.0 + overlap - HALF_WIDTH,
+                        201.0 + 0.02 + FEET_BELOW_EYE,
+                        -1.0 + overlap - HALF_WIDTH,
+                    ),
+                );
+                player.velocity = Vec3::new(-speed, vy, -speed);
+                player.tick(&world, Motion::default(), DT);
+                assert!(
+                    supported(&player, &world),
+                    "negative corner overlap={overlap} vy={vy} at {} grounded={}",
+                    player.eye,
+                    player.grounded
+                );
+                passed += 1;
+            }
+        }
+        println!("negative corner: {passed}/4");
+    }
+
+    #[test]
+    fn sprint_jump_runway_lands_on_every_frame_phase() {
+        let mut landed_phases = 0usize;
+        for phase in 0..8 {
+            let mut world = World::new(3);
+            fill_box(&mut world, [-2, 160, -2], [40, 260, 2], Block::Air);
+            fill_box(&mut world, [0, 200, -1], [8, 200, 1], Block::Stone);
+            world.set_block([12, 200, 0], Block::Stone);
+            let mut player = Player::new(&world);
+            let start_x = 2.0 + phase as f32 * SPRINT_SPEED * DT / 8.0;
+            place(&mut player, Vec3::new(start_x, 210.0, 0.5));
+            settle(&mut player, &world);
+            face_positive_x(&mut player);
+            let jump_at = 7.2;
+            let mut jumped = false;
+            let mut landed = false;
+            for _ in 0..400 {
+                let takeoff = !jumped && player.eye.x >= jump_at;
+                if takeoff {
+                    jumped = true;
+                }
+                player.tick(
+                    &world,
+                    Motion {
+                        forward: 1.0,
+                        sprint: true,
+                        jump: takeoff,
+                        ..Motion::default()
+                    },
+                    DT,
+                );
+                if jumped && player.grounded && player.eye.x > 9.0 {
+                    landed = true;
+                    break;
+                }
+            }
+            assert!(landed, "phase {phase} never landed, at {}", player.eye);
+            assert!(
+                supported(&player, &world),
+                "phase {phase} missed the block at {}",
+                player.eye
+            );
+            assert!(
+                (12.0..13.0).contains(&player.eye.x),
+                "phase {phase} landed off the single block at {}",
+                player.eye
+            );
+            landed_phases += 1;
+        }
+        println!("sprint-jump runway phases: {landed_phases}/8");
+    }
+
+    #[test]
+    fn starting_overlap_does_not_launch_or_trap() {
+        let mut world = World::new(3);
+        fill_box(&mut world, [-2, 160, -2], [6, 240, 2], Block::Air);
+        fill_box(&mut world, [-2, 200, -1], [6, 200, 1], Block::Stone);
+        world.set_block([2, 201, 0], Block::Stone);
+        world.set_block([2, 202, 0], Block::Stone);
+        let buried = Vec3::new(1.72, 202.62, 0.5);
+
+        let mut leaving = Player::new(&world);
+        place(&mut leaving, buried);
+        leaving.grounded = true;
+        leaving.velocity = Vec3::new(-4.0, 0.0, 0.0);
+        leaving.tick(&world, Motion::default(), DT);
+        assert!(
+            leaving.eye.x < buried.x - 0.01,
+            "overlap trapped the outward move at {}",
+            leaving.eye
+        );
+        assert!(
+            leaving.eye.y < buried.y + 0.05,
+            "overlap launched the body to {}",
+            leaving.eye.y
+        );
+        assert!(!Player::collides(leaving.eye, &world));
+
+        let mut pushing = Player::new(&world);
+        place(&mut pushing, buried);
+        pushing.grounded = true;
+        pushing.velocity = Vec3::new(4.0, 0.0, 0.0);
+        pushing.tick(&world, Motion::default(), DT);
+        assert!(
+            pushing.eye.x <= buried.x + 1.0e-3,
+            "overlap shoved the body to {}",
+            pushing.eye
+        );
+        assert!(
+            pushing.eye.y <= buried.y + 0.02,
+            "overlap launched upward to {}",
+            pushing.eye.y
+        );
     }
 }
