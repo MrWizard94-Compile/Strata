@@ -170,13 +170,10 @@ pub fn validate_time_of_day(value: f32) -> Result<(), String> {
 }
 
 pub fn sample_daylight(fraction: f32) -> Daylight {
-    let fraction = if fraction.is_finite() {
-        fraction.rem_euclid(1.0)
-    } else {
-        0.0
-    };
+    let fraction = wrapped_fraction(fraction);
     let sun_height = ((fraction - 0.25) * TAU).sin();
-    let sun_glow = smoothstep(-0.04, 0.20, sun_height);
+    // Glow is 0.5 when the sun sits on the horizon and 0 once it is well below.
+    let sun_glow = smoothstep(-0.15, 0.15, sun_height);
     let sun_tint = sample_curve(fraction, &SUN_TINT);
     Daylight {
         sun_direction: sun_direction(fraction),
@@ -188,6 +185,23 @@ pub fn sample_daylight(fraction: f32) -> Daylight {
         sun_color: scale(sun_tint, SUN_INTENSITY * sun_glow),
         sun_glow,
         time_of_day: fraction,
+    }
+}
+
+fn wrapped_fraction(fraction: f32) -> f32 {
+    if !fraction.is_finite() {
+        return 0.0;
+    }
+    // f32::rem_euclid loses the remainder once the magnitude exceeds the mantissa.
+    let reduced = (fraction as f64).rem_euclid(1.0);
+    if !reduced.is_finite() {
+        return 0.0;
+    }
+    let reduced = reduced as f32;
+    if reduced.is_finite() && (0.0..1.0).contains(&reduced) {
+        reduced
+    } else {
+        0.0
     }
 }
 
@@ -355,6 +369,8 @@ mod tests {
         assert!(dusk.fog_color[0] > dusk.fog_color[2], "dusk fog is warm");
         assert!(dusk.sun_glow > midnight.sun_glow);
         assert!(dusk.sun_glow < noon.sun_glow);
+        assert!((sample_daylight(0.25).sun_glow - 0.5).abs() < 0.02);
+        assert!((dusk.sun_glow - 0.5).abs() < 0.02);
 
         assert!(midnight.sun_direction[1] < -0.7, "midnight sun is below");
         assert!(
@@ -413,6 +429,43 @@ mod tests {
                 assert!(color.iter().all(|channel| channel.is_finite()));
             }
             previous = next;
+        }
+    }
+
+    #[test]
+    fn extreme_inputs_stay_finite_and_sane() {
+        let midnight = sample_daylight(0.0);
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let light = sample_daylight(bad);
+            assert_eq!(light.time_of_day, midnight.time_of_day);
+            assert_eq!(light.sun_direction, midnight.sun_direction);
+            assert_eq!(light.sun_color, midnight.sun_color);
+            assert_eq!(light.sun_glow, midnight.sun_glow);
+        }
+        for huge in [1.0e10, -1.0e10, 1.0e20, -1.0e20, f32::MAX, f32::MIN] {
+            let light = sample_daylight(huge);
+            assert!(
+                light.time_of_day.is_finite() && (0.0..1.0).contains(&light.time_of_day),
+                "{huge} -> {}",
+                light.time_of_day
+            );
+            let length = dot(light.sun_direction, light.sun_direction).sqrt();
+            assert!(
+                (length - 1.0).abs() < 1e-4,
+                "sun length {length} for {huge}"
+            );
+            assert!((0.0..=1.0).contains(&light.sun_glow));
+            for color in [
+                light.sun_direction,
+                light.sky_horizon,
+                light.sky_zenith,
+                light.fog_color,
+                light.ambient_ground,
+                light.ambient_sky,
+                light.sun_color,
+            ] {
+                assert!(color.iter().all(|channel| channel.is_finite()), "{huge}");
+            }
         }
     }
 

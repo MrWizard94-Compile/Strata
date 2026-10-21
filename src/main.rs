@@ -411,11 +411,14 @@ impl Game {
                 self.enter()
             }
             KeyCode::F3 => self.debug = !self.debug,
-            KeyCode::F4 if self.debug => {
-                self.day.skip_hours(1.0);
-                if self.has_entered {
-                    self.dirty = true;
-                }
+            KeyCode::F4
+                if apply_debug_hour_skip(
+                    self.debug,
+                    &mut self.day,
+                    self.has_entered,
+                    &mut self.dirty,
+                ) =>
+            {
                 self.notify(self.day.label());
             }
             KeyCode::F5 => {
@@ -507,18 +510,16 @@ impl Game {
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_frame).as_secs_f32();
         self.last_frame = now;
-        if self.screen == Screen::Playing && self.focused {
-            self.accumulator += elapsed.min(0.1);
+        let (steps, accumulator) =
+            simulation_steps(self.screen, self.focused, self.accumulator, elapsed);
+        self.accumulator = accumulator;
+        if steps > 0 {
             let motion = self.motion();
-            while self.accumulator >= daylight::SIM_TICK_SECONDS {
+            for _ in 0..steps {
                 self.player
                     .tick(&self.world, motion, daylight::SIM_TICK_SECONDS);
-                // Pause, the title, and settings never reach this loop.
                 self.day.advance(false);
-                self.accumulator -= daylight::SIM_TICK_SECONDS;
             }
-        } else {
-            self.accumulator = 0.0;
         }
         let camera = self.camera();
         // UI actions below can change these for the next redraw. Keep each
@@ -949,17 +950,13 @@ impl ApplicationHandler for Application {
             WindowEvent::Resized(size) => game.renderer.resize(size.width, size.height),
             WindowEvent::Focused(focused) => {
                 game.focused = focused;
-                if !focused && game.screen == Screen::Playing {
+                if unfocused_play_pauses(game.screen, focused) {
                     game.pause();
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if let PhysicalKey::Code(code) = event.physical_key
-                    && (!response.consumed
-                        || matches!(
-                            code,
-                            KeyCode::Escape | KeyCode::F3 | KeyCode::F5 | KeyCode::Enter
-                        ))
+                    && game_key_reaches_game(code, response.consumed)
                 {
                     game.keyboard(code, event.state == ElementState::Pressed, event.repeat);
                 }
@@ -1024,6 +1021,54 @@ impl ApplicationHandler for Application {
     }
 }
 
+/// Steps the fixed clock may take this frame. Title, pause, settings, and
+/// focus loss clear the accumulator so the day does not advance.
+fn simulation_steps(
+    screen: Screen,
+    focused: bool,
+    mut accumulator: f32,
+    elapsed: f32,
+) -> (u32, f32) {
+    if !(screen == Screen::Playing && focused) {
+        return (0, 0.0);
+    }
+    accumulator += elapsed.min(0.1);
+    let mut steps = 0u32;
+    while accumulator >= daylight::SIM_TICK_SECONDS {
+        accumulator -= daylight::SIM_TICK_SECONDS;
+        steps += 1;
+    }
+    (steps, accumulator)
+}
+
+fn unfocused_play_pauses(screen: Screen, focused: bool) -> bool {
+    !focused && screen == Screen::Playing
+}
+
+fn game_key_reaches_game(code: KeyCode, egui_consumed: bool) -> bool {
+    !egui_consumed
+        || matches!(
+            code,
+            KeyCode::Escape | KeyCode::F3 | KeyCode::F4 | KeyCode::F5 | KeyCode::Enter
+        )
+}
+
+fn apply_debug_hour_skip(
+    debug: bool,
+    day: &mut DayClock,
+    has_entered: bool,
+    dirty: &mut bool,
+) -> bool {
+    if !debug {
+        return false;
+    }
+    day.skip_hours(1.0);
+    if has_entered {
+        *dirty = true;
+    }
+    true
+}
+
 fn main() {
     let options = match Options::parse() {
         Ok(o) => o,
@@ -1080,5 +1125,104 @@ fn main() {
     }
     if app.error.is_some() {
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn clock_after(screen: Screen, focused: bool, frames: u32) -> (DayClock, f32) {
+        let mut clock = DayClock::morning();
+        let mut accumulator = 0.0;
+        for _ in 0..frames {
+            let (steps, next) =
+                simulation_steps(screen, focused, accumulator, daylight::SIM_TICK_SECONDS);
+            accumulator = next;
+            for _ in 0..steps {
+                clock.advance(false);
+            }
+        }
+        (clock, accumulator)
+    }
+
+    #[test]
+    fn title_pause_settings_and_focus_loss_freeze_the_clock() {
+        let morning = DayClock::morning().fraction();
+        let (cleared, cleared_accumulator) =
+            simulation_steps(Screen::Paused, true, 0.04, daylight::SIM_TICK_SECONDS);
+        assert_eq!(cleared, 0);
+        assert_eq!(cleared_accumulator, 0.0);
+        for screen in [Screen::Title, Screen::Paused, Screen::Settings] {
+            for focused in [true, false] {
+                let (clock, accumulator) = clock_after(screen, focused, 180);
+                assert_eq!(clock.fraction(), morning);
+                assert_eq!(accumulator, 0.0);
+            }
+        }
+        let (playing, _) = clock_after(Screen::Playing, true, 120);
+        assert_eq!(playing.tick(), DayClock::morning().tick() + 120);
+
+        let mut screen = Screen::Playing;
+        let focused = false;
+        if unfocused_play_pauses(screen, focused) {
+            screen = Screen::Paused;
+        }
+        assert!(screen == Screen::Paused);
+        let (clock, accumulator) = clock_after(screen, focused, 90);
+        assert_eq!(clock.fraction(), morning);
+        assert_eq!(accumulator, 0.0);
+        assert!(!unfocused_play_pauses(Screen::Paused, false));
+        assert!(!unfocused_play_pauses(Screen::Title, false));
+        assert!(!unfocused_play_pauses(Screen::Settings, false));
+        assert!(!unfocused_play_pauses(Screen::Playing, true));
+    }
+
+    #[test]
+    fn three_days_of_focused_play_wrap_the_clock() {
+        let start = DayClock::from_fraction(0.0).unwrap();
+        let mut clock = start;
+        let mut accumulator = 0.0;
+        let frames = daylight::TICKS_PER_DAY * 3;
+        for _ in 0..frames {
+            let (steps, next) = simulation_steps(
+                Screen::Playing,
+                true,
+                accumulator,
+                daylight::SIM_TICK_SECONDS,
+            );
+            assert_eq!(steps, 1);
+            accumulator = next;
+            clock.advance(false);
+        }
+        assert_eq!(clock.tick(), start.tick());
+        assert!(accumulator.abs() < 1e-4);
+        let (burst, left) = simulation_steps(Screen::Playing, true, 0.0, 10.0);
+        let capped = 0.1_f32;
+        assert!((left + burst as f32 * daylight::SIM_TICK_SECONDS - capped).abs() < 1e-5);
+        assert!(left < daylight::SIM_TICK_SECONDS);
+        assert!(burst < 60);
+    }
+
+    #[test]
+    fn f4_reaches_the_game_and_skips_one_hour_only_while_debugging() {
+        assert!(game_key_reaches_game(KeyCode::F4, true));
+        assert!(game_key_reaches_game(KeyCode::F4, false));
+        assert!(!game_key_reaches_game(KeyCode::KeyW, true));
+        assert!(game_key_reaches_game(KeyCode::Escape, true));
+
+        let mut day = DayClock::morning();
+        let before = day.fraction();
+        let mut dirty = false;
+        assert!(!apply_debug_hour_skip(false, &mut day, true, &mut dirty));
+        assert_eq!(day.fraction(), before);
+        assert!(!dirty);
+
+        assert!(apply_debug_hour_skip(true, &mut day, false, &mut dirty));
+        assert_eq!(day.label(), "09:00 morning");
+        assert!(!dirty);
+        assert!(apply_debug_hour_skip(true, &mut day, true, &mut dirty));
+        assert_eq!(day.label(), "10:00 morning");
+        assert!(dirty);
     }
 }

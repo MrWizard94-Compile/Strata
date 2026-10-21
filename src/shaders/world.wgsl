@@ -4,7 +4,8 @@ struct Camera {
     eye_time: vec4<f32>,
     sun_fog: vec4<f32>,
     selected: vec4<f32>,
-    // Appended day/night data. xyz colors are linear; w is glow or time of day.
+    // sky/fog rgb are linear; ambient and sun_color are multipliers.
+    // sky_horizon.w is sun glow, sky_zenith.w is time of day; other w lanes are 0.
     sky_horizon: vec4<f32>,
     sky_zenith: vec4<f32>,
     fog_color: vec4<f32>,
@@ -38,7 +39,7 @@ fn noise(point: vec3<f32>) -> f32 {
             mix(hash(cell + vec3<f32>(0., 1., 1.)), hash(cell + vec3<f32>(1., 1., 1.)), blend.x), blend.y), blend.z);
 }
 
-// Shared by the background, distance haze, and water's environment reflection.
+// Sky and water reflection. Distance haze uses camera.fog_color.
 fn atmosphere(direction: vec3<f32>) -> vec3<f32> {
     let up = clamp(direction.y, 0.0, 1.0);
     let sun_amount = max(dot(direction, camera.sun_fog.xyz), 0.0);
@@ -79,7 +80,7 @@ fn fs_sky(input: SkyVertex) -> @location(0) vec4<f32> {
         let cloud = noise(cloud_point * 1.8) * 0.66 + noise(cloud_point * 4.1) * 0.24 + noise(cloud_point * 8.2) * 0.1;
         let mask = smoothstep(0.57, 0.76, cloud) * smoothstep(0.035, 0.23, ray.y) * 0.62;
         let cloud_color = mix(
-            vec3<f32>(0.10, 0.13, 0.20),
+            linear_color(vec3<f32>(0.10, 0.13, 0.20)),
             linear_color(vec3<f32>(0.97, 0.96, 0.89)),
             camera.sky_horizon.w);
         color = mix(color, cloud_color, mask);
@@ -137,8 +138,12 @@ fn fs_terrain(input: TerrainFragment) -> @location(0) vec4<f32> {
         let water_normal = normalize(normal + vec3<f32>(cos(wave_a) * 0.055, 0., cos(wave_b) * 0.055));
         let reflected = reflect(-eye_direction, water_normal);
         let fresnel = 0.10 + 0.72 * pow(1.0 - max(dot(eye_direction, water_normal), 0.0), 4.0);
-        let depth_color = albedo * (0.88 + sin(wave_a) * sin(wave_b) * 0.04);
-        let half_direction = normalize(camera.sun_fog.xyz + eye_direction);
+        let hemisphere = water_normal.y * 0.5 + 0.5;
+        let ambient = mix(camera.ambient_ground.xyz, camera.ambient_sky.xyz, hemisphere);
+        let sun_term = camera.sun_color.xyz * max(dot(water_normal, camera.sun_fog.xyz), 0.0);
+        let depth_color = albedo * (0.88 + sin(wave_a) * sin(wave_b) * 0.04) * (ambient + sun_term);
+        let half_vector = camera.sun_fog.xyz + eye_direction;
+        let half_direction = half_vector / max(length(half_vector), 1e-4);
         let sparkle = pow(max(dot(water_normal, half_direction), 0.0), 220.0);
         color = mix(depth_color, atmosphere(reflected), fresnel) + vec3<f32>(1.0, 0.89, 0.66) * sparkle * 0.65 * camera.sky_horizon.w;
     } else {

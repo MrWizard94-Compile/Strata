@@ -4,12 +4,12 @@
 
 ## Day/night cycle
 
-Playing advances a 20-minute day on the fixed 60 Hz simulation tick. Pause, the title, and settings do not. Schema 1 stores `time_of_day` in `[0, 1)` (midnight is 0). Older saves without the field load at 08:00. Non-finite or out-of-range values are rejected and the file is kept. Sun direction, sky, fog, ambient, and sun color are appended camera uniforms. The 44-byte vertex layout is unchanged.
+Playing advances a 20-minute day on the fixed 60 Hz simulation tick. The title, pause menu, settings, and focus loss all go through the same step function and freeze that clock. Schema 1 generator 2 stores `time_of_day` in `[0, 1)` (midnight is 0). A generator 2 save without the field loads at 08:00. Generator 1 files are rejected and left untouched. Non-finite values, negatives, and exactly 1.0 are rejected and the file is kept. Sun direction, sky, fog, ambient, and sun color are appended camera uniforms. Night clouds and water use the same linear lighting as the terrain. The 44-byte vertex layout is unchanged.
 
 Linux verification for this change, Rust 1.97.1:
 
 - `cargo fmt --check`: passed.
-- `cargo test --locked`: **65 passed, 0 failed, 1 ignored**.
+- `cargo test --locked`: **80 passed, 0 failed, 1 ignored** after rebasing onto generator 2 (`8af9548`). The generator 2 checkpoint below remains 65.
 - `cargo test --locked native_gpu_validates_all_world_shader_pipelines -- --ignored --nocapture`: **passed** on Mesa lavapipe (software Vulkan from mesa-vulkan-drivers 25.2.8). That is shader-pipeline and material-upload validation, not a GTX 1660 Ti and not a windowed playthrough.
 - `cargo clippy --locked --all-targets -- -D warnings`: passed.
 - `cargo build --release --locked`: passed.

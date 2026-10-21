@@ -387,6 +387,29 @@ mod tests {
     }
 
     #[test]
+    fn null_negative_and_exact_one_time_of_day_are_rejected_without_overwrite() {
+        for bad in [
+            serde_json::Value::Null,
+            serde_json::json!(-0.25),
+            serde_json::json!(1.0),
+        ] {
+            let path = directory();
+            let (mut store, _) = SaveStore::open(&path).unwrap();
+            store.save(&World::new(3), player(), 0.5).unwrap();
+            drop(store);
+            let slot = path.join("world-b.json");
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&fs::read(&slot).unwrap()).unwrap();
+            value["time_of_day"] = bad;
+            let tampered = serde_json::to_vec_pretty(&value).unwrap();
+            fs::write(&slot, &tampered).unwrap();
+            assert!(SaveStore::open(&path).is_err(), "{tampered:?}");
+            assert_eq!(fs::read(&slot).unwrap(), tampered);
+            fs::remove_dir_all(path).unwrap();
+        }
+    }
+
+    #[test]
     fn generator_1_save_is_rejected_and_preserved() {
         let path = directory();
         fs::create_dir_all(&path).unwrap();
