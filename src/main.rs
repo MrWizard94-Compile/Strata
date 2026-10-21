@@ -231,7 +231,7 @@ impl Game {
         let streaming_trace = options.trace_streaming.as_ref().map(|path| {
             StreamingTrace::create(path, &TraceHeader {
                 kind: "header",
-                schema_version: 1,
+                schema_version: 2,
                 package_version: env!("CARGO_PKG_VERSION"),
                 seed: world.seed(),
                 adapter: &renderer.adapter_name,
@@ -243,7 +243,7 @@ impl Game {
                 upload_max_bytes: budget.max_bytes,
                 upload_max_cpu_ms: budget.max_cpu_time.as_secs_f64() * 1000.0,
                 source_label_external: std::env::var("STRATA_SOURCE_REVISION").ok(),
-                measurement: "CPU-observed admission/upload callback/queue waits and presentation submission intervals. No GPU timestamps, display timing or total RAM/VRAM. Buffered trace I/O is observer overhead. Byte/time budgets permit one oversized/slow callback for progress.",
+                measurement: "CPU-observed admission/upload callback/queue waits and presentation submission intervals. No GPU timestamps, display timing or total RAM/VRAM. Buffered trace I/O is observer overhead. Each callback copies at most the remaining byte budget and cannot be preempted; a larger mesh continues across redraws and becomes resident only when complete.",
             })
         }).transpose()?;
         Ok(Self {
@@ -534,10 +534,13 @@ impl Game {
         for key in self.streaming.update(camera.eye, self.radius, &self.world) {
             self.renderer.remove_chunk(key);
         }
+        for key in self.streaming.take_cancelled_uploads() {
+            self.renderer.cancel_upload(key);
+        }
         self.last_upload = self
             .streaming
-            .upload_ready(UploadBudget::default(), |key, mesh| {
-                self.renderer.upload_chunk(key, mesh);
+            .upload_ready(UploadBudget::default(), |slice| {
+                self.renderer.upload_slice(slice);
             });
         if self.has_entered && now.duration_since(self.last_save) > Duration::from_secs(30) {
             self.last_save = now;
