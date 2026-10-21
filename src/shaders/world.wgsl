@@ -120,6 +120,7 @@ struct TerrainFragment {
     @location(2) brightness: f32,
     @location(3) @interpolate(flat) texture_layer: u32,
     @location(4) @interpolate(flat) water: u32,
+    @location(5) @interpolate(flat) cutout: u32,
 };
 
 fn corner_brightness(ao: u32, variation: u32, direction: u32) -> f32 {
@@ -191,6 +192,7 @@ fn vs_terrain(input: QuadInput, @builtin(vertex_index) vertex_index: u32) -> Ter
     out.brightness = corner_brightness(ao, variation, direction);
     out.texture_layer = (input.word1 >> 8u) & 31u;
     out.water = (input.word1 >> 16u) & 1u;
+    out.cutout = (input.word1 >> 17u) & 1u;
     return out;
 }
 
@@ -207,9 +209,15 @@ fn fs_terrain(input: TerrainFragment) -> @location(0) vec4<f32> {
     } else if abs(normal.z) > 0.5 {
         uv = vec2<f32>(input.world.x, -input.world.y);
     }
-    let albedo = textureSample(material_tiles, material_sampler, uv, i32(input.texture_layer)).rgb
-        * input.brightness;
+    let texel = textureSample(material_tiles, material_sampler, uv, i32(input.texture_layer));
+    // Leaf cutout is sampled in every pass; only the cutout bit discards.
+    // Sampling stays outside the branch so the texture lookup is uniform.
+    if input.cutout != 0u && texel.a < 0.5 {
+        discard;
+    }
+    let albedo = texel.rgb * input.brightness;
     var color: vec3<f32>;
+    var alpha = 1.0;
 
     if input.water != 0u {
         let t = camera.eye_time.w;
@@ -226,6 +234,7 @@ fn fs_terrain(input: TerrainFragment) -> @location(0) vec4<f32> {
         let half_direction = half_vector / max(length(half_vector), 1e-4);
         let sparkle = pow(max(dot(water_normal, half_direction), 0.0), 220.0);
         color = mix(depth_color, atmosphere(reflected), fresnel) + vec3<f32>(1.0, 0.89, 0.66) * sparkle * 0.65 * camera.sky_horizon.w;
+        alpha = mix(0.55, 0.9, fresnel);
     } else {
         let diffuse = max(dot(normal, camera.sun_fog.xyz), 0.0);
         let hemisphere = normal.y * 0.5 + 0.5;
@@ -238,7 +247,7 @@ fn fs_terrain(input: TerrainFragment) -> @location(0) vec4<f32> {
     let fog_span = max(camera.sun_fog.w - fog_start, 1.0);
     let fog = smoothstep(0.0, 1.0, (distance - fog_start) / fog_span);
     color = mix(color, camera.fog_color.xyz, fog * 0.94);
-    return vec4<f32>(color, 1.0);
+    return vec4<f32>(color, alpha);
 }
 
 @vertex

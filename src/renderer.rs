@@ -8,7 +8,7 @@ use winit::window::Window;
 use crate::{
     daylight::Daylight,
     materials, streaming,
-    world::{ChunkKey, LIGHTING_TABLE, Mesh, PackedQuad},
+    world::{CHUNK_SIZE, ChunkKey, LIGHTING_TABLE, Mesh, PackedQuad},
 };
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
@@ -83,7 +83,10 @@ struct ChunkOriginImmediate {
 
 struct GpuChunk {
     quads: wgpu::Buffer,
-    quad_count: u32,
+    /// Instance ranges in `quads`: `[0, opaque)`, then cutout, then water.
+    opaque_quads: u32,
+    cutout_quads: u32,
+    translucent_quads: u32,
     payload_bytes: usize,
     origin: [i32; 3],
     min: Vec3,
@@ -100,7 +103,9 @@ struct InflightMesh {
 }
 
 struct Pipelines {
-    terrain: wgpu::RenderPipeline,
+    terrain_opaque: wgpu::RenderPipeline,
+    terrain_cutout: wgpu::RenderPipeline,
+    terrain_water: wgpu::RenderPipeline,
     sky: wgpu::RenderPipeline,
     selection: wgpu::RenderPipeline,
     camera_layout: wgpu::BindGroupLayout,
@@ -360,11 +365,20 @@ impl Renderer {
         if slice.complete && inflight.written == inflight.total_bytes {
             let finished = self.inflight.take().expect("completed slice");
             let (min, max) = mesh_bounds(slice.mesh);
+            let opaque_quads = slice.mesh.opaque_quads;
+            let cutout_quads = slice.mesh.cutout_quads;
+            let translucent_quads = slice.mesh.translucent_quads;
+            debug_assert_eq!(
+                opaque_quads as usize + cutout_quads as usize + translucent_quads as usize,
+                slice.mesh.quads.len()
+            );
             self.chunks.insert(
                 slice.key,
                 GpuChunk {
                     quads: finished.buffer,
-                    quad_count: slice.mesh.quads.len() as u32,
+                    opaque_quads,
+                    cutout_quads,
+                    translucent_quads,
                     payload_bytes: finished.total_bytes,
                     origin: finished.origin,
                     min,
@@ -406,7 +420,9 @@ impl Renderer {
     pub fn triangle_count(&self) -> usize {
         self.chunks
             .values()
-            .map(|chunk| chunk.quad_count as usize * 2)
+            .map(|chunk| {
+                (chunk.opaque_quads + chunk.cutout_quads + chunk.translucent_quads) as usize * 2
+            })
             .sum()
     }
 
@@ -547,18 +563,36 @@ impl Renderer {
             pass.set_immediates(0, &[0u8; CHUNK_ORIGIN_IMMEDIATE_BYTES as usize]);
             pass.set_pipeline(&self.pipelines.sky);
             pass.draw(0..3, 0..1);
-            pass.set_pipeline(&self.pipelines.terrain);
-            for chunk in self.chunks.values() {
-                if !frustum.intersects(chunk.min, chunk.max) {
-                    continue;
-                }
-                let mut origin = [0; 4];
-                origin[..3].copy_from_slice(&chunk.origin);
-                pass.set_immediates(0, bytemuck::bytes_of(&ChunkOriginImmediate { origin }));
-                pass.set_vertex_buffer(0, chunk.quads.slice(..));
-                pass.draw(0..6, 0..chunk.quad_count);
+            let mut visible: Vec<&GpuChunk> = self
+                .chunks
+                .values()
+                .filter(|chunk| frustum.intersects(chunk.min, chunk.max))
+                .collect();
+            pass.set_pipeline(&self.pipelines.terrain_opaque);
+            for chunk in &visible {
+                draw_chunk_range(&mut pass, chunk, 0, chunk.opaque_quads);
+            }
+            pass.set_pipeline(&self.pipelines.terrain_cutout);
+            for chunk in &visible {
+                draw_chunk_range(&mut pass, chunk, chunk.opaque_quads, chunk.cutout_quads);
+            }
+            visible.sort_by(|left, right| {
+                let distance =
+                    |chunk: &GpuChunk| (chunk_center(chunk.origin) - eye).length_squared();
+                distance(right).total_cmp(&distance(left))
+            });
+            pass.set_pipeline(&self.pipelines.terrain_water);
+            for chunk in &visible {
+                draw_chunk_range(
+                    &mut pass,
+                    chunk,
+                    chunk.opaque_quads + chunk.cutout_quads,
+                    chunk.translucent_quads,
+                );
                 self.visible_chunks += 1;
-                self.visible_triangles += chunk.quad_count as usize * 2;
+                self.visible_triangles +=
+                    (chunk.opaque_quads + chunk.cutout_quads + chunk.translucent_quads) as usize
+                        * 2;
             }
             if camera.selected.is_some() {
                 pass.set_pipeline(&self.pipelines.selection);
@@ -689,6 +723,26 @@ fn terrain_vertex_layout() -> wgpu::VertexBufferLayout<'static> {
     }
 }
 
+fn chunk_center(origin: [i32; 3]) -> Vec3 {
+    let half = CHUNK_SIZE as f32 * 0.5;
+    Vec3::new(
+        origin[0] as f32 + half,
+        origin[1] as f32 + half,
+        origin[2] as f32 + half,
+    )
+}
+
+fn draw_chunk_range(pass: &mut wgpu::RenderPass<'_>, chunk: &GpuChunk, start: u32, count: u32) {
+    if count == 0 {
+        return;
+    }
+    let mut origin = [0; 4];
+    origin[..3].copy_from_slice(&chunk.origin);
+    pass.set_immediates(0, bytemuck::bytes_of(&ChunkOriginImmediate { origin }));
+    pass.set_vertex_buffer(0, chunk.quads.slice(..));
+    pass.draw(0..6, start..start + count);
+}
+
 fn mesh_bounds(mesh: &Mesh) -> (Vec3, Vec3) {
     let mut min = Vec3::splat(f32::INFINITY);
     let mut max = Vec3::splat(f32::NEG_INFINITY);
@@ -767,73 +821,119 @@ fn create_pipelines(
         bind_group_layouts: &[Some(&camera_layout)],
         immediate_size: CHUNK_ORIGIN_IMMEDIATE_BYTES,
     });
-    let targets = [Some(wgpu::ColorTargetState {
-        format,
-        blend: None,
-        write_mask: wgpu::ColorWrites::ALL,
-    })];
     let vertex_layout = [Some(terrain_vertex_layout())];
-    let make_pipeline =
-        |label: &str, vertex: &str, fragment: &str, terrain: bool, selection: bool| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(&layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some(vertex),
-                    compilation_options: Default::default(),
-                    buffers: if terrain { &vertex_layout } else { &[] },
+    struct PipelineDesc {
+        label: &'static str,
+        vertex: &'static str,
+        fragment: &'static str,
+        terrain: bool,
+        selection: bool,
+        cull: Option<wgpu::Face>,
+        depth_write: bool,
+        blend: Option<wgpu::BlendState>,
+    }
+    let make_pipeline = |desc: PipelineDesc| {
+        let targets = [Some(wgpu::ColorTargetState {
+            format,
+            blend: desc.blend,
+            write_mask: wgpu::ColorWrites::ALL,
+        })];
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(desc.label),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some(desc.vertex),
+                compilation_options: Default::default(),
+                buffers: if desc.terrain { &vertex_layout } else { &[] },
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: if desc.selection {
+                    wgpu::PrimitiveTopology::LineList
+                } else {
+                    wgpu::PrimitiveTopology::TriangleList
                 },
-                primitive: wgpu::PrimitiveState {
-                    topology: if selection {
-                        wgpu::PrimitiveTopology::LineList
-                    } else {
-                        wgpu::PrimitiveTopology::TriangleList
-                    },
-                    cull_mode: if terrain {
-                        Some(wgpu::Face::Back)
-                    } else {
-                        None
-                    },
-                    ..Default::default()
-                },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: DEPTH_FORMAT,
-                    depth_write_enabled: Some(terrain),
-                    depth_compare: Some(if terrain || selection {
-                        wgpu::CompareFunction::LessEqual
-                    } else {
-                        wgpu::CompareFunction::Always
-                    }),
-                    stencil: Default::default(),
-                    // The selection shader expands the cube slightly; depth
-                    // bias is not legal for a line-list pipeline in wgpu.
-                    bias: Default::default(),
+                cull_mode: desc.cull,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(desc.depth_write),
+                depth_compare: Some(if desc.terrain || desc.selection {
+                    wgpu::CompareFunction::LessEqual
+                } else {
+                    wgpu::CompareFunction::Always
                 }),
-                multisample: wgpu::MultisampleState {
-                    count: sample_count,
-                    ..Default::default()
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some(fragment),
-                    compilation_options: Default::default(),
-                    targets: &targets,
-                }),
-                multiview_mask: None,
-                cache: None,
-            })
-        };
+                stencil: Default::default(),
+                // The selection shader expands the cube slightly; depth
+                // bias is not legal for a line-list pipeline in wgpu.
+                bias: Default::default(),
+            }),
+            multisample: wgpu::MultisampleState {
+                count: sample_count,
+                ..Default::default()
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some(desc.fragment),
+                compilation_options: Default::default(),
+                targets: &targets,
+            }),
+            multiview_mask: None,
+            cache: None,
+        })
+    };
     Pipelines {
-        terrain: make_pipeline("Voxel world", "vs_terrain", "fs_terrain", true, false),
-        sky: make_pipeline("Atmospheric sky", "vs_sky", "fs_sky", false, false),
-        selection: make_pipeline(
-            "Selected block outline",
-            "vs_selection",
-            "fs_selection",
-            false,
-            true,
-        ),
+        terrain_opaque: make_pipeline(PipelineDesc {
+            label: "Opaque terrain",
+            vertex: "vs_terrain",
+            fragment: "fs_terrain",
+            terrain: true,
+            selection: false,
+            cull: Some(wgpu::Face::Back),
+            depth_write: true,
+            blend: None,
+        }),
+        terrain_cutout: make_pipeline(PipelineDesc {
+            label: "Leaf cutout",
+            vertex: "vs_terrain",
+            fragment: "fs_terrain",
+            terrain: true,
+            selection: false,
+            cull: None,
+            depth_write: true,
+            blend: None,
+        }),
+        terrain_water: make_pipeline(PipelineDesc {
+            label: "Translucent water",
+            vertex: "vs_terrain",
+            fragment: "fs_terrain",
+            terrain: true,
+            selection: false,
+            cull: None,
+            depth_write: false,
+            blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+        }),
+        sky: make_pipeline(PipelineDesc {
+            label: "Atmospheric sky",
+            vertex: "vs_sky",
+            fragment: "fs_sky",
+            terrain: false,
+            selection: false,
+            cull: None,
+            depth_write: false,
+            blend: None,
+        }),
+        selection: make_pipeline(PipelineDesc {
+            label: "Selected block outline",
+            vertex: "vs_selection",
+            fragment: "fs_selection",
+            terrain: false,
+            selection: true,
+            cull: None,
+            depth_write: false,
+            blend: None,
+        }),
         camera_layout,
     }
 }
@@ -957,6 +1057,19 @@ mod tests {
     }
 
     #[test]
+    fn translucent_chunks_sort_far_to_near_from_their_centers() {
+        let eye = Vec3::ZERO;
+        let mut order = [[0, 0, 0], [64, 0, 0], [-32, 0, 96]];
+        order.sort_by(|left, right| {
+            let distance = |origin: &[i32; 3]| (chunk_center(*origin) - eye).length_squared();
+            distance(right).total_cmp(&distance(left))
+        });
+        assert_eq!(order[0], [-32, 0, 96]);
+        assert_eq!(order[1], [64, 0, 0]);
+        assert_eq!(order[2], [0, 0, 0]);
+    }
+
+    #[test]
     fn missing_immediates_reports_a_startup_refusal() {
         let message = missing_immediates_message("Example GPU / Vulkan");
         assert!(message.contains("STRATA cannot start on Example GPU / Vulkan"));
@@ -985,7 +1098,14 @@ mod tests {
                 .await
                 .expect("native GPU device");
             let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
-            let _pipelines = create_pipelines(&device, wgpu::TextureFormat::Bgra8UnormSrgb, 4);
+            let pipelines = create_pipelines(&device, wgpu::TextureFormat::Bgra8UnormSrgb, 4);
+            let _kept = (
+                &pipelines.terrain_opaque,
+                &pipelines.terrain_cutout,
+                &pipelines.terrain_water,
+                &pipelines.sky,
+                &pipelines.selection,
+            );
             let _materials = create_material_texture(&device, &queue);
             queue.submit([]);
             let result = scope.pop().await;

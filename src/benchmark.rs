@@ -470,6 +470,59 @@ mod tests {
             if scenario.name == "edited_terrain_route" {
                 edited_route = Some(geometry);
             }
+            if scenario.name == "seeded_route" || scenario.name == "edited_terrain_route" {
+                let mut opaque = 0u32;
+                let mut cutout = 0u32;
+                let mut translucent = 0u32;
+                for key in &scenario.chunks {
+                    let mesh = scenario.world.mesh_chunk(*key);
+                    opaque += mesh.opaque_quads;
+                    cutout += mesh.cutout_quads;
+                    translucent += mesh.translucent_quads;
+                    assert_eq!(
+                        mesh.opaque_quads as usize
+                            + mesh.cutout_quads as usize
+                            + mesh.translucent_quads as usize,
+                        mesh.quads.len()
+                    );
+                }
+                let expected: (usize, usize, usize, String, u32, u32, u32) =
+                    if scenario.name == "seeded_route" {
+                        (
+                            13551,
+                            108_408,
+                            27_102,
+                            "d732c9d403bf9a68".to_string(),
+                            10_792,
+                            2_759,
+                            0,
+                        )
+                    } else {
+                        (
+                            13_589,
+                            108_712,
+                            27_178,
+                            "553186af4f85dbdf".to_string(),
+                            10_830,
+                            2_759,
+                            0,
+                        )
+                    };
+                assert_eq!(
+                    (
+                        geometry.quads,
+                        geometry.bytes,
+                        geometry.triangles,
+                        format!("{:016x}", geometry.digest),
+                        opaque,
+                        cutout,
+                        translucent
+                    ),
+                    expected,
+                    "{}",
+                    scenario.name
+                );
+            }
         }
         assert_ne!(route.unwrap().digest, edited_route.unwrap().digest);
         assert!(route.unwrap().triangles > 0);
@@ -479,6 +532,21 @@ mod tests {
             .unwrap();
         let (_, geometry) = measure(checkerboard).unwrap();
         assert_eq!(geometry.triangles, (CHUNK_SIZE as usize).pow(3) / 2 * 12);
+        assert_eq!(geometry.bytes, 786_432);
+        assert_eq!(
+            format!("{:016x}", geometry.digest),
+            "9b90a6ba4714f004",
+            "all-stone checkerboard has no leaves, so the digest stays"
+        );
+        let isolated = scenarios
+            .iter()
+            .find(|scenario| scenario.name == "isolated_solid_chunk")
+            .unwrap();
+        let (_, isolated_geometry) = measure(isolated).unwrap();
+        assert_eq!(
+            format!("{:016x}", isolated_geometry.digest),
+            "41be41bea5c6c402"
+        );
     }
 
     #[test]

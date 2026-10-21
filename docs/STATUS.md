@@ -42,6 +42,27 @@ Twenty-three streaming tests cover aligned slices, a slow slice stopping the fra
 
 Not in this change: camera-relative rendering and f32 far-coordinate precision; per-region edit invalidation generations; choosing an ECS before the gameplay loop.
 
+## 2026-10-21 leaf cutout and translucent water
+
+Same Linux cloud VM as the packed-quad section. Geometry counts below are from the locked test suite after generator 2, not from `evidence/cpu-20261021-linux-vm-01.json` and not from the GTX 1660 Ti.
+
+Leaves stay solid for collision and ambient occlusion and do not occlude the block behind them. A leaf face is emitted only against air or water, in a depth-writing cutout pass that discards texel alpha below 0.5. Water is emitted only against air, then drawn in a later alpha-blended pass with depth testing and no depth write. The chunk is one packed-quad upload, ordered opaque, cutout, water. `payload_bytes` is still `quads × 8`. Nothing in that buffer is drawn until the last slice.
+
+Compared with the same generator and the previous face rule (a solid neighbor hid its face), the seed `728491` route grows by 296 quads, 592 triangles, and 2,368 bytes. Those are the solid faces leaves used to hide. Cutout count and water count on that route do not change; the route's twelve chunks contain no water surface. Checkerboard payload stays 786,432 bytes and digest `9b90a6ba4714f004`. Isolated solid digest stays `41be41bea5c6c402`.
+
+| Scenario | Triangles | Quads | Bytes | Opaque | Cutout | Water | Digest |
+|---|---:|---:|---:|---:|---:|---:|---|
+| Seeded route, previous face rule | 26,510 | 13,255 | 106,040 | 10,496 | 2,759 | 0 | `c1c77e5fe9a99379` |
+| Seeded route, leaves keep the solid face | 27,102 | 13,551 | 108,408 | 10,792 | 2,759 | 0 | `d732c9d403bf9a68` |
+| Edited route, previous face rule | 26,586 | 13,293 | 106,344 | 10,534 | 2,759 | 0 | `03d404629247c01f` |
+| Edited route, leaves keep the solid face | 27,178 | 13,589 | 108,712 | 10,830 | 2,759 | 0 | `553186af4f85dbdf` |
+| Ocean chunk `(-8, 0, -8)` | 3,062 | 1,531 | 12,248 | 1,485 | 0 | 46 | |
+| Checkerboard | 196,608 | 98,304 | 786,432 | 98,304 | 0 | 0 | `9b90a6ba4714f004` |
+
+The extra 2,368 route bytes still fit in one 4 MiB callback. Upload milliseconds were not measured. Leaf holes are 208 of 1,024 texels. The 1-pixel leaf mip alpha is 203. Non-leaf mips stay opaque, including the sRGB black/white average of 188.
+
+`cargo fmt --check`, `cargo test --locked` (94 passed, 0 failed, 1 ignored) and `cargo clippy --locked --all-targets -- -D warnings` passed on this VM. The ignored GPU pipeline test was run here and failed immediately: no wgpu adapter (`supported_backends` Vulkan and GL, `active_backends` empty). Opaque, cutout, and water pipelines were not validated on a GPU. The 2026-10-20 Windows GPU pass and the lavapipe pass recorded for day/night do not cover this shader.
+
 ## Source and artifact verification
 
 - Deterministic generator 2 terrain is integrated: plains, forest, desert, ocean, and beach, with sea-level water, caves, grid-anchored trees, and coal, iron, gold, and diamond. Sparse edits, greedy meshing, DDA targeting, walking/jump/flight, body collision, bounded streaming and versioned two-slot saves are integrated. Generator 1 saves are rejected and left untouched.

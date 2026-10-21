@@ -38,8 +38,10 @@ pub struct Vertex {
 /// per-draw immediate so a later camera-relative pass can translate it once.
 ///
 /// `word0`: x:6, y:6, z:6, width-1:5, height-1:5, axis:2, positive:1, diagonal:1.
-/// `word1`: ao0..ao3:2 each, layer:5, variation:3, water:1. Local axes are 0..=32
-/// and quad sizes are 1..=32. The diagonal bit preserves the AO-aware split.
+/// `word1`: ao0..ao3:2 each, layer:5, variation:3, water:1, cutout:1. Local axes
+/// are 0..=32 and quad sizes are 1..=32. The diagonal bit preserves the AO-aware
+/// split. Water and cutout are never both set: water is the translucent range,
+/// cutout is the leaf range, and neither bit is an opaque quad.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct PackedQuad {
@@ -59,6 +61,7 @@ pub struct DecodedQuad {
     pub layer: u32,
     pub variation: u8,
     pub water: bool,
+    pub cutout: bool,
 }
 
 impl PackedQuad {
@@ -68,6 +71,7 @@ impl PackedQuad {
         debug_assert!(quad.axis < 3);
         debug_assert!(quad.ao.iter().all(|value| *value <= 3));
         debug_assert!(quad.layer < 32 && quad.variation < 7);
+        debug_assert!(!(quad.water && quad.cutout));
         let word0 = quad.local[0]
             | (quad.local[1] << 6)
             | (quad.local[2] << 12)
@@ -82,7 +86,8 @@ impl PackedQuad {
             | (u32::from(quad.ao[3]) << 6)
             | (quad.layer << 8)
             | (u32::from(quad.variation) << 13)
-            | (u32::from(quad.water) << 16);
+            | (u32::from(quad.water) << 16)
+            | (u32::from(quad.cutout) << 17);
         Self { word0, word1 }
     }
 
@@ -105,6 +110,7 @@ impl PackedQuad {
             layer: (word1 >> 8) & 31,
             variation: ((word1 >> 13) & 7) as u8,
             water: (word1 >> 16) & 1 == 1,
+            cutout: (word1 >> 17) & 1 == 1,
         }
     }
 }
@@ -198,7 +204,11 @@ pub const LIGHTING_TABLE: [[f32; 4]; 21] = lighting_table();
 #[derive(Clone, Debug, Default)]
 pub struct Mesh {
     pub origin: [i32; 3],
+    /// Opaque quads, then leaf cutout quads, then water quads.
     pub quads: Vec<PackedQuad>,
+    pub opaque_quads: u32,
+    pub cutout_quads: u32,
+    pub translucent_quads: u32,
 }
 
 impl Mesh {
@@ -961,11 +971,24 @@ impl Face {
     }
 }
 
+/// Leaves stay solid for collision and ambient occlusion, but they do not hide
+/// the block behind them. A leaf emits only into air or water, so two leaves
+/// or a leaf and a solid never share a plane. Water emits only into air, so
+/// the water/solid boundary is the solid face and two water blocks share none.
+fn face_visible(block: Block, neighbor: Block) -> bool {
+    if block == Block::Water {
+        return neighbor == Block::Air;
+    }
+    if block == Block::Leaves {
+        return matches!(neighbor, Block::Air | Block::Water);
+    }
+    block.is_solid() && (neighbor == Block::Leaves || !neighbor.is_solid())
+}
+
 fn mesh_halo(origin: [i32; 3], halo: &[Block]) -> Mesh {
-    let mut mesh = Mesh {
-        origin,
-        quads: Vec::new(),
-    };
+    let mut opaque = Vec::new();
+    let mut cutout = Vec::new();
+    let mut translucent = Vec::new();
     let side = CHUNK_SIZE as usize;
     let mut mask = vec![None; side * side];
     for axis in 0..3 {
@@ -983,11 +1006,7 @@ fn mesh_halo(origin: [i32; 3], halo: &[Block]) -> Mesh {
                         let mut outside = p;
                         outside[axis] += sign;
                         let neighbor = halo[halo_index(outside)];
-                        let visible = if block == Block::Water {
-                            neighbor == Block::Air
-                        } else {
-                            block.is_solid() && !neighbor.is_solid()
-                        };
+                        let visible = face_visible(block, neighbor);
                         mask[i as usize + j as usize * side] = if visible {
                             let ao = corner_ao(halo, outside, u, v);
                             let world = [origin[0] + p[0], origin[1] + p[1], origin[2] + p[2]];
@@ -1032,8 +1051,14 @@ fn mesh_halo(origin: [i32; 3], halo: &[Block]) -> Mesh {
                         p[axis] += slice + i32::from(sign > 0);
                         p[u] += i as i32;
                         p[v] += j as i32;
+                        let bucket = match face.block {
+                            Block::Water => &mut translucent,
+                            Block::Leaves => &mut cutout,
+                            _ => &mut opaque,
+                        };
                         emit_quad(
-                            &mut mesh,
+                            bucket,
+                            origin,
                             p,
                             axis,
                             sign,
@@ -1051,7 +1076,23 @@ fn mesh_halo(origin: [i32; 3], halo: &[Block]) -> Mesh {
             }
         }
     }
-    mesh
+    let opaque_quads = opaque.len() as u32;
+    let cutout_quads = cutout.len() as u32;
+    let translucent_quads = translucent.len() as u32;
+    let mut quads = opaque;
+    quads.extend(cutout);
+    quads.extend(translucent);
+    debug_assert_eq!(
+        opaque_quads as usize + cutout_quads as usize + translucent_quads as usize,
+        quads.len()
+    );
+    Mesh {
+        origin,
+        quads,
+        opaque_quads,
+        cutout_quads,
+        translucent_quads,
+    }
 }
 
 fn corner_ao(halo: &[Block], outside: [i32; 3], u: usize, v: usize) -> [u8; 4] {
@@ -1072,15 +1113,23 @@ fn corner_ao(halo: &[Block], outside: [i32; 3], u: usize, v: usize) -> [u8; 4] {
     ao
 }
 
-fn emit_quad(mesh: &mut Mesh, p: [i32; 3], axis: usize, sign: i32, size: [f32; 2], face: Face) {
+fn emit_quad(
+    quads: &mut Vec<PackedQuad>,
+    origin: [i32; 3],
+    p: [i32; 3],
+    axis: usize,
+    sign: i32,
+    size: [f32; 2],
+    face: Face,
+) {
     let local = [
-        (p[0] - mesh.origin[0]) as u32,
-        (p[1] - mesh.origin[1]) as u32,
-        (p[2] - mesh.origin[2]) as u32,
+        (p[0] - origin[0]) as u32,
+        (p[1] - origin[1]) as u32,
+        (p[2] - origin[2]) as u32,
     ];
     let mut normal = [0; 3];
     normal[axis] = sign;
-    mesh.quads.push(PackedQuad::pack(DecodedQuad {
+    quads.push(PackedQuad::pack(DecodedQuad {
         local,
         width: size[0] as u32,
         height: size[1] as u32,
@@ -1091,6 +1140,7 @@ fn emit_quad(mesh: &mut Mesh, p: [i32; 3], axis: usize, sign: i32, size: [f32; 2
         layer: crate::materials::layer_for(face.block, normal),
         variation: face.variation,
         water: face.block == Block::Water,
+        cutout: face.block == Block::Leaves,
     }));
 }
 
@@ -2145,6 +2195,7 @@ mod tests {
             layer: 12,
             variation: 6,
             water: true,
+            cutout: false,
         });
         let decoded = packed.decode();
         assert_eq!(decoded.local, [32, 0, 17]);
@@ -2159,10 +2210,25 @@ mod tests {
             "downward faces use the darker factor"
         );
         assert!(decoded.water);
+        assert!(!decoded.cutout);
+        assert_eq!((packed.word1 >> 16) & 1, 1);
+        assert_eq!((packed.word1 >> 17) & 1, 0);
+        let cutout = PackedQuad::pack(DecodedQuad {
+            water: false,
+            cutout: true,
+            ..decoded
+        });
+        let cutout_decoded = cutout.decode();
+        assert!(cutout_decoded.cutout);
+        assert!(!cutout_decoded.water);
+        assert_eq!((cutout.word1 >> 17) & 1, 1);
         assert_eq!(decoded.triangle_corners(), [0, 3, 1, 1, 3, 2]);
         let mesh = Mesh {
             origin: [-32, 192, -64],
             quads: vec![packed],
+            opaque_quads: 0,
+            cutout_quads: 0,
+            translucent_quads: 1,
         };
         let expanded = mesh.expand();
         assert_eq!(expanded.vertices.len(), 4);
@@ -2226,6 +2292,8 @@ mod tests {
             "variation mask"
         );
         assert_eq!((word1 >> 16) & 1 == 1, quad.water, "water mask");
+        assert_eq!((word1 >> 17) & 1 == 1, quad.cutout, "cutout mask");
+        assert!(!(quad.water && quad.cutout));
         assert_eq!(packed.decode(), quad);
     }
 
@@ -2245,6 +2313,7 @@ mod tests {
             "(input.word1 >> 8u) & 31u",
             "(input.word1 >> 13u) & 7u",
             "(input.word1 >> 16u) & 1u",
+            "(input.word1 >> 17u) & 1u",
         ] {
             assert!(shader.contains(needle), "WGSL unpack missing {needle}");
         }
@@ -2256,30 +2325,37 @@ mod tests {
                         for diagonal_high in [false, true] {
                             for variation in 0..7u8 {
                                 for water in [false, true] {
-                                    for layer in 0..crate::materials::LAYER_COUNT {
-                                        let shift = width + height + axis + u32::from(variation);
-                                        assert_quad_matches_wgsl_masks(DecodedQuad {
-                                            local: [
-                                                shift % 33,
-                                                (shift + 11) % 33,
-                                                (shift + 22) % 33,
-                                            ],
-                                            width,
-                                            height,
-                                            axis,
-                                            positive,
-                                            diagonal_high,
-                                            ao: [
-                                                (shift as u8) & 3,
-                                                ((shift + 1) as u8) & 3,
-                                                ((shift + 2) as u8) & 3,
-                                                ((shift + 3) as u8) & 3,
-                                            ],
-                                            layer,
-                                            variation,
-                                            water,
-                                        });
-                                        cases += 1;
+                                    for cutout in [false, true] {
+                                        if water && cutout {
+                                            continue;
+                                        }
+                                        for layer in 0..crate::materials::LAYER_COUNT {
+                                            let shift =
+                                                width + height + axis + u32::from(variation);
+                                            assert_quad_matches_wgsl_masks(DecodedQuad {
+                                                local: [
+                                                    shift % 33,
+                                                    (shift + 11) % 33,
+                                                    (shift + 22) % 33,
+                                                ],
+                                                width,
+                                                height,
+                                                axis,
+                                                positive,
+                                                diagonal_high,
+                                                ao: [
+                                                    (shift as u8) & 3,
+                                                    ((shift + 1) as u8) & 3,
+                                                    ((shift + 2) as u8) & 3,
+                                                    ((shift + 3) as u8) & 3,
+                                                ],
+                                                layer,
+                                                variation,
+                                                water,
+                                                cutout,
+                                            });
+                                            cases += 1;
+                                        }
                                     }
                                 }
                             }
@@ -2295,22 +2371,28 @@ mod tests {
                         for layer in 0..crate::materials::LAYER_COUNT {
                             for variation in 0..7u8 {
                                 for water in [false, true] {
-                                    for axis in 0..3u32 {
-                                        for positive in [false, true] {
-                                            for diagonal_high in [false, true] {
-                                                assert_quad_matches_wgsl_masks(DecodedQuad {
-                                                    local: [32, 0, 17],
-                                                    width: 32,
-                                                    height: 1,
-                                                    axis,
-                                                    positive,
-                                                    diagonal_high,
-                                                    ao: [ao0, ao1, ao2, ao3],
-                                                    layer,
-                                                    variation,
-                                                    water,
-                                                });
-                                                cases += 1;
+                                    for cutout in [false, true] {
+                                        if water && cutout {
+                                            continue;
+                                        }
+                                        for axis in 0..3u32 {
+                                            for positive in [false, true] {
+                                                for diagonal_high in [false, true] {
+                                                    assert_quad_matches_wgsl_masks(DecodedQuad {
+                                                        local: [32, 0, 17],
+                                                        width: 32,
+                                                        height: 1,
+                                                        axis,
+                                                        positive,
+                                                        diagonal_high,
+                                                        ao: [ao0, ao1, ao2, ao3],
+                                                        layer,
+                                                        variation,
+                                                        water,
+                                                        cutout,
+                                                    });
+                                                    cases += 1;
+                                                }
                                             }
                                         }
                                     }
@@ -2324,23 +2406,29 @@ mod tests {
         for x in 0..=32u32 {
             for y in 0..=32u32 {
                 for z in 0..=32u32 {
-                    assert_quad_matches_wgsl_masks(DecodedQuad {
-                        local: [x, y, z],
-                        width: 32,
-                        height: 32,
-                        axis: 2,
-                        positive: true,
-                        diagonal_high: false,
-                        ao: [0, 1, 2, 3],
-                        layer: 16,
-                        variation: 6,
-                        water: false,
-                    });
-                    cases += 1;
+                    for cutout in [false, true] {
+                        assert_quad_matches_wgsl_masks(DecodedQuad {
+                            local: [x, y, z],
+                            width: 32,
+                            height: 32,
+                            axis: 2,
+                            positive: true,
+                            diagonal_high: false,
+                            ao: [0, 1, 2, 3],
+                            layer: 16,
+                            variation: 6,
+                            water: false,
+                            cutout,
+                        });
+                        cases += 1;
+                    }
                 }
             }
         }
-        assert_eq!(cases, 2_924_544 + 731_136 + 35_937);
+        // Legal combinations only. Water and cutout together are excluded.
+        // Size/winding/variation/layer: 4_386_816. AO tuples: 1_096_704.
+        // Positions 0..=32, with and without the cutout bit: 71_874.
+        assert_eq!(cases, 4_386_816 + 1_096_704 + 71_874);
     }
 
     #[test]
@@ -2358,9 +2446,197 @@ mod tests {
         let mesh = world.mesh_chunk((0, 6, 0));
         let expanded = mesh.expand();
         assert_eq!(mesh.quads.len(), 98_304);
+        assert_eq!(
+            (mesh.opaque_quads, mesh.cutout_quads, mesh.translucent_quads),
+            (98_304, 0, 0)
+        );
         assert_eq!(expanded.indices.len() / 3, 196_608);
         assert_eq!(expanded.vertices.len(), 393_216);
         assert_eq!(mesh.payload_bytes(), 786_432);
         assert_eq!(mesh.origin, [0, 192, 0]);
+    }
+
+    fn assert_pass_ranges(mesh: &Mesh) {
+        assert_eq!(
+            mesh.opaque_quads as usize
+                + mesh.cutout_quads as usize
+                + mesh.translucent_quads as usize,
+            mesh.quads.len()
+        );
+        for (index, quad) in mesh.quads.iter().enumerate() {
+            let decoded = quad.decode();
+            let index = index as u32;
+            if index < mesh.opaque_quads {
+                assert!(!decoded.water && !decoded.cutout);
+            } else if index < mesh.opaque_quads + mesh.cutout_quads {
+                assert!(decoded.cutout && !decoded.water);
+            } else {
+                assert!(decoded.water && !decoded.cutout);
+            }
+        }
+    }
+
+    #[test]
+    fn water_leaves_and_solids_keep_their_passes_and_shared_planes() {
+        let stone = artificial_mesh(&[([8, 8, 8], Block::Stone)]);
+        assert_eq!(triangle_area(&stone), 6.0);
+        assert_eq!(
+            (
+                stone.opaque_quads,
+                stone.cutout_quads,
+                stone.translucent_quads
+            ),
+            (6, 0, 0)
+        );
+        assert_pass_ranges(&stone);
+
+        let leaves = artificial_mesh(&[([8, 8, 8], Block::Leaves)]);
+        assert_eq!(triangle_area(&leaves), 6.0, "a lone leaf is a closed shell");
+        assert_eq!(
+            (
+                leaves.opaque_quads,
+                leaves.cutout_quads,
+                leaves.translucent_quads
+            ),
+            (0, 6, 0)
+        );
+        assert_pass_ranges(&leaves);
+
+        let canopy = artificial_mesh(&[([8, 8, 8], Block::Leaves), ([9, 8, 8], Block::Leaves)]);
+        assert_eq!(triangle_area(&canopy), 10.0, "leaf faces do not meet");
+        assert_eq!(canopy.opaque_quads, 0);
+        assert_eq!(canopy.translucent_quads, 0);
+        assert_eq!(canopy.cutout_quads as usize, canopy.quads.len());
+        assert_pass_ranges(&canopy);
+
+        let behind = artificial_mesh(&[([8, 8, 8], Block::Stone), ([9, 8, 8], Block::Leaves)]);
+        assert_eq!(
+            triangle_area(&behind),
+            11.0,
+            "the solid keeps the face the leaf no longer emits"
+        );
+        assert_eq!(
+            (
+                behind.opaque_quads,
+                behind.cutout_quads,
+                behind.translucent_quads
+            ),
+            (6, 5, 0)
+        );
+        assert!(
+            behind.quads[..behind.opaque_quads as usize]
+                .iter()
+                .any(|quad| {
+                    let decoded = quad.decode();
+                    decoded.axis == 0 && decoded.positive
+                })
+        );
+        assert!(
+            behind.quads[behind.opaque_quads as usize..]
+                .iter()
+                .all(|quad| {
+                    let decoded = quad.decode();
+                    !(decoded.axis == 0 && !decoded.positive)
+                })
+        );
+        assert_pass_ranges(&behind);
+
+        let mut surrounded = vec![([8, 8, 8], Block::Stone)];
+        for offset in [
+            [1, 0, 0],
+            [-1, 0, 0],
+            [0, 1, 0],
+            [0, -1, 0],
+            [0, 0, 1],
+            [0, 0, -1],
+        ] {
+            surrounded.push(([8 + offset[0], 8 + offset[1], 8 + offset[2]], Block::Leaves));
+        }
+        let buried = artificial_mesh(&surrounded);
+        assert_eq!(triangle_area(&buried), 36.0);
+        assert_eq!(
+            (
+                buried.opaque_quads,
+                buried.cutout_quads,
+                buried.translucent_quads
+            ),
+            (6, 30, 0),
+            "leaves do not erase the solid they enclose"
+        );
+        assert_pass_ranges(&buried);
+
+        let shore = artificial_mesh(&[([8, 8, 8], Block::Water), ([9, 8, 8], Block::Stone)]);
+        assert_eq!(triangle_area(&shore), 11.0);
+        assert_eq!(
+            (
+                shore.opaque_quads,
+                shore.cutout_quads,
+                shore.translucent_quads
+            ),
+            (6, 0, 5)
+        );
+        assert_pass_ranges(&shore);
+
+        let wet_leaves = artificial_mesh(&[([8, 8, 8], Block::Water), ([9, 8, 8], Block::Leaves)]);
+        assert_eq!(triangle_area(&wet_leaves), 11.0);
+        assert_eq!(
+            (
+                wet_leaves.opaque_quads,
+                wet_leaves.cutout_quads,
+                wet_leaves.translucent_quads
+            ),
+            (0, 6, 5)
+        );
+        assert_pass_ranges(&wet_leaves);
+
+        let pool = artificial_mesh(&[([8, 8, 8], Block::Water), ([9, 8, 8], Block::Water)]);
+        assert_eq!(triangle_area(&pool), 10.0);
+        assert_eq!(pool.opaque_quads, 0);
+        assert_eq!(pool.cutout_quads, 0);
+        assert_eq!(pool.translucent_quads as usize, pool.quads.len());
+        assert_pass_ranges(&pool);
+
+        let mut interior = vec![([8, 8, 8], Block::Water)];
+        for offset in [
+            [1, 0, 0],
+            [-1, 0, 0],
+            [0, 1, 0],
+            [0, -1, 0],
+            [0, 0, 1],
+            [0, 0, -1],
+        ] {
+            interior.push(([8 + offset[0], 8 + offset[1], 8 + offset[2]], Block::Water));
+        }
+        let enclosed = artificial_mesh(&interior);
+        assert_eq!(
+            triangle_area(&enclosed),
+            30.0,
+            "no faces between water blocks"
+        );
+        assert_eq!(
+            (
+                enclosed.opaque_quads,
+                enclosed.cutout_quads,
+                enclosed.translucent_quads
+            ),
+            (0, 0, 30)
+        );
+        assert_pass_ranges(&enclosed);
+    }
+
+    #[test]
+    fn an_ocean_chunk_keeps_water_out_of_the_opaque_and_cutout_ranges() {
+        let world = World::new(728_491);
+        let mesh = world.mesh_chunk((-8, 0, -8));
+        assert_eq!(
+            (
+                mesh.opaque_quads,
+                mesh.cutout_quads,
+                mesh.translucent_quads,
+                mesh.payload_bytes()
+            ),
+            (1485, 0, 46, 12_248)
+        );
+        assert_pass_ranges(&mesh);
     }
 }

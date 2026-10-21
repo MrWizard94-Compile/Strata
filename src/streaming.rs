@@ -580,6 +580,7 @@ mod tests {
     fn sized_result(key: ChunkKey, revision: u64, quads: usize) -> CompletedMesh {
         let mut completed = result(key, revision);
         completed.mesh.quads = vec![PackedQuad::default(); quads];
+        completed.mesh.opaque_quads = quads as u32;
         completed
     }
 
