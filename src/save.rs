@@ -654,6 +654,33 @@ mod tests {
     }
 
     #[test]
+    fn unknown_field_is_rejected_and_the_file_is_preserved() {
+        let path = directory();
+        let (mut store, _) = SaveStore::open(&path).unwrap();
+        save_world(
+            &mut store,
+            &World::new(3),
+            player(),
+            daylight::MORNING,
+            interaction::default_hotbar(),
+            0,
+        );
+        drop(store);
+        let slot = path.join("world-b.json");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&slot).unwrap()).unwrap();
+        value["not_a_save_field"] = serde_json::json!(true);
+        let tampered = serde_json::to_vec(&value).unwrap();
+        fs::write(&slot, &tampered).unwrap();
+        let Err(error) = SaveStore::open(&path) else {
+            panic!("unknown field was accepted");
+        };
+        assert!(error.contains("unknown field"), "{error}");
+        assert_eq!(fs::read(&slot).unwrap(), tampered);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
     fn second_writer_is_rejected_and_close_releases_world_lock() {
         let path = directory();
         let (first, _) = SaveStore::open(&path).unwrap();

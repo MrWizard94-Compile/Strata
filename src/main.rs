@@ -14,7 +14,7 @@ mod world;
 
 use daylight::DayClock;
 use egui::{Align2, Color32, FontId, Pos2, Rect, RichText, Stroke, Vec2};
-use interaction::{EditOutcome, EditQuery, EditRepeat, Hotbar};
+use interaction::{EditOutcome, EditQuery, EditRepeat, Hotbar, RepeatFires};
 use player::{Motion, Player};
 use renderer::{PresentOutcome, RenderCamera, Renderer};
 use save::SaveStore;
@@ -409,16 +409,6 @@ impl Game {
         }
     }
 
-    fn repeat_edits(&mut self) {
-        let fires = self.edit_repeat.simulation_tick();
-        if fires.break_block {
-            self.edit(false);
-        }
-        if fires.place_block {
-            self.edit(true);
-        }
-    }
-
     fn keyboard(&mut self, code: KeyCode, pressed: bool, repeat: bool) {
         if !pressed {
             self.keys.remove(&code);
@@ -538,24 +528,28 @@ impl Game {
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_frame).as_secs_f32();
         self.last_frame = now;
-        let simulating = self.screen == Screen::Playing && self.focused && !self.picker_open;
-        let (steps, accumulator) = if simulating {
-            simulation_steps(self.screen, self.focused, self.accumulator, elapsed)
-        } else {
-            // Title, pause, settings, focus loss, and the material picker freeze the clock.
-            simulation_steps(Screen::Paused, false, self.accumulator, elapsed)
-        };
-        self.accumulator = accumulator;
-        if steps > 0 {
-            let motion = self.motion();
-            for _ in 0..steps {
-                self.player
-                    .tick(&self.world, motion, daylight::SIM_TICK_SECONDS);
-                self.day.advance(false);
-                self.repeat_edits();
+        let motion = self.motion();
+        let fires = advance_play_frame(
+            PlayFrame {
+                screen: self.screen,
+                focused: self.focused,
+                picker_open: self.picker_open,
+                elapsed,
+                world: &self.world,
+                motion,
+            },
+            &mut self.accumulator,
+            &mut self.player,
+            &mut self.day,
+            &mut self.edit_repeat,
+        );
+        for fire in fires {
+            if fire.break_block {
+                self.edit(false);
             }
-        } else if !self.picker_open {
-            self.edit_repeat.clear();
+            if fire.place_block {
+                self.edit(true);
+            }
         }
         let camera = self.camera();
         // UI actions below can change these for the next redraw. Keep each
@@ -1171,6 +1165,50 @@ impl ApplicationHandler for Application {
     }
 }
 
+struct PlayFrame<'a> {
+    screen: Screen,
+    focused: bool,
+    picker_open: bool,
+    elapsed: f32,
+    world: &'a World,
+    motion: Motion,
+}
+
+fn simulation_suspended(screen: Screen, focused: bool, picker_open: bool) -> bool {
+    picker_open || screen != Screen::Playing || !focused
+}
+
+/// One rendered frame of the fixed simulation.
+///
+/// Drains `elapsed` into `accumulator` with the 0.1 s hitch cap, then steps the
+/// player, the day, and edit repeat once per tick. A frame that drains zero
+/// ticks leaves a held button armed. Pause, title, settings, focus loss, and
+/// the material picker suspend the sim: the accumulator is cleared and so is
+/// the repeat state, so resuming cannot fire a stale hold. Releasing a mouse
+/// button is handled by [`EditRepeat::release`], not by this function.
+fn advance_play_frame(
+    frame: PlayFrame<'_>,
+    accumulator: &mut f32,
+    player: &mut Player,
+    day: &mut DayClock,
+    repeat: &mut EditRepeat,
+) -> Vec<RepeatFires> {
+    if simulation_suspended(frame.screen, frame.focused, frame.picker_open) {
+        *accumulator = 0.0;
+        repeat.clear();
+        return Vec::new();
+    }
+    let (steps, next) = simulation_steps(Screen::Playing, true, *accumulator, frame.elapsed);
+    *accumulator = next;
+    let mut fires = Vec::with_capacity(steps as usize);
+    for _ in 0..steps {
+        player.tick(frame.world, frame.motion, daylight::SIM_TICK_SECONDS);
+        day.advance(false);
+        fires.push(repeat.simulation_tick());
+    }
+    fires
+}
+
 /// Steps the fixed clock may take this frame. Title, pause, settings, and
 /// focus loss clear the accumulator so the day does not advance.
 fn simulation_steps(
@@ -1367,5 +1405,313 @@ mod tests {
         assert!(apply_debug_hour_skip(true, &mut day, true, &mut dirty));
         assert_eq!(day.label(), "10:00 morning");
         assert!(dirty);
+    }
+
+    struct HeldRun {
+        fires: Vec<u32>,
+        ticks: u32,
+        day_ticks: u32,
+        eye_moved: bool,
+    }
+
+    fn hold_across_frames(frames: &[f32]) -> HeldRun {
+        let world = World::new(1);
+        let mut player = Player::new(&world);
+        player.flying = true;
+        let start_eye = player.eye;
+        let mut day = DayClock::morning();
+        let start_day = day.tick();
+        let mut repeat = EditRepeat::new();
+        assert!(repeat.press(false), "the press is the initial edit");
+        let mut accumulator = 0.0;
+        let mut tick = 0u32;
+        let mut fires = Vec::new();
+        let motion = Motion {
+            forward: 1.0,
+            ..Motion::default()
+        };
+        for &elapsed in frames {
+            for fire in advance_play_frame(
+                PlayFrame {
+                    screen: Screen::Playing,
+                    focused: true,
+                    picker_open: false,
+                    elapsed,
+                    world: &world,
+                    motion,
+                },
+                &mut accumulator,
+                &mut player,
+                &mut day,
+                &mut repeat,
+            ) {
+                tick += 1;
+                if fire.break_block {
+                    fires.push(tick);
+                }
+                assert!(!fire.place_block);
+            }
+        }
+        HeldRun {
+            fires,
+            ticks: tick,
+            day_ticks: day.tick() - start_day,
+            eye_moved: player.eye != start_eye,
+        }
+    }
+
+    fn assert_repeat_cadence(fires: &[u32]) {
+        assert_eq!(interaction::EDIT_REPEAT_TICKS, 15);
+        assert!(
+            fires.len() >= 8,
+            "several seconds of hold should repeat, got {fires:?}"
+        );
+        assert_eq!(fires[0], 15, "{fires:?}");
+        for pair in fires.windows(2) {
+            assert_eq!(pair[1] - pair[0], 15, "{fires:?}");
+        }
+    }
+
+    #[test]
+    fn held_break_repeats_every_fifteen_ticks_at_144_hz() {
+        let frames = vec![1.0 / 144.0; (4.0 * 144.0) as usize];
+        let run = hold_across_frames(&frames);
+        assert_repeat_cadence(&run.fires);
+        assert_eq!(run.day_ticks, run.ticks);
+        assert!(run.eye_moved);
+        assert!(run.ticks > 200, "144 Hz still produces 60 Hz ticks");
+    }
+
+    #[test]
+    fn held_break_repeats_every_fifteen_ticks_at_60_hz() {
+        let frames = vec![daylight::SIM_TICK_SECONDS; 4 * 60];
+        let run = hold_across_frames(&frames);
+        assert_repeat_cadence(&run.fires);
+        assert_eq!(run.day_ticks, run.ticks);
+        assert!(run.eye_moved);
+    }
+
+    #[test]
+    fn held_break_repeats_every_fifteen_ticks_through_jitter() {
+        let pattern = [
+            1.0 / 144.0,
+            daylight::SIM_TICK_SECONDS,
+            0.004,
+            1.0 / 30.0,
+            0.012,
+            0.001,
+            0.02,
+            0.008,
+        ];
+        let mut frames = Vec::new();
+        let mut time = 0.0;
+        while time < 4.0 {
+            for dt in pattern {
+                frames.push(dt);
+                time += dt;
+            }
+        }
+        let run = hold_across_frames(&frames);
+        assert_repeat_cadence(&run.fires);
+        assert_eq!(run.day_ticks, run.ticks);
+        assert!(run.eye_moved);
+    }
+
+    #[test]
+    fn a_one_second_hitch_does_not_double_fire() {
+        let world = World::new(1);
+        let mut player = Player::new(&world);
+        let mut day = DayClock::morning();
+        let mut repeat = EditRepeat::new();
+        assert!(repeat.press(false));
+        let mut accumulator = 0.0;
+        let motion = Motion::default();
+        let hitch = advance_play_frame(
+            PlayFrame {
+                screen: Screen::Playing,
+                focused: true,
+                picker_open: false,
+                elapsed: 1.0,
+                world: &world,
+                motion,
+            },
+            &mut accumulator,
+            &mut player,
+            &mut day,
+            &mut repeat,
+        );
+        let repeats = hitch.iter().filter(|fire| fire.break_block).count();
+        assert!(repeats <= 1, "a hitch must not double-fire");
+        assert_eq!(repeats, 0);
+        assert!(hitch.len() < interaction::EDIT_REPEAT_TICKS as usize);
+        let mut tick = hitch.len() as u32;
+        let mut first = None;
+        'frames: for _ in 0..120 {
+            for fire in advance_play_frame(
+                PlayFrame {
+                    screen: Screen::Playing,
+                    focused: true,
+                    picker_open: false,
+                    elapsed: daylight::SIM_TICK_SECONDS,
+                    world: &world,
+                    motion,
+                },
+                &mut accumulator,
+                &mut player,
+                &mut day,
+                &mut repeat,
+            ) {
+                tick += 1;
+                if fire.break_block {
+                    first = Some(tick);
+                    break 'frames;
+                }
+            }
+        }
+        assert_eq!(first, Some(15));
+    }
+
+    #[test]
+    fn release_pause_focus_loss_and_picker_cancel_the_hold() {
+        struct Case {
+            screen: Screen,
+            focused: bool,
+            picker_open: bool,
+            release: bool,
+        }
+        let cases = [
+            Case {
+                screen: Screen::Playing,
+                focused: true,
+                picker_open: false,
+                release: true,
+            },
+            Case {
+                screen: Screen::Paused,
+                focused: true,
+                picker_open: false,
+                release: false,
+            },
+            Case {
+                screen: Screen::Playing,
+                focused: false,
+                picker_open: false,
+                release: false,
+            },
+            Case {
+                screen: Screen::Playing,
+                focused: true,
+                picker_open: true,
+                release: false,
+            },
+            Case {
+                screen: Screen::Title,
+                focused: true,
+                picker_open: false,
+                release: false,
+            },
+            Case {
+                screen: Screen::Settings,
+                focused: true,
+                picker_open: false,
+                release: false,
+            },
+        ];
+        for case in cases {
+            let world = World::new(1);
+            let mut player = Player::new(&world);
+            player.flying = true;
+            let mut day = DayClock::morning();
+            let mut repeat = EditRepeat::new();
+            let mut accumulator = 0.0;
+            let motion = Motion {
+                forward: 1.0,
+                ..Motion::default()
+            };
+            assert!(repeat.press(false));
+            for _ in 0..8 {
+                advance_play_frame(
+                    PlayFrame {
+                        screen: Screen::Playing,
+                        focused: true,
+                        picker_open: false,
+                        elapsed: daylight::SIM_TICK_SECONDS,
+                        world: &world,
+                        motion,
+                    },
+                    &mut accumulator,
+                    &mut player,
+                    &mut day,
+                    &mut repeat,
+                );
+            }
+            if case.release {
+                repeat.release(false);
+            }
+            let day_at_suspend = day.tick();
+            let eye_at_suspend = player.eye;
+            for _ in 0..30 {
+                let fires = advance_play_frame(
+                    PlayFrame {
+                        screen: case.screen,
+                        focused: case.focused,
+                        picker_open: case.picker_open,
+                        elapsed: daylight::SIM_TICK_SECONDS,
+                        world: &world,
+                        motion,
+                    },
+                    &mut accumulator,
+                    &mut player,
+                    &mut day,
+                    &mut repeat,
+                );
+                assert!(
+                    fires
+                        .iter()
+                        .all(|fire| !fire.break_block && !fire.place_block)
+                );
+                if !case.release {
+                    assert!(fires.is_empty(), "a suspended frame drains no ticks");
+                }
+            }
+            if !case.release {
+                assert_eq!(
+                    day.tick(),
+                    day_at_suspend,
+                    "a suspended frame freezes the clock"
+                );
+                assert_eq!(
+                    player.eye, eye_at_suspend,
+                    "a suspended frame freezes the player"
+                );
+            }
+            let mut resumed = Vec::new();
+            for _ in 0..180 {
+                for fire in advance_play_frame(
+                    PlayFrame {
+                        screen: Screen::Playing,
+                        focused: true,
+                        picker_open: false,
+                        elapsed: daylight::SIM_TICK_SECONDS,
+                        world: &world,
+                        motion,
+                    },
+                    &mut accumulator,
+                    &mut player,
+                    &mut day,
+                    &mut repeat,
+                ) {
+                    if fire.break_block {
+                        resumed.push(fire);
+                    }
+                }
+            }
+            assert!(
+                resumed.is_empty(),
+                "resuming must not fire a stale repeat: {resumed:?}"
+            );
+            assert!(day.tick() > day_at_suspend);
+            assert_ne!(player.eye, eye_at_suspend);
+        }
     }
 }
