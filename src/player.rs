@@ -43,11 +43,12 @@ const FEET_BELOW_EYE: f32 = 1.6;
 const HEAD_ABOVE_EYE: f32 = 0.15;
 /// Shrinks the collision sample so a body flush with a face is not inside it.
 const SKIN: f32 = 0.001;
-/// Less than one block, so a sweep cannot step over a solid cell.
+/// Less than one block, so one 3D substep cannot step over a solid cell.
 const MAX_SUBSTEP: f32 = 0.25;
 const CONTACT_ITERS: u32 = 16;
-/// Covers a terminal-velocity tick at 60 Hz many times over.
-const MAX_SWEEP_STEPS: u32 = 64;
+/// Bounds a pathological displacement. Each substep still stays within
+/// [`MAX_SUBSTEP`] on its largest axis; the cap does not enlarge steps.
+const MAX_SWEEP_STEPS: u32 = 256;
 
 pub struct Player {
     pub eye: Vec3,
@@ -322,26 +323,57 @@ impl Player {
     }
 
     fn collide_move(&mut self, world: &World, dt: f32, edge_guard: bool) {
-        let displacement = self.velocity * dt;
         let had_ground = self.grounded;
         self.grounded = false;
-        // The larger horizontal axis goes first so an outside corner yields
-        // along the direction of travel instead of catching both axes.
-        if displacement.x.abs() >= displacement.z.abs() {
-            self.move_axis(world, 0, displacement.x, edge_guard);
-            self.move_axis(world, 2, displacement.z, edge_guard);
-        } else {
-            self.move_axis(world, 2, displacement.z, edge_guard);
-            self.move_axis(world, 0, displacement.x, edge_guard);
+        // Integrate from the live velocity. A floor or ceiling hit zeros that
+        // component, so later substeps must not keep replaying the pre-impact slice.
+        let mut time_left = dt;
+        for _ in 0..MAX_SWEEP_STEPS {
+            if time_left <= 1.0e-8 || self.velocity.length_squared() <= 1.0e-12 {
+                break;
+            }
+            let displacement = self.velocity * time_left;
+            let span = displacement
+                .x
+                .abs()
+                .max(displacement.y.abs())
+                .max(displacement.z.abs());
+            if !span.is_finite() {
+                break;
+            }
+            let used = if span <= MAX_SUBSTEP {
+                time_left
+            } else {
+                time_left * (MAX_SUBSTEP / span)
+            };
+            let step = self.velocity * used;
+            let hit = self.resolve_substep(world, step, edge_guard);
+            time_left -= used;
+            if hit == AxisHit::Floor {
+                self.grounded = true;
+                // An airborne impact ends the ballistic sweep. Finishing the
+                // pre-impact horizontal slice would step off the lip that just
+                // stopped the fall. A tick that was already on the ground keeps
+                // sliding for the rest of its horizontal substeps.
+                if !had_ground {
+                    break;
+                }
+            }
         }
-        let landed = self.move_axis(world, 1, displacement.y, false) == AxisHit::Floor;
-        let stayed = had_ground
-            && displacement.y.abs() <= 1.0e-6
+        let resting = had_ground
+            && self.velocity.y.abs() <= 1.0e-4
             && Self::has_footing(self.eye, world)
             && !Self::collides(self.eye, world);
-        if landed || stayed {
+        if resting {
             self.grounded = true;
         }
+    }
+
+    /// One 3D slice: X, then Z, then Y, each flushed to contact.
+    fn resolve_substep(&mut self, world: &World, step: Vec3, edge_guard: bool) -> AxisHit {
+        self.move_axis(world, 0, step.x, edge_guard);
+        self.move_axis(world, 2, step.z, edge_guard);
+        self.move_axis(world, 1, step.y, false)
     }
 
     fn move_axis(&mut self, world: &World, axis: usize, delta: f32, edge_guard: bool) -> AxisHit {
@@ -1180,12 +1212,13 @@ mod tests {
         );
         assert!(!Player::collides(player.eye, &world));
 
-        // Endpoint is in open air on the far side of a one-block floor and wall.
-        // A single unsplit move would accept it; the sweep must stop at contact.
+        // Already at the contact band with a downward speed the tick will clamp
+        // to terminal. An unsplit move would push the body through the floor.
         let mut player = Player::new(&world);
         place(&mut player, Vec3::new(0.5, 202.62, 0.5));
         player.velocity.y = -90.0;
-        player.move_axis(&world, 1, -2.0, false);
+        player.tick(&world, Motion::default(), DT);
+        assert!(player.grounded, "fast landing missed at {}", player.eye);
         assert_eq!(player.velocity.y, 0.0);
         assert!(!Player::collides(player.eye, &world));
         assert!(
@@ -1199,16 +1232,11 @@ mod tests {
         let mut player = Player::new(&world);
         place(&mut player, Vec3::new(1.5, 202.62, 0.5));
         player.velocity.x = 40.0;
-        player.move_axis(&world, 0, 2.0, false);
+        player.tick(&world, Motion::default(), DT);
         assert_eq!(player.velocity.x, 0.0);
         assert!(
-            player.eye.x < 1.75,
-            "passed the thin wall at {}",
-            player.eye.x
-        );
-        assert!(
-            player.eye.x > 1.55,
-            "never approached the wall at {}",
+            (1.68..1.71).contains(&player.eye.x),
+            "thin wall was missed or crossed at {}",
             player.eye.x
         );
         assert!(!Player::collides(player.eye, &world));
@@ -1252,14 +1280,301 @@ mod tests {
         );
         assert_eq!(first.grounded, second.grounded);
 
+        // Nine metres of fall in one step. Skipping collision, or stopping the
+        // sweep short of the floor, leaves this body outside the stand band.
         let mut player = Player::new(&world);
-        place(&mut player, Vec3::new(0.5, 260.0, 0.5));
+        place(&mut player, Vec3::new(0.5, 212.0, 0.5));
         player.velocity.y = -40.0;
         player.tick(&world, Motion::default(), 0.5);
         assert!(player.velocity.is_finite() && player.eye.is_finite());
         assert!(player.velocity.y >= -TERMINAL_VELOCITY - 1.0e-3);
+        assert!(
+            player.grounded,
+            "large step missed the floor at {}",
+            player.eye
+        );
+        assert!(
+            (202.59..202.76).contains(&player.eye.y),
+            "large step ended at {}",
+            player.eye.y
+        );
         assert!(!Player::collides(player.eye, &world));
-        assert!(player.eye.y > 202.0);
+        assert!(Player::has_footing(player.eye, &world));
+    }
+
+    #[test]
+    fn sprint_terminal_fall_catches_block_lip() {
+        let mut world = World::new(3);
+        fill_box(&mut world, [-2, 160, -2], [3, 260, 2], Block::Air);
+        world.set_block([0, 200, 0], Block::Stone);
+        let mut player = Player::new(&world);
+        place(&mut player, Vec3::new(1.2, 202.7, 0.5));
+        player.velocity = Vec3::new(8.0, -TERMINAL_VELOCITY, 0.0);
+        player.tick(&world, Motion::default(), DT);
+        assert!(
+            player.grounded,
+            "sprint off the lip missed the landing at {}",
+            player.eye
+        );
+        assert!(
+            (202.59..202.76).contains(&player.eye.y),
+            "lip landing height {}",
+            player.eye.y
+        );
+        assert!(
+            (1.21..1.29).contains(&player.eye.x),
+            "slid past the lip to x {}",
+            player.eye.x
+        );
+        assert!(
+            Player::has_footing(player.eye, &world),
+            "landed without the stone underfoot at {}",
+            player.eye
+        );
+        assert!(!Player::collides(player.eye, &world));
+        assert_eq!(player.velocity.y, 0.0);
+    }
+
+    #[test]
+    fn centered_fast_fall_with_horizontal_speed_lands() {
+        let world = open_platform();
+        let mut player = Player::new(&world);
+        place(&mut player, Vec3::new(0.5, 203.2, 0.5));
+        player.velocity = Vec3::new(8.0, -TERMINAL_VELOCITY, 0.0);
+        player.tick(&world, Motion::default(), DT);
+        assert!(player.grounded, "centered fall missed at {}", player.eye);
+        assert!(
+            (202.59..202.76).contains(&player.eye.y),
+            "centered fall height {}",
+            player.eye.y
+        );
+        assert!(
+            (0.55..0.70).contains(&player.eye.x),
+            "horizontal speed was dropped or over-applied, x {}",
+            player.eye.x
+        );
+        assert!(Player::has_footing(player.eye, &world), "{}", player.eye);
+        assert!(!Player::collides(player.eye, &world));
+    }
+
+    #[test]
+    fn sneak_diagonal_single_block_and_l_corner() {
+        let mut world = World::new(3);
+        fill_box(&mut world, [-2, 160, -2], [3, 240, 3], Block::Air);
+        world.set_block([0, 200, 0], Block::Stone);
+        let mut player = Player::new(&world);
+        place(&mut player, Vec3::new(0.5, 210.0, 0.5));
+        settle(&mut player, &world);
+        face_positive_x(&mut player);
+        let diagonal = Motion {
+            forward: 1.0,
+            right: 1.0,
+            sneak: true,
+            ..Motion::default()
+        };
+        for _ in 0..200 {
+            player.tick(&world, diagonal, DT);
+            assert!(
+                player.grounded && player.eye.y > 202.4,
+                "diagonal sneak left the block at {}",
+                player.eye
+            );
+            assert!(
+                Player::has_footing(player.eye, &world),
+                "diagonal sneak lost the block at {}",
+                player.eye
+            );
+            assert!(!Player::collides(player.eye, &world));
+        }
+        assert!(
+            player.eye.x > 0.8 && player.eye.z > 0.8,
+            "diagonal sneak did not reach the corner at {}",
+            player.eye
+        );
+
+        let mut world = World::new(3);
+        fill_box(&mut world, [-2, 160, -2], [4, 240, 4], Block::Air);
+        for (x, z) in [(0, 0), (1, 0), (2, 0), (2, 1), (2, 2)] {
+            world.set_block([x, 200, z], Block::Stone);
+        }
+        let mut player = Player::new(&world);
+        place(&mut player, Vec3::new(0.5, 210.0, 0.5));
+        settle(&mut player, &world);
+        face_positive_x(&mut player);
+        let along = Motion {
+            forward: 1.0,
+            sneak: true,
+            ..Motion::default()
+        };
+        let mut turned = false;
+        for _ in 0..400 {
+            if !turned && player.eye.x > 2.4 {
+                player.yaw = std::f32::consts::PI;
+                turned = true;
+            }
+            player.tick(&world, along, DT);
+            assert!(
+                player.grounded && player.eye.y > 202.4,
+                "L sneak fell at {}",
+                player.eye
+            );
+            assert!(
+                Player::has_footing(player.eye, &world),
+                "L sneak lost footing at {}",
+                player.eye
+            );
+            assert!(!Player::collides(player.eye, &world));
+        }
+        assert!(turned, "never reached the stem of the L at {}", player.eye);
+        assert!(
+            player.eye.z > 1.8 && player.eye.x > 2.0,
+            "sneak did not follow the L to {}",
+            player.eye
+        );
+    }
+
+    #[test]
+    fn sneak_retreats_and_jump_leaves_the_ledge() {
+        let mut world = World::new(3);
+        fill_box(&mut world, [-2, 160, -2], [8, 240, 2], Block::Air);
+        fill_box(&mut world, [0, 200, -1], [5, 200, 1], Block::Stone);
+
+        let mut player = Player::new(&world);
+        place(&mut player, Vec3::new(2.5, 210.0, 0.5));
+        settle(&mut player, &world);
+        face_positive_x(&mut player);
+        let retreat = Motion {
+            forward: -1.0,
+            sneak: true,
+            ..Motion::default()
+        };
+        for _ in 0..300 {
+            player.tick(&world, retreat, DT);
+            assert!(
+                player.grounded && player.eye.y > 202.4,
+                "sneak retreat left the platform at {}",
+                player.eye
+            );
+            assert!(
+                Player::has_footing(player.eye, &world),
+                "sneak retreat lost footing at {}",
+                player.eye
+            );
+        }
+        assert!(
+            (-0.40..0.50).contains(&player.eye.x),
+            "sneak retreat did not hold the near lip at {}",
+            player.eye
+        );
+
+        let mut player = Player::new(&world);
+        place(&mut player, Vec3::new(6.05, 210.0, 0.5));
+        settle(&mut player, &world);
+        face_positive_x(&mut player);
+        let hold = Motion {
+            forward: 1.0,
+            sneak: true,
+            ..Motion::default()
+        };
+        for _ in 0..40 {
+            player.tick(&world, hold, DT);
+            assert!(
+                player.grounded && Player::has_footing(player.eye, &world),
+                "pre-jump sneak walked off at {}",
+                player.eye
+            );
+        }
+        let lip_x = player.eye.x;
+        assert!(
+            (5.6..6.35).contains(&lip_x),
+            "not waiting on the far lip at {lip_x}"
+        );
+        for _ in 0..90 {
+            player.tick(
+                &world,
+                Motion {
+                    forward: 1.0,
+                    sneak: true,
+                    jump: true,
+                    ..Motion::default()
+                },
+                DT,
+            );
+        }
+        assert!(
+            player.eye.x > lip_x + 0.25,
+            "sneak jump stayed on the lip, from {lip_x} to {}",
+            player.eye.x
+        );
+        assert!(
+            player.eye.y < 202.0 || !player.grounded,
+            "sneak jump never left the floor at {}",
+            player.eye
+        );
+        assert!(
+            !Player::has_footing(player.eye, &world),
+            "sneak jump still supported at {}",
+            player.eye
+        );
+    }
+
+    #[test]
+    fn sneak_holds_ledges_at_chunk_borders() {
+        // Block just inside the border, and which way sneak approaches the drop.
+        let cases = [
+            ("x=32", 31, true),
+            ("x=0/-1", 0, false),
+            ("x=-32", -33, true),
+            ("x=-33", -32, false),
+        ];
+        for (label, block_x, positive_x) in cases {
+            let mut world = World::new(3);
+            fill_box(
+                &mut world,
+                [block_x - 2, 160, -2],
+                [block_x + 2, 240, 2],
+                Block::Air,
+            );
+            world.set_block([block_x, 200, 0], Block::Stone);
+            let mut player = Player::new(&world);
+            place(&mut player, Vec3::new(block_x as f32 + 0.5, 210.0, 0.5));
+            settle(&mut player, &world);
+            if positive_x {
+                face_positive_x(&mut player);
+            } else {
+                player.yaw = -std::f32::consts::FRAC_PI_2;
+            }
+            let start_x = player.eye.x;
+            let motion = Motion {
+                forward: 1.0,
+                sneak: true,
+                ..Motion::default()
+            };
+            for _ in 0..240 {
+                player.tick(&world, motion, DT);
+                assert!(
+                    player.grounded && player.eye.y > 202.4,
+                    "{label} sneak fell at {}",
+                    player.eye
+                );
+                assert!(
+                    Player::has_footing(player.eye, &world),
+                    "{label} lost footing at {}",
+                    player.eye
+                );
+                assert!(!Player::collides(player.eye, &world), "{label}");
+            }
+            let progress = if positive_x {
+                player.eye.x - start_x
+            } else {
+                start_x - player.eye.x
+            };
+            assert!(
+                progress > 0.35,
+                "{label} did not reach the lip, progress {progress} at {}",
+                player.eye
+            );
+        }
     }
 
     #[test]
