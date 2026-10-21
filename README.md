@@ -30,7 +30,8 @@ One full day lasts 20 real minutes and advances only while playing. Pausing the 
 |---|---|
 | Enter | Enter world / resume |
 | WASD / mouse | Move / look |
-| Space / Shift | Jump / sprint |
+| Space / Shift | Jump / sprint while moving forward |
+| Left Ctrl | Sneak; will not walk off edges |
 | F | Toggle creative flight |
 | Space / Left Ctrl in flight | Rise / descend |
 | Left click or X | Break the targeted block. Hold the mouse button to repeat |
@@ -55,7 +56,7 @@ cargo build --release --locked
 
 The GPU test is opt-in on a developer machine because it needs a Vulkan adapter. Running it validates shader pipelines, not the window, input, or save lifecycle. The Linux source-check job runs that same test on lavapipe (software Vulkan). Native playtest evidence and remaining gates are recorded in [docs/STATUS.md](docs/STATUS.md).
 
-Flight is collision-free for development exploration; move clear of solid terrain before toggling back to walking. New spawns and fall recovery test the entire body against trees and construction.
+Walking eases in and out instead of snapping to full speed. Sprint applies only while moving forward and drops when you stop or step backward. Jumping still works for a brief moment after leaving a ledge, and a jump pressed just before landing is kept. Holding jump takes off once each time you land. Sneak is slower and stops at edges. Flight is collision-free for development exploration; move clear of solid terrain before toggling back to walking. New spawns and fall recovery test the entire body against trees and construction.
 
 ## Materials and CPU benchmarks
 
