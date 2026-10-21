@@ -4,16 +4,16 @@ For Rob, on a Windows PC with an NVIDIA GTX 1660 Ti. STRATA is the working name.
 
 ## This applies after these land, in this order
 
-Merge order is #3 (already merged), #2, #5, #4, #6, and this pull request last:
+#3 and #2 are merged. The rest of the order is #5, #4, #6, then this pull request:
 
-1. [Pull request #3](https://github.com/MrWizard94-Compile/Strata/pull/3) — plains, forests, deserts, oceans, caves, and ores. Already on `development`.
-2. [Pull request #2](https://github.com/MrWizard94-Compile/Strata/pull/2) — day and night (`cursor/day-night-cycle-26da`)
+1. [Pull request #3](https://github.com/MrWizard94-Compile/Strata/pull/3) — plains, forests, deserts, oceans, caves, and ores. Merged.
+2. [Pull request #2](https://github.com/MrWizard94-Compile/Strata/pull/2) — day and night. Merged.
 3. [Pull request #5](https://github.com/MrWizard94-Compile/Strata/pull/5) — smaller terrain uploads (`cursor/packed-quad-upload-budget-f0c1`)
 4. [Pull request #4](https://github.com/MrWizard94-Compile/Strata/pull/4) — walking, sprint, and sneak (`cursor/player-movement-feel-8b4f`)
 5. [Pull request #6](https://github.com/MrWizard94-Compile/Strata/pull/6) — breaking, placing, and the block picker (`cursor/interaction-hotbar-picker-3aca`)
 6. This checklist, [pull request #7](https://github.com/MrWizard94-Compile/Strata/pull/7), last
 
-`development` already has the title screen, pause screen, breaking and placing, flight, F3, F5 save, and the ore blocks from #3. The later pull requests add the clock, the upload check, the walking feel, and the block picker. Do this whole list in one sitting, after someone tells you those pull requests are merged. An older build will fail the new steps.
+`development` already has the title screen, pause screen, breaking and placing, flight, F3, F5 save, the ore blocks from #3, and the day/night clock from #2. Still to come are the upload check, the walking feel, and the block picker. Do this whole list in one sitting, after someone tells you those remaining pull requests are merged. An older build will fail the new steps.
 
 The combined game you are checking works like this: you can change a block about five blocks away, F4 changes the clock even while a menu is open, the save keeps both the clock and the hotbar, left Ctrl sneaks on the ground and sinks while flying, and the corner word changes among **SNEAKING**, **FREE FLIGHT**, **CHOOSING A MATERIAL**, and **EXPLORING**.
 
@@ -331,7 +331,7 @@ Copy this, fill it in, and paste it to Vector or Atlas.
 Milestone 1 playtest
 Date:
 PC: Windows, GTX 1660 Ti
-Merge order confirmed (#3 already merged, then #2, #5, #4, #6, then this checklist): yes / no
+Merge order confirmed (#3 and #2 merged, then #5, #4, #6, then this checklist): yes / no
 
 GPU test line:
 
