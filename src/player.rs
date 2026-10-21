@@ -225,7 +225,15 @@ mod tests {
     }
     #[test]
     fn spawn_and_fall_recovery_clear_trees_and_player_construction() {
-        let tree_world = World::new(396);
+        let mut tree_world = World::new(396);
+        let ground = tree_world.surface_height(64, -64);
+        // Generator 2 moved the forests, so seed 396 no longer promises a trunk
+        // in this spawn column. Plant one when the column is open; recovery
+        // still has to lift the body clear of that solid.
+        if !tree_world.block_at(64, ground + 1, -64).is_solid() {
+            tree_world.set_block([64, ground + 1, -64], Block::Wood);
+            tree_world.set_block([64, ground + 2, -64], Block::Leaves);
+        }
         let player = Player::new(&tree_world);
         assert!(!Player::collides(player.eye, &tree_world));
         assert!(player.eye.y > tree_world.surface_height(64, -64) as f32 + 3.0);

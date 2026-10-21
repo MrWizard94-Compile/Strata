@@ -1,12 +1,12 @@
 # Original 32×32 material set
 
-The material generator in `src/materials.rs` authors thirteen opaque 32×32 pixel albedo tiles for STRATA. Every pixel comes from project-owned geometric rules and fixed palettes. There are no downloaded images, sampled photographs, copied game textures, bundled art dependencies, or claims of legal clearance for the working title.
+The material generator in `src/materials.rs` authors seventeen opaque 32×32 pixel albedo tiles for STRATA. Every pixel comes from project-owned geometric rules and fixed palettes. There are no downloaded images, sampled photographs, copied game textures, bundled art dependencies, or claims of legal clearance for the working title.
 
 This is the source material set for the director's explicit 32×32 texture requirement. Source tests establish dimensions, mapping, deterministic output, visible variation and mip behavior. They do not establish approval of its appearance in the rendered game.
 
 ## Array contract
 
-`TILE_SIZE = 32`, `LAYER_COUNT = 13`. `rgba_layers()` returns 53,248 bytes, packed in layer → row → column → RGBA order. Each layer is 4,096 bytes. RGB values are full sRGB albedo; alpha is always 255. Upload with an sRGB RGBA8 texture-array format, and preserve lighting/AO as independent factors rather than multiplying albedo by the existing block palette a second time.
+`TILE_SIZE = 32`, `LAYER_COUNT = 17`. `rgba_layers()` returns 69,632 bytes, packed in layer → row → column → RGBA order. Each layer is 4,096 bytes. RGB values are full sRGB albedo; alpha is always 255. Upload with an sRGB RGBA8 texture-array format, and preserve lighting/AO as independent factors rather than multiplying albedo by the existing block palette a second time.
 
 `layer_for(Block, [nx,ny,nz])` accepts the axis-aligned integer face normals used by the world mesher. Mapping is independent of world seed, load order and chunk coordinates.
 
@@ -25,8 +25,12 @@ This is the source material set for the director's explicit 32×32 texture requi
 | 10 | Clay | Terracotta sediment layers, fine slanted drying cracks and ochre rims |
 | 11 | Crystal | Cyan mineral seams, pale facet edges and blue-grey host rock |
 | 12 | Basalt | Offset angular column joints, cool raised edges and sparse mineral inclusions |
+| 13 | Coal ore | Limestone host with a wrapped cluster of dark coal specks |
+| 14 | Iron ore | Limestone host with a wrapped cluster of rust-colored specks |
+| 15 | Gold ore | Limestone host with a wrapped cluster of warm gold specks |
+| 16 | Diamond ore | Limestone host with a wrapped cluster of pale cyan specks |
 
-Air is never rendered; its defensive mapping is layer 3. Grass uses the soil layer on its underside, and both timber ends use the same endgrain layer. Those shared faces keep the set at thirteen layers without redundant tiles.
+Air is never rendered; its defensive mapping is layer 3. Grass uses the soil layer on its underside, and both timber ends use the same endgrain layer. Ore tiles reuse the limestone host and add one mineral cluster each, so they stay distinct from stone and from each other without a second albedo path.
 
 ## Rendering conventions
 
@@ -38,11 +42,11 @@ The palette uses restrained greens, warm earth, cool limestone/basalt and bright
 
 ## Mip chain
 
-`mip_chain()` returns six packed texture-array levels at 32, 16, 8, 4, 2 and 1 pixels per side. Every level contains all thirteen layers in the same order. Each 2×2 group is decoded using the sRGB transfer function, averaged in linear light, and encoded back to sRGB. Alpha remains opaque and filtering never mixes layers. Total chain payload is 70,980 bytes; this is pixel payload, not total GPU allocation.
+`mip_chain()` returns six packed texture-array levels at 32, 16, 8, 4, 2 and 1 pixels per side. Every level contains all seventeen layers in the same order. Each 2×2 group is decoded using the sRGB transfer function, averaged in linear light, and encoded back to sRGB. Alpha remains opaque and filtering never mixes layers. Total chain payload is 92,820 bytes; this is pixel payload, not total GPU allocation.
 
 The renderer uses nearest magnification to retain readable pixels and linear minification/mipmap filtering to reduce distant shimmer. Renderer integration and visual acceptance are separate checks: inspect all six face orientations, grass-side direction, repeated large greedy faces, shared chunk boundaries, and distance transitions in the actual client.
 
-`strata.exe --export-materials <new-directory>` writes thirteen exact 32×32 PNG tiles, a 6× nearest-neighbour contact sheet and a layer/provenance manifest. The parent directory must exist. Existing export directories are rejected, preserving artist edits. This is an export path; file edits do not yet hot-reload into the engine. A consumer test decodes every PNG and compares it byte-for-byte with the runtime source.
+`strata.exe --export-materials <new-directory>` writes seventeen exact 32×32 PNG tiles, a 6× nearest-neighbour contact sheet and a layer/provenance manifest. The parent directory must exist. Existing export directories are rejected, preserving artist edits. This is an export path; file edits do not yet hot-reload into the engine. A consumer test decodes every PNG and compares it byte-for-byte with the runtime source.
 
 ## Verification
 

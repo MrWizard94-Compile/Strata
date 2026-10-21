@@ -1,15 +1,27 @@
 //! Deterministic procedural terrain, sparse edits, DDA selection, and greedy meshes.
 //!
-//! Generation is a pure function of seed and integer coordinates. Each mesh samples
-//! a one-cell halo so visibility and ambient occlusion agree across chunk borders.
-//! Trees are anchored in a global grid and are never owned by the first chunk that
-//! happens to load. No cache survives an edit; worker jobs should own a World clone.
+//! Generation is a pure function of the world seed and integer coordinates. Chunk
+//! order and thread scheduling do not change a block. Each mesh samples a one-cell
+//! halo so visibility and ambient occlusion agree across chunk borders. Trees and
+//! ore veins are anchored on global grids, so a feature that crosses a chunk is
+//! identical from either side. No generation cache is stored on `World`.
 
 use std::collections::HashMap;
 
 pub const CHUNK_SIZE: i32 = 32;
 pub const SEA_LEVEL: i32 = 28;
+/// Inclusive surface clamp. Terrain, including tree crowns, stays below the
+/// y=192 benchmark fixtures.
+pub const MIN_SURFACE: i32 = 12;
+pub const MAX_SURFACE: i32 = 96;
+/// Save-file terrain version. Generator 1 is rejected so older files keep
+/// their bytes instead of being reinterpreted under these rules.
+pub const GENERATOR_VERSION: u32 = 2;
 pub type ChunkKey = (i32, i32, i32);
+
+const TREE_GRID: i32 = 9;
+const TREE_CANOPY: i32 = 2;
+const TREE_CROWN_ABOVE: i32 = 2;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -42,6 +54,10 @@ pub enum Block {
     Clay = 9,
     Crystal = 10,
     Basalt = 11,
+    CoalOre = 12,
+    IronOre = 13,
+    GoldOre = 14,
+    DiamondOre = 15,
 }
 
 impl Block {
@@ -59,6 +75,10 @@ impl Block {
             Self::Clay => [0.66, 0.34, 0.22, 1.0],
             Self::Crystal => [0.28, 0.86, 0.89, 1.0],
             Self::Basalt => [0.24, 0.28, 0.31, 1.0],
+            Self::CoalOre => [0.16, 0.16, 0.17, 1.0],
+            Self::IronOre => [0.66, 0.48, 0.40, 1.0],
+            Self::GoldOre => [0.86, 0.72, 0.28, 1.0],
+            Self::DiamondOre => [0.45, 0.86, 0.84, 1.0],
         }
     }
 
@@ -76,6 +96,10 @@ impl Block {
             Self::Clay => "Terracotta",
             Self::Crystal => "Lumen crystal",
             Self::Basalt => "Basalt",
+            Self::CoalOre => "Coal ore",
+            Self::IronOre => "Iron ore",
+            Self::GoldOre => "Gold ore",
+            Self::DiamondOre => "Diamond ore",
         }
     }
 
@@ -97,9 +121,24 @@ impl Block {
             9 => Self::Clay,
             10 => Self::Crystal,
             11 => Self::Basalt,
+            12 => Self::CoalOre,
+            13 => Self::IronOre,
+            14 => Self::GoldOre,
+            15 => Self::DiamondOre,
             _ => return None,
         })
     }
+}
+
+/// Climate region at a column. Transitions are continuous in height and dithered
+/// in cover; this label is the dominant region after that blend.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Biome {
+    Plains,
+    Forest,
+    Desert,
+    Ocean,
+    Beach,
 }
 
 #[derive(Clone)]
@@ -120,9 +159,9 @@ pub struct RayHit {
 #[derive(Clone, Copy)]
 struct Column {
     height: i32,
-    moisture: f64,
-    warm: f64,
-    river: f64,
+    biome: Biome,
+    /// Desert influence in `0.0..=1.0`, used to dither sand onto neighboring land.
+    sand: f64,
 }
 
 #[derive(Clone, Copy)]
@@ -131,7 +170,6 @@ struct Tree {
     z: i32,
     ground: i32,
     height: i32,
-    pine: bool,
 }
 
 impl Tree {
@@ -139,25 +177,71 @@ impl Tree {
         let dx = (i64::from(x) - i64::from(self.x)).abs();
         let dz = (i64::from(z) - i64::from(self.z)).abs();
         let dy = y - self.ground;
+        if !(0..=i64::from(TREE_CANOPY)).contains(&dx.max(dz)) {
+            return Block::Air;
+        }
         if dx == 0 && dz == 0 && dy > 0 && dy <= self.height {
             return Block::Wood;
         }
-        if self.pine {
-            if dy >= 3 && dy <= self.height + 2 {
-                let radius = ((self.height + 3 - dy) / 2).clamp(0, 3) as i64;
-                if dx.max(dz) <= radius && dx + dz <= radius + 1 {
-                    return Block::Leaves;
-                }
-            }
-        } else {
-            let crown_y = dy - self.height;
-            if (-2..=2).contains(&crown_y) && dx * dx + dz * dz + i64::from(crown_y * crown_y) <= 11
-            {
-                return Block::Leaves;
-            }
+        let crown = dy - self.height;
+        if (-2..=TREE_CROWN_ABOVE).contains(&crown)
+            && dx * dx + dz * dz + i64::from(crown * crown) <= 6
+        {
+            return Block::Leaves;
         }
         Block::Air
     }
+}
+
+struct OreRule {
+    salt: u64,
+    cell: i32,
+    min_y: i32,
+    max_y: i32,
+    chance: u64,
+    radius_sq: i32,
+    block: Block,
+}
+
+fn ore_rules() -> [OreRule; 4] {
+    [
+        OreRule {
+            salt: 0xD1A0,
+            cell: 13,
+            min_y: 1,
+            max_y: 12,
+            chance: 8,
+            radius_sq: 1,
+            block: Block::DiamondOre,
+        },
+        OreRule {
+            salt: 0x60D0,
+            cell: 11,
+            min_y: 1,
+            max_y: 22,
+            chance: 14,
+            radius_sq: 1,
+            block: Block::GoldOre,
+        },
+        OreRule {
+            salt: 0x1A0,
+            cell: 9,
+            min_y: 1,
+            max_y: 46,
+            chance: 34,
+            radius_sq: 2,
+            block: Block::IronOre,
+        },
+        OreRule {
+            salt: 0xC0A1,
+            cell: 8,
+            min_y: 6,
+            max_y: 70,
+            chance: 46,
+            radius_sq: 2,
+            block: Block::CoalOre,
+        },
+    ]
 }
 
 impl World {
@@ -203,33 +287,166 @@ impl World {
         self.column(x, z).height
     }
 
-    fn column(&self, x: i32, z: i32) -> Column {
-        let x = f64::from(x);
-        let z = f64::from(z);
-        let moisture = fbm2(self.seed ^ 0x1959, x / 175.0, z / 175.0, 3);
-        let warm = noise2(self.seed ^ 0xA713, x / 240.0, z / 240.0);
-        let broad = fbm2(self.seed ^ 0x72F8, x / 135.0, z / 135.0, 4);
-        let ridge = 1.0 - noise2(self.seed ^ 0x9137, x / 92.0, z / 92.0).abs();
-        let mountain_mask = smoothstep(0.0, 0.6, broad);
-        let mountains = ridge.powi(3) * mountain_mask * 68.0;
-        let hills = fbm2(self.seed ^ 0x82A7, x / 43.0, z / 43.0, 3) * 8.0;
-        let base = 40.0 + broad * 19.0 + hills + mountains;
+    /// Dominant climate label. The runtime samples terrain through `block_at`;
+    /// this is the tested query for maps and biome checks.
+    #[allow(dead_code)]
+    pub fn biome_at(&self, x: i32, z: i32) -> Biome {
+        self.column(x, z).biome
+    }
 
-        // A continuous meandering river is readable at the starting vista. Noise
-        // supplies tributaries beyond it without chunk-local discontinuities.
-        let center = (z / 115.0).sin() * 29.0 + noise2(self.seed ^ 0xC171, z / 170.0, 1.7) * 24.0;
-        let river_distance = (x - center).abs();
-        let river = 1.0 - smoothstep(6.0, 23.0, river_distance);
-        let riverbed = 23.0 + noise2(self.seed ^ 0xD441, x / 19.0, z / 19.0) * 2.0;
-        let height = (base * (1.0 - river) + riverbed * river)
+    /// Interior blocks of one chunk, in `x + CHUNK_SIZE * (z + CHUNK_SIZE * y)` order.
+    /// `None` when the chunk origin cannot be represented. Edits are included, matching
+    /// `block_at`. Generation itself does not read or write shared mutable state.
+    /// Meshing still samples a halo; this is the timed, order-independent chunk API.
+    #[allow(dead_code)]
+    pub fn generate_chunk(&self, key: ChunkKey) -> Option<Vec<Block>> {
+        let origin = chunk_origin(key)?;
+        let halo = self.sample_halo(origin);
+        let mut blocks = Vec::with_capacity((CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE) as usize);
+        for y in 0..CHUNK_SIZE {
+            for z in 0..CHUNK_SIZE {
+                for x in 0..CHUNK_SIZE {
+                    blocks.push(halo[halo_index([x, y, z])]);
+                }
+            }
+        }
+        Some(blocks)
+    }
+
+    fn column(&self, x: i32, z: i32) -> Column {
+        let xf = f64::from(x);
+        let zf = f64::from(z);
+        let continental = fbm2(self.seed ^ 0xC0A7, xf / 220.0, zf / 220.0, 4);
+        let temperature = fbm2(self.seed ^ 0x7E11, xf / 240.0, zf / 240.0, 3);
+        let humidity = fbm2(self.seed ^ 0x111D, xf / 210.0, zf / 210.0, 3);
+        let hills = fbm2(self.seed ^ 0x1111, xf / 46.0, zf / 46.0, 4);
+        let roll = fbm2(self.seed ^ 0x4011, xf / 130.0, zf / 130.0, 3);
+        let detail = fbm2(self.seed ^ 0x0D37, xf / 17.0, zf / 17.0, 2);
+        let ocean = smoothstep(0.10, -0.28, continental);
+        let shore = smoothstep(-0.34, -0.10, continental) * smoothstep(0.18, -0.02, continental);
+        let desert_w = smoothstep(0.0, 0.24, temperature) * smoothstep(0.04, -0.24, humidity);
+        let forest_w = smoothstep(-0.04, 0.28, humidity) * (1.0 - desert_w);
+        let plains_w = (1.0 - desert_w - forest_w).max(0.0);
+
+        let sea = f64::from(SEA_LEVEL);
+        let ocean_h = sea - 11.0 + hills * 2.4 + detail * 0.5;
+        let plains_h = sea + 9.0 + roll * 4.5 + hills * 7.0 + detail * 1.2;
+        let forest_h = sea + 10.0 + roll * 4.0 + hills * 8.0 + detail * 1.4;
+        let desert_h = sea + 7.0 + roll * 2.0 + hills * 2.6 + detail * 0.6;
+        let land = 1.0 - ocean;
+        let land_h = plains_h * plains_w + forest_h * forest_w + desert_h * desert_w;
+        let mut height = ocean_h * ocean + land_h * land;
+        let beach_h = sea + 1.0 + detail * 0.45;
+        height = lerp(height, beach_h, shore);
+        let height = height
             .round()
-            .clamp(12.0, 117.0) as i32;
+            .clamp(f64::from(MIN_SURFACE), f64::from(MAX_SURFACE)) as i32;
+
+        let biome = if height < SEA_LEVEL {
+            Biome::Ocean
+        } else if shore > 0.35 && height <= SEA_LEVEL + 2 {
+            Biome::Beach
+        } else if desert_w >= 0.42 && desert_w >= forest_w {
+            Biome::Desert
+        } else if forest_w >= 0.46 {
+            Biome::Forest
+        } else {
+            Biome::Plains
+        };
         Column {
             height,
-            moisture,
-            warm,
-            river,
+            biome,
+            sand: desert_w.clamp(0.0, 1.0),
         }
+    }
+
+    fn sandy(&self, x: i32, z: i32, column: Column) -> bool {
+        match column.biome {
+            Biome::Ocean | Biome::Beach | Biome::Desert => true,
+            Biome::Plains | Biome::Forest => {
+                if column.sand <= 0.08 {
+                    false
+                } else {
+                    let roll = (hash3(self.seed ^ 0x5AAD, x, 1, z) % 1024) as f64 / 1024.0;
+                    roll < column.sand
+                }
+            }
+        }
+    }
+
+    fn carves(&self, x: i32, y: i32, z: i32, column: Column) -> bool {
+        let seal = match column.biome {
+            Biome::Ocean | Biome::Beach => 6,
+            _ if column.height <= SEA_LEVEL + 3 => 6,
+            _ => 4,
+        };
+        if y < 2 || y > column.height - seal {
+            return false;
+        }
+        // Keep tunnels from climbing into the sea along a coast. Inland hills
+        // may still open dry caves above this line.
+        if y >= SEA_LEVEL - 3 && column.height < SEA_LEVEL + 12 {
+            return false;
+        }
+        let xf = f64::from(x);
+        let yf = f64::from(y);
+        let zf = f64::from(z);
+        let warp = noise3(self.seed ^ 0x0A11, xf / 31.0, yf / 27.0, zf / 31.0) * 5.0;
+        let sheet = noise3(self.seed ^ 0xCA7E, (xf + warp) / 18.0, yf / 12.0, zf / 18.0);
+        let tube = noise3(
+            self.seed ^ 0x71BE,
+            xf / 18.0,
+            (yf - warp) / 14.0,
+            (zf + warp) / 18.0,
+        );
+        sheet.abs() < 0.085 && tube.abs() < 0.15
+    }
+
+    fn ore_at(&self, x: i32, y: i32, z: i32) -> Option<Block> {
+        if !(1..=70).contains(&y) {
+            return None;
+        }
+        for rule in ore_rules() {
+            if !(rule.min_y..=rule.max_y).contains(&y) {
+                continue;
+            }
+            let min_cx = (x - 1).div_euclid(rule.cell);
+            let max_cx = (x + 1).div_euclid(rule.cell);
+            let min_cy = (y - 1).div_euclid(rule.cell);
+            let max_cy = (y + 1).div_euclid(rule.cell);
+            let min_cz = (z - 1).div_euclid(rule.cell);
+            let max_cz = (z + 1).div_euclid(rule.cell);
+            for cz in min_cz..=max_cz {
+                for cy in min_cy..=max_cy {
+                    for cx in min_cx..=max_cx {
+                        if self.vein_hits(&rule, [cx, cy, cz], [x, y, z]) {
+                            return Some(rule.block);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn vein_hits(&self, rule: &OreRule, cell: [i32; 3], at: [i32; 3]) -> bool {
+        let [cx, cy, cz] = cell;
+        let [x, y, z] = at;
+        let hash = hash3(self.seed ^ rule.salt, cx, cy, cz);
+        if hash % 100 >= rule.chance {
+            return false;
+        }
+        let span = u64::from(rule.cell as u32);
+        let ox = cx * rule.cell + (hash % span) as i32;
+        let oy = cy * rule.cell + ((hash >> 8) % span) as i32;
+        let oz = cz * rule.cell + ((hash >> 16) % span) as i32;
+        if !(rule.min_y..=rule.max_y).contains(&oy) {
+            return false;
+        }
+        let dx = x - ox;
+        let dy = y - oy;
+        let dz = z - oz;
+        dx * dx + dy * dy + dz * dz <= rule.radius_sq
     }
 
     fn terrain_block(&self, x: i32, y: i32, z: i32, column: Column) -> Block {
@@ -240,94 +457,61 @@ impl World {
                 Block::Air
             };
         }
-        if y < 0 {
+        if y < 1 {
             return Block::Basalt;
         }
-        if y > 4 && y < column.height - 4 {
-            let nx = f64::from(x) / 27.0;
-            let ny = f64::from(y) / 21.0;
-            let nz = f64::from(z) / 27.0;
-            let tunnel = noise3(self.seed ^ 0xBE93, nx, ny, nz);
-            if tunnel.abs() < 0.105 {
-                let cross = noise3(self.seed ^ 0x51F1, nx * 1.3, ny * 0.75, nz * 1.3);
-                if cross.abs() < 0.19 {
-                    return Block::Air;
-                }
-            }
+        if self.carves(x, y, z, column) {
+            return Block::Air;
         }
         let depth = column.height - y;
+        let sandy = self.sandy(x, z, column);
         if depth == 0 {
-            if column.height >= 85 {
-                Block::Snow
-            } else if column.height <= SEA_LEVEL + 1 || column.river > 0.72 {
-                Block::Sand
-            } else if column.warm > 0.35 && column.moisture < -0.08 {
-                Block::Clay
-            } else if column.height >= 68 {
-                Block::Stone
-            } else {
-                Block::Grass
-            }
+            if sandy { Block::Sand } else { Block::Grass }
         } else if depth < 4 {
-            if column.height <= SEA_LEVEL + 1 {
-                Block::Sand
-            } else if column.warm > 0.35 && column.moisture < -0.08 {
-                Block::Clay
-            } else {
-                Block::Dirt
-            }
-        } else if y < 26 && hash3(self.seed ^ 0xCA77, x, y, z).is_multiple_of(179) {
-            Block::Crystal
-        } else if y < 10 || (y / 7).rem_euclid(8) == 0 {
-            Block::Basalt
+            if sandy { Block::Sand } else { Block::Dirt }
         } else {
-            Block::Stone
+            self.ore_at(x, y, z).unwrap_or(Block::Stone)
         }
     }
 
     fn tree(&self, grid_x: i32, grid_z: i32) -> Option<Tree> {
         let hash = hash3(self.seed ^ 0x7AEE, grid_x, 0, grid_z);
-        let x = grid_x.checked_mul(12)?.checked_add(2 + (hash % 8) as i32)?;
+        let x = grid_x
+            .checked_mul(TREE_GRID)?
+            .checked_add(2 + (hash % 5) as i32)?;
         let z = grid_z
-            .checked_mul(12)?
-            .checked_add(2 + ((hash >> 8) % 8) as i32)?;
+            .checked_mul(TREE_GRID)?
+            .checked_add(2 + ((hash >> 8) % 5) as i32)?;
         let column = self.column(x, z);
-        if column.height <= SEA_LEVEL + 3
-            || column.height > 89
-            || column.river > 0.3
-            || column.moisture < -0.25
-            || hash % 100 > if column.moisture > 0.1 { 78 } else { 43 }
-        {
+        let chance = match column.biome {
+            Biome::Forest => 68,
+            Biome::Plains => 11,
+            Biome::Desert | Biome::Ocean | Biome::Beach => return None,
+        };
+        if hash % 100 >= chance || self.sandy(x, z, column) {
             return None;
         }
-        let beside = self.column(x.saturating_add(2), z.saturating_add(2));
-        if (beside.height - column.height).abs() > 3 {
+        let east = self.column(x.saturating_add(2), z);
+        let south = self.column(x, z.saturating_add(2));
+        if (east.height - column.height).abs() > 2 || (south.height - column.height).abs() > 2 {
             return None;
         }
         Some(Tree {
             x,
             z,
             ground: column.height,
-            height: 5 + ((hash >> 16) % 5) as i32,
-            pine: column.height > 60 || column.warm < -0.2,
+            height: 4 + ((hash >> 16) % 3) as i32,
         })
     }
 
-    fn generated_block(&self, x: i32, y: i32, z: i32) -> Block {
-        if y < 0 {
-            return Block::Basalt;
-        }
-        if y > 128 {
-            return Block::Air;
-        }
-        let column = self.column(x, z);
-        let terrain = self.terrain_block(x, y, z, column);
-        if terrain != Block::Air || y <= column.height {
-            return terrain;
-        }
+    fn foliage_at(&self, x: i32, y: i32, z: i32) -> Block {
         let mut foliage = Block::Air;
-        for gz in z.div_euclid(12) - 1..=z.div_euclid(12) + 1 {
-            for gx in x.div_euclid(12) - 1..=x.div_euclid(12) + 1 {
+        let min_z = (z - TREE_CANOPY).div_euclid(TREE_GRID);
+        let max_z = (z + TREE_CANOPY).div_euclid(TREE_GRID);
+        let min_x = (x - TREE_CANOPY).div_euclid(TREE_GRID);
+        let max_x = (x + TREE_CANOPY).div_euclid(TREE_GRID);
+        for gz in min_z..=max_z {
+            for gx in min_x..=max_x {
                 if let Some(tree) = self.tree(gx, gz) {
                     let block = tree.block(x, y, z);
                     if block == Block::Wood {
@@ -340,6 +524,21 @@ impl World {
             }
         }
         foliage
+    }
+
+    fn generated_block(&self, x: i32, y: i32, z: i32) -> Block {
+        if y < 0 {
+            return Block::Basalt;
+        }
+        if y > 128 {
+            return Block::Air;
+        }
+        let column = self.column(x, z);
+        let terrain = self.terrain_block(x, y, z, column);
+        if y <= column.height || terrain != Block::Air {
+            return terrain;
+        }
+        self.foliage_at(x, y, z)
     }
 
     /// Mesh positions are world-space f32. Camera-relative large-world rendering
@@ -370,10 +569,10 @@ impl World {
         }
         // Apply all trees that can intersect this chunk's halo. The same anchors
         // and trunk-before-leaf rule are used by point queries and meshing.
-        let min_x = (origin[0] - 4).div_euclid(12);
-        let max_x = (origin[0] + CHUNK_SIZE + 3).div_euclid(12);
-        let min_z = (origin[2] - 4).div_euclid(12);
-        let max_z = (origin[2] + CHUNK_SIZE + 3).div_euclid(12);
+        let min_x = (origin[0] - TREE_CANOPY).div_euclid(TREE_GRID);
+        let max_x = (origin[0] + CHUNK_SIZE + TREE_CANOPY).div_euclid(TREE_GRID);
+        let min_z = (origin[2] - TREE_CANOPY).div_euclid(TREE_GRID);
+        let max_z = (origin[2] + CHUNK_SIZE + TREE_CANOPY).div_euclid(TREE_GRID);
         for gz in min_z..=max_z {
             for gx in min_x..=max_x {
                 if origin[1] > 128 || origin[1] + CHUNK_SIZE < 0 {
@@ -383,11 +582,13 @@ impl World {
                     continue;
                 };
                 let start_y = (tree.ground + 1 - origin[1]).max(-1);
-                let end_y = (tree.ground + tree.height + 2 - origin[1]).min(CHUNK_SIZE);
-                for z in (tree.z - 3 - origin[2]).max(-1)..=(tree.z + 3 - origin[2]).min(CHUNK_SIZE)
+                let end_y =
+                    (tree.ground + tree.height + TREE_CROWN_ABOVE - origin[1]).min(CHUNK_SIZE);
+                for z in (tree.z - TREE_CANOPY - origin[2]).max(-1)
+                    ..=(tree.z + TREE_CANOPY - origin[2]).min(CHUNK_SIZE)
                 {
-                    for x in
-                        (tree.x - 3 - origin[0]).max(-1)..=(tree.x + 3 - origin[0]).min(CHUNK_SIZE)
+                    for x in (tree.x - TREE_CANOPY - origin[0]).max(-1)
+                        ..=(tree.x + TREE_CANOPY - origin[0]).min(CHUNK_SIZE)
                     {
                         for y in start_y..=end_y {
                             if origin[1] + y
@@ -814,14 +1015,18 @@ mod tests {
 
     #[test]
     fn all_material_ids_round_trip_and_unknown_ids_are_rejected() {
-        for id in 0..=11 {
-            let block = Block::from_id(id).expect("known material");
+        let mut id = 0_u8;
+        while let Some(block) = Block::from_id(id) {
             assert_eq!(block as u8, id);
             assert!(!block.name().is_empty());
+            assert!(block.color().iter().all(|channel| channel.is_finite()));
+            id += 1;
         }
-        assert_eq!(Block::from_id(12), None);
+        assert!(id > 15, "ore ids must stay registered");
+        assert_eq!(Block::from_id(id), None);
         assert_eq!(Block::from_id(255), None);
         assert!(!Block::Water.is_solid());
+        assert!(Block::DiamondOre.is_solid());
     }
 
     #[test]
@@ -835,7 +1040,7 @@ mod tests {
                 assert_eq!(a.surface_height(x, z), b.surface_height(x, z));
                 assert_eq!(a.block_at(x, 35, z), b.block_at(x, 35, z));
                 differences += usize::from(a.surface_height(x, z) != c.surface_height(x, z));
-                assert!((12..=117).contains(&a.surface_height(x, z)));
+                assert!((MIN_SURFACE..=MAX_SURFACE).contains(&a.surface_height(x, z)));
             }
         }
         assert!(differences > 300);
@@ -1021,15 +1226,26 @@ mod tests {
     #[test]
     fn a_tree_crossing_a_chunk_boundary_is_identical_on_both_sides() {
         let world = World::new(728491);
-        let tree = (-16..16)
+        let tree = (-48..48)
             .find_map(|gz| {
-                (-16..16).find_map(|gx| {
+                (-48..48).find_map(|gx| {
                     world
                         .tree(gx, gz)
-                        .filter(|tree| tree.x.rem_euclid(CHUNK_SIZE) <= 2)
+                        .filter(|tree| tree.x.rem_euclid(CHUNK_SIZE) <= 1)
                 })
             })
             .expect("seeded forest includes a boundary tree");
+        for dy in 1..=tree.height {
+            assert_eq!(
+                world.block_at(tree.x, tree.ground + dy, tree.z),
+                Block::Wood,
+                "trunk must be continuous"
+            );
+        }
+        assert_eq!(
+            world.block_at(tree.x, tree.ground + tree.height + 1, tree.z),
+            Block::Leaves
+        );
         let boundary = tree.x.div_euclid(CHUNK_SIZE) * CHUNK_SIZE;
         let key = (
             tree.x.div_euclid(CHUNK_SIZE),
@@ -1040,42 +1256,514 @@ mod tests {
         let left_origin = chunk_origin((key.0 - 1, key.1, key.2)).unwrap();
         let right = world.sample_halo(right_origin);
         let left = world.sample_halo(left_origin);
-        let mut foliage = 0;
-        for y in right_origin[1]..right_origin[1] + CHUNK_SIZE {
-            for z in right_origin[2]..right_origin[2] + CHUNK_SIZE {
-                let block = world.block_at(boundary, y, z);
-                foliage += usize::from(block == Block::Leaves || block == Block::Wood);
-                assert_eq!(
-                    right[halo_index([0, y - right_origin[1], z - right_origin[2]])],
-                    block
-                );
-                assert_eq!(
-                    left[halo_index([CHUNK_SIZE, y - left_origin[1], z - left_origin[2]])],
-                    block
-                );
-            }
-        }
-        assert!(foliage > 0, "boundary must contain actual tree geometry");
-    }
-
-    #[test]
-    fn cave_cells_and_river_water_exist_in_generated_world() {
-        let world = World::new(31415);
-        let mut caves = 0;
-        let mut river = 0;
-        for x in (-64..64).step_by(4) {
-            for z in (-64..64).step_by(4) {
-                let column = world.column(x, z);
-                river += usize::from(world.block_at(x, SEA_LEVEL, z) == Block::Water);
-                for y in (5..column.height - 4).step_by(3) {
-                    caves += usize::from(world.block_at(x, y, z) == Block::Air);
+        let mut left_leaves = 0;
+        let mut right_leaves = 0;
+        for y in tree.ground..=tree.ground + tree.height + TREE_CROWN_ABOVE {
+            for dz in -TREE_CANOPY..=TREE_CANOPY {
+                for dx in -TREE_CANOPY..=TREE_CANOPY {
+                    let x = tree.x + dx;
+                    let z = tree.z + dz;
+                    let block = world.block_at(x, y, z);
+                    if block == Block::Leaves || block == Block::Wood {
+                        if x < boundary {
+                            left_leaves += 1;
+                        } else {
+                            right_leaves += 1;
+                        }
+                    }
+                    if (left_origin[1]..left_origin[1] + CHUNK_SIZE).contains(&y)
+                        && (left_origin[2]..left_origin[2] + CHUNK_SIZE).contains(&z)
+                    {
+                        let local_x = x - left_origin[0];
+                        if (0..CHUNK_SIZE).contains(&local_x) {
+                            assert_eq!(
+                                left[halo_index([local_x, y - left_origin[1], z - left_origin[2]])],
+                                block
+                            );
+                        }
+                    }
+                    if (right_origin[1]..right_origin[1] + CHUNK_SIZE).contains(&y)
+                        && (right_origin[2]..right_origin[2] + CHUNK_SIZE).contains(&z)
+                    {
+                        let local_x = x - right_origin[0];
+                        if (0..CHUNK_SIZE).contains(&local_x) {
+                            assert_eq!(
+                                right[halo_index([
+                                    local_x,
+                                    y - right_origin[1],
+                                    z - right_origin[2]
+                                ])],
+                                block
+                            );
+                        }
+                    }
                 }
             }
         }
         assert!(
-            caves > 20,
-            "seed must produce explorable underground volume"
+            left_leaves > 0,
+            "canopy must enter the chunk before the trunk"
         );
-        assert!(river > 50, "seed must produce river surface");
+        assert!(
+            right_leaves > 0,
+            "canopy must continue on the trunk's chunk"
+        );
+        let boundary_block = world.block_at(boundary, tree.ground + tree.height, tree.z);
+        assert_eq!(
+            right[halo_index([
+                0,
+                tree.ground + tree.height - right_origin[1],
+                tree.z - right_origin[2]
+            ])],
+            boundary_block
+        );
+        assert_eq!(
+            left[halo_index([
+                CHUNK_SIZE,
+                tree.ground + tree.height - left_origin[1],
+                tree.z - left_origin[2]
+            ])],
+            boundary_block
+        );
+    }
+
+    #[test]
+    fn same_seed_regenerates_identical_chunks_independent_of_order() {
+        let seed = 0x000A_11CE;
+        let keys = [(0, 0, 0), (1, 0, -1), (-2, 0, 3), (0, 1, 0), (-1, 0, -1)];
+        let world = World::new(seed);
+        let serial: Vec<_> = keys
+            .iter()
+            .map(|key| world.generate_chunk(*key).expect("chunk origin"))
+            .collect();
+        let other = World::new(seed);
+        for key in keys.into_iter().rev() {
+            let chunk = other.generate_chunk(key).unwrap();
+            let index = keys.iter().position(|candidate| *candidate == key).unwrap();
+            assert_eq!(chunk, serial[index]);
+        }
+        let mut handles = Vec::new();
+        for key in keys {
+            handles.push(std::thread::spawn(move || {
+                let world = World::new(seed);
+                (key, world.generate_chunk(key).unwrap())
+            }));
+        }
+        for handle in handles {
+            let (key, chunk) = handle.join().expect("worker");
+            let index = keys.iter().position(|candidate| *candidate == key).unwrap();
+            assert_eq!(
+                chunk, serial[index],
+                "parallel generation diverged at {key:?}"
+            );
+        }
+        let origin = chunk_origin(keys[0]).unwrap();
+        let chunk = &serial[0];
+        for y in 0..CHUNK_SIZE {
+            for z in (0..CHUNK_SIZE).step_by(3) {
+                for x in (0..CHUNK_SIZE).step_by(3) {
+                    let index = (x + CHUNK_SIZE * (z + CHUNK_SIZE * y)) as usize;
+                    assert_eq!(
+                        chunk[index],
+                        world.block_at(origin[0] + x, origin[1] + y, origin[2] + z)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn oceans_beaches_and_land_biomes_have_the_expected_cover() {
+        let world = World::new(20261021);
+        let mut counts = [0_u32; 5];
+        let mut desert_sand = 0;
+        let mut desert_seen = 0;
+        let mut forest_grass = 0;
+        let mut forest_seen = 0;
+        let mut plains_grass = 0;
+        let mut plains_seen = 0;
+        let mut oceans = 0;
+        let mut flooded = 0;
+        for x in (-512..512).step_by(8) {
+            for z in (-512..512).step_by(8) {
+                let biome = world.biome_at(x, z);
+                counts[biome_index(biome)] += 1;
+                let height = world.surface_height(x, z);
+                let surface = world.block_at(x, height, z);
+                match biome {
+                    Biome::Ocean => {
+                        oceans += 1;
+                        assert!(height < SEA_LEVEL);
+                        assert_eq!(world.block_at(x, SEA_LEVEL, z), Block::Water);
+                        assert_eq!(surface, Block::Sand);
+                        assert_eq!(world.block_at(x, height - 1, z), Block::Sand);
+                        for dy in 0..6 {
+                            let block = world.block_at(x, height - dy, z);
+                            assert!(block.is_solid(), "ocean floor opened at y={}", height - dy);
+                        }
+                        for y in height + 1..=SEA_LEVEL {
+                            assert_eq!(world.block_at(x, y, z), Block::Water);
+                            for [nx, nz] in [[1, 0], [-1, 0], [0, 1], [0, -1]] {
+                                let neighbor = world.block_at(x + nx, y, z + nz);
+                                if neighbor == Block::Air {
+                                    flooded += 1;
+                                }
+                            }
+                            assert_ne!(world.block_at(x, y - 1, z), Block::Air);
+                        }
+                    }
+                    Biome::Beach | Biome::Desert => {
+                        desert_seen += usize::from(biome == Biome::Desert);
+                        desert_sand +=
+                            usize::from(biome == Biome::Desert && surface == Block::Sand);
+                        assert_eq!(surface, Block::Sand);
+                        assert!(height >= SEA_LEVEL);
+                    }
+                    Biome::Forest => {
+                        forest_seen += 1;
+                        forest_grass += usize::from(surface == Block::Grass);
+                        assert!(height > SEA_LEVEL);
+                    }
+                    Biome::Plains => {
+                        plains_seen += 1;
+                        plains_grass += usize::from(surface == Block::Grass);
+                        assert!(height > SEA_LEVEL);
+                    }
+                }
+            }
+        }
+        assert!(
+            counts.iter().all(|count| *count > 20),
+            "biome counts {counts:?}"
+        );
+        assert!(oceans > 40);
+        assert_eq!(flooded, 0, "cave air met ocean water");
+        assert_eq!(desert_sand, desert_seen);
+        assert!(forest_seen > 0 && forest_grass * 100 / forest_seen > 70);
+        assert!(plains_seen > 0 && plains_grass * 100 / plains_seen > 70);
+    }
+
+    #[test]
+    fn trees_are_dense_in_forest_sparse_on_plains_and_absent_elsewhere() {
+        let world = World::new(20261021);
+        let mut forest = 0;
+        let mut plains = 0;
+        let mut elsewhere = 0;
+        for gz in -30..30 {
+            for gx in -30..30 {
+                let Some(tree) = world.tree(gx, gz) else {
+                    continue;
+                };
+                match world.biome_at(tree.x, tree.z) {
+                    Biome::Forest => forest += 1,
+                    Biome::Plains => plains += 1,
+                    _ => elsewhere += 1,
+                }
+                assert!(world.surface_height(tree.x, tree.z) > SEA_LEVEL);
+                assert_eq!(world.block_at(tree.x, tree.ground, tree.z), Block::Grass);
+                for dy in 1..=tree.height {
+                    assert_eq!(
+                        world.block_at(tree.x, tree.ground + dy, tree.z),
+                        Block::Wood
+                    );
+                }
+                assert_eq!(
+                    world.block_at(tree.x + 1, tree.ground + tree.height, tree.z),
+                    Block::Leaves
+                );
+            }
+        }
+        assert_eq!(elsewhere, 0);
+        assert!(
+            forest > plains && plains > 0,
+            "forest {forest}, plains {plains}"
+        );
+    }
+
+    #[test]
+    fn ores_stay_inside_depth_bands_and_each_band_is_populated() {
+        let world = World::new(20261021);
+        let mut coal = 0;
+        let mut iron = 0;
+        let mut gold = 0;
+        let mut diamond = 0;
+        for cy in 0..=2 {
+            for cz in -2..=2 {
+                for cx in -2..=2 {
+                    let chunk = world.generate_chunk((cx, cy, cz)).unwrap();
+                    let origin_y = cy * CHUNK_SIZE;
+                    for (index, block) in chunk.iter().copied().enumerate() {
+                        let y = origin_y + (index / (CHUNK_SIZE * CHUNK_SIZE) as usize) as i32;
+                        match block {
+                            Block::CoalOre => {
+                                assert!((6..=70).contains(&y));
+                                coal += 1;
+                            }
+                            Block::IronOre => {
+                                assert!((1..=46).contains(&y));
+                                iron += 1;
+                            }
+                            Block::GoldOre => {
+                                assert!((1..=22).contains(&y));
+                                gold += 1;
+                            }
+                            Block::DiamondOre => {
+                                assert!((1..=12).contains(&y));
+                                diamond += 1;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            coal > iron && iron > gold && gold > 0,
+            "coal {coal} iron {iron} gold {gold}"
+        );
+        assert!(diamond > 0, "diamond band was empty in the sample");
+        assert!(
+            coal > diamond * 4,
+            "coal should be much more common than diamond"
+        );
+    }
+
+    #[test]
+    fn caves_exist_underground_without_opening_the_sky() {
+        let world = World::new(31415);
+        let mut caves = 0;
+        for x in (-80..80).step_by(5) {
+            for z in (-80..80).step_by(5) {
+                let height = world.surface_height(x, z);
+                assert_ne!(world.block_at(x, height, z), Block::Air);
+                for y in 2..height {
+                    if world.block_at(x, y, z) == Block::Air {
+                        caves += 1;
+                        assert!(y <= height - 4);
+                    }
+                }
+            }
+        }
+        assert!(caves > 30, "sample contained {caves} cave cells");
+    }
+
+    #[test]
+    fn chunk_generation_reports_average_time() {
+        let world = World::new(20261021);
+        let keys: Vec<ChunkKey> = (-1..=1)
+            .flat_map(|z| (-1..=1).map(move |x| (x, 0, z)))
+            .collect();
+        for key in &keys {
+            std::hint::black_box(world.generate_chunk(*key));
+        }
+        let rounds = 2;
+        let start = std::time::Instant::now();
+        for _ in 0..rounds {
+            for key in &keys {
+                std::hint::black_box(world.generate_chunk(*key));
+            }
+        }
+        let average_us = start.elapsed().as_secs_f64() * 1_000_000.0 / (keys.len() * rounds) as f64;
+        eprintln!(
+            "STRATA_CHUNK_GEN_AVG_US {average_us:.1} chunks={} rounds={rounds}",
+            keys.len()
+        );
+        assert!(
+            average_us < 50_000.0,
+            "chunk generation averaged {average_us:.1} µs"
+        );
+    }
+
+    fn biome_index(biome: Biome) -> usize {
+        match biome {
+            Biome::Plains => 0,
+            Biome::Forest => 1,
+            Biome::Desert => 2,
+            Biome::Ocean => 3,
+            Biome::Beach => 4,
+        }
+    }
+
+    #[test]
+    fn export_worldgen_previews_when_requested() {
+        let Ok(directory) = std::env::var("STRATA_PREVIEW_DIR") else {
+            return;
+        };
+        let directory = std::path::PathBuf::from(directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let world = World::new(PREVIEW_SEED);
+        let (origin_x, origin_z) = preview_origin(&world);
+        let slice_z = preview_slice_z(&world, origin_x, origin_z);
+        let span = PREVIEW_SPAN;
+        let mut map = vec![0_u8; (span * (span * 2 + 8) * 3) as usize];
+        for z in 0..span {
+            for x in 0..span {
+                let wx = origin_x + x;
+                let wz = origin_z + z;
+                let height = world.surface_height(wx, wz);
+                let biome = biome_rgb(world.biome_at(wx, wz), height);
+                let height_shade = height_rgb(height, world.biome_at(wx, wz));
+                put_rgb(&mut map, span * 2 + 8, x, z, biome);
+                put_rgb(&mut map, span * 2 + 8, span + 8 + x, z, height_shade);
+            }
+        }
+        write_rgb(
+            &directory.join("biome-height.png"),
+            (span * 2 + 8) as u32,
+            span as u32,
+            &map,
+        );
+        let section_top = 72;
+        let depth = section_top + 1;
+        let mut section = vec![0_u8; (span * depth * 3) as usize];
+        for x in 0..span {
+            for y in 0..=section_top {
+                let block = world.block_at(origin_x + x, y, slice_z);
+                let row = section_top - y;
+                put_rgb(&mut section, span, x, row, block_rgb(block, y));
+            }
+        }
+        write_rgb(
+            &directory.join("cross-section.png"),
+            span as u32,
+            depth as u32,
+            &section,
+        );
+        eprintln!(
+            "STRATA_PREVIEW seed={PREVIEW_SEED} origin={origin_x},{origin_z} slice_z={slice_z} span={span}"
+        );
+    }
+
+    const PREVIEW_SEED: u64 = 20261021;
+    const PREVIEW_SPAN: i32 = 320;
+
+    fn preview_origin(world: &World) -> (i32, i32) {
+        let mut best = (0, 0, -1_i32);
+        for origin_z in (-640..640).step_by(80) {
+            for origin_x in (-640..640).step_by(80) {
+                let mut counts = [0_i32; 5];
+                for z in (0..PREVIEW_SPAN).step_by(16) {
+                    for x in (0..PREVIEW_SPAN).step_by(16) {
+                        counts[biome_index(world.biome_at(origin_x + x, origin_z + z))] += 1;
+                    }
+                }
+                let Some(least) = counts.iter().copied().min() else {
+                    continue;
+                };
+                if least < 4 {
+                    continue;
+                }
+                let score =
+                    least * 1_000 + counts.iter().map(|count| (*count).min(30)).sum::<i32>();
+                if score > best.2 {
+                    best = (origin_x, origin_z, score);
+                }
+            }
+        }
+        assert!(best.2 > 0, "preview window did not contain every biome");
+        (best.0, best.1)
+    }
+
+    fn preview_slice_z(world: &World, origin_x: i32, origin_z: i32) -> i32 {
+        let mut best = (origin_z + PREVIEW_SPAN / 2, 0_i32);
+        for z in (origin_z..origin_z + PREVIEW_SPAN).step_by(2) {
+            let mut saw_ocean = false;
+            let mut saw_land = false;
+            let mut caves = 0;
+            let mut coal = 0;
+            let mut iron = 0;
+            let mut gold = 0;
+            let mut diamond = 0;
+            for x in (origin_x..origin_x + PREVIEW_SPAN).step_by(4) {
+                match world.biome_at(x, z) {
+                    Biome::Ocean => saw_ocean = true,
+                    Biome::Beach => {}
+                    _ => saw_land = true,
+                }
+                let height = world.surface_height(x, z).min(72);
+                for y in 1..height {
+                    match world.block_at(x, y, z) {
+                        Block::Air => caves += 1,
+                        Block::CoalOre => coal += 1,
+                        Block::IronOre => iron += 1,
+                        Block::GoldOre => gold += 1,
+                        Block::DiamondOre => diamond += 1,
+                        _ => {}
+                    }
+                }
+            }
+            if saw_ocean && saw_land && caves > 0 && coal > 0 && iron > 0 && gold > 0 && diamond > 0
+            {
+                let score = caves.min(40) + coal.min(20) + iron.min(20) + gold * 3 + diamond * 5;
+                if score > best.1 {
+                    best = (z, score);
+                }
+            }
+        }
+        assert!(best.1 > 0, "preview slice missed caves or an ore band");
+        best.0
+    }
+
+    fn biome_rgb(biome: Biome, height: i32) -> [u8; 3] {
+        let shade = (0.55 + f64::from(height - MIN_SURFACE) / 80.0).clamp(0.45, 1.15);
+        let base = match biome {
+            Biome::Plains => [92, 164, 70],
+            Biome::Forest => [34, 108, 52],
+            Biome::Desert => [214, 186, 112],
+            Biome::Ocean => [30, 96, 156],
+            Biome::Beach => [222, 204, 150],
+        };
+        base.map(|channel| (f64::from(channel) * shade).round() as u8)
+    }
+
+    fn height_rgb(height: i32, biome: Biome) -> [u8; 3] {
+        if biome == Biome::Ocean {
+            let depth = (SEA_LEVEL - height).clamp(0, 24);
+            return [20, (70 + depth * 3) as u8, (120 + depth * 4).min(220) as u8];
+        }
+        let shade =
+            ((height - MIN_SURFACE) * 255 / (MAX_SURFACE - MIN_SURFACE)).clamp(0, 255) as u8;
+        [shade, shade, shade]
+    }
+
+    fn block_rgb(block: Block, y: i32) -> [u8; 3] {
+        match block {
+            Block::Air => {
+                if y > SEA_LEVEL {
+                    [186, 214, 232]
+                } else {
+                    [28, 22, 36]
+                }
+            }
+            Block::Grass => [74, 150, 58],
+            Block::Dirt => [122, 84, 52],
+            Block::Stone => [132, 136, 134],
+            Block::Sand => [214, 196, 132],
+            Block::Water => [42, 112, 168],
+            Block::Wood => [112, 74, 42],
+            Block::Leaves => [48, 124, 54],
+            Block::Snow => [230, 236, 238],
+            Block::Clay => [168, 86, 56],
+            Block::Crystal => [72, 210, 214],
+            Block::Basalt => [48, 52, 58],
+            Block::CoalOre => [42, 42, 46],
+            Block::IronOre => [176, 110, 78],
+            Block::GoldOre => [214, 176, 64],
+            Block::DiamondOre => [80, 220, 210],
+        }
+    }
+
+    fn put_rgb(image: &mut [u8], width: i32, x: i32, y: i32, color: [u8; 3]) {
+        let index = ((y * width + x) * 3) as usize;
+        image[index..index + 3].copy_from_slice(&color);
+    }
+
+    fn write_rgb(path: &std::path::Path, width: u32, height: u32, rgb: &[u8]) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width, height);
+        encoder.set_color(png::ColorType::Rgb);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().unwrap();
+        writer.write_image_data(rgb).unwrap();
     }
 }

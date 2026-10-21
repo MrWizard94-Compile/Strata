@@ -27,7 +27,7 @@ Every scenario uses seed `728491` and the current `CHUNK_SIZE` of 32. A chunk co
 
 | Scenario | Exact workload | Independent check |
 |---|---|---|
-| `seeded_route` | The ordered 12-chunk route below, spanning negative coordinates, river terrain, cave depths, surface and upper air | Valid finite mesh data; repeatable digest/counts on every run |
+| `seeded_route` | The ordered 12-chunk route below, spanning negative coordinates, biome terrain, cave depths, surface and upper air | Valid finite mesh data; repeatable digest/counts on every run |
 | `empty_high_chunk` | Generated air core and one-cell air halo at `(0,6,0)` | Zero surface area |
 | `isolated_solid_chunk` | Every core cell edited to Stone; generated air halo | Area `6 × 32² = 6144` square blocks |
 | `enclosed_solid_chunk` | Core plus its full one-cell halo edited to Stone | Zero surface area; no boundary faces |
