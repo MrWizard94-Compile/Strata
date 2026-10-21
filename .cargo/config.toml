@@ -1,0 +1,4 @@
+# Static C runtime for the Windows player executable only. Other targets,
+# including a Linux host build, do not inherit this flag.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

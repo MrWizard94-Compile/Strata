@@ -1,0 +1,330 @@
+name: Playable build
+
+# Manual runs upload downloadable zips as workflow artifacts (kept 30 days).
+# A push of a v* tag also publishes those zips on a GitHub Release unless
+# workflow_dispatch sets dry_run. The Windows zip is the primary artifact.
+# This workflow does not run on pull requests. The publish job is the only
+# job that can write repository contents, and only when the ref is a version
+# tag and dry_run is not set.
+#
+# Another platform is another `package.strategy.matrix.include` row:
+#   family: windows   uses package-windows.ps1
+#   family: unix      copies matrix.binary, checks matrix.binary_kind, zips it
+# Leave a row out until that OS has actually been built. macOS is not a row.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Upload zips and checksums without creating a GitHub Release
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: playable-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package:
+    name: Package ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      actions: write
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            label: windows-x86_64
+            shell: pwsh
+            family: windows
+            zip: strata-windows-x86_64.zip
+            binary: strata.exe
+            shaders: false
+            binary_kind: ""
+          # Ubuntu 22.04 keeps the published binary on glibc 2.35. The image
+          # is scheduled for removal in April 2027; when it goes, move this
+          # row forward and update the glibc note in PLAYING.md.
+          - os: ubuntu-22.04
+            label: linux-x86_64
+            shell: bash
+            family: unix
+            zip: strata-linux-x86_64.zip
+            binary: strata
+            shaders: true
+            binary_kind: ELF 64-bit
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install lavapipe
+        if: matrix.shaders == true
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers libvulkan1 zip
+          icd="$(find /usr/share/vulkan/icd.d -name 'lvp_icd*.json' -print -quit)"
+          if [ -z "$icd" ]; then
+            echo 'lavapipe ICD was not installed'
+            exit 1
+          fi
+          echo "LAVAPIPE_ICD=$icd" >> "$GITHUB_ENV"
+
+      - name: Install the pinned toolchain
+        run: |
+          rustup show
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup target add x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustc --version
+          cargo --version
+        if: matrix.family == 'windows'
+      - name: Install the pinned toolchain
+        run: |
+          rustup show
+          rustc --version
+          cargo --version
+        if: matrix.family == 'unix'
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Formatting
+        run: cargo fmt --check
+
+      # Unfiltered on every OS row. Do not add a test name or --skip here.
+      - name: Full locked test suite
+        run: cargo test --locked
+
+      - name: Shader pipeline validation
+        if: matrix.shaders == true
+        env:
+          VK_DRIVER_FILES: ${{ env.LAVAPIPE_ICD }}
+          VK_ICD_FILENAMES: ${{ env.LAVAPIPE_ICD }}
+          WGPU_BACKEND: vulkan
+        run: cargo test --locked native_gpu_validates_all_world_shader_pipelines -- --ignored --nocapture
+
+      - name: Strict linting
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Locked release build
+        if: matrix.family == 'windows'
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+
+      - name: Locked release build
+        if: matrix.family == 'unix'
+        run: cargo build --release --locked
+
+      - name: Validate and package Windows zip
+        if: matrix.family == 'windows'
+        run: ./package-windows.ps1 -Executable target\x86_64-pc-windows-msvc\release\${{ matrix.binary }} -ZipName ${{ matrix.zip }}
+
+      - name: Package Unix zip
+        if: matrix.family == 'unix'
+        run: |
+          set -eu
+          kind='${{ matrix.binary_kind }}'
+          if [ -z "$kind" ]; then
+            echo 'A unix matrix row needs binary_kind, for example: ELF 64-bit'
+            exit 1
+          fi
+          if ! command -v zip >/dev/null 2>&1 || ! command -v file >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends zip file
+          fi
+          mkdir -p dist
+          cp "target/release/${{ matrix.binary }}" "dist/${{ matrix.binary }}"
+          chmod 755 "dist/${{ matrix.binary }}"
+          cp PLAYING.md dist/PLAYING.md
+          file "dist/${{ matrix.binary }}" | grep -q "$kind"
+          zip -j '${{ matrix.zip }}' "dist/${{ matrix.binary }}" dist/PLAYING.md
+          rm -rf unpack
+          mkdir unpack
+          python3 -m zipfile -e '${{ matrix.zip }}' unpack
+          names="$(cd unpack && find . -type f -print | sed 's|^\./||' | sort | paste -sd, -)"
+          if [ "$names" != "PLAYING.md,${{ matrix.binary }}" ]; then
+            echo "Unix zip contains [$names]; expected ${{ matrix.binary }} and PLAYING.md."
+            exit 1
+          fi
+          # Python's extractor drops the Unix mode. Check the mode stored in
+          # the zip, then mark the unpacked file executable so this job can launch it.
+          python3 -c 'import sys,zipfile; info=zipfile.ZipFile(sys.argv[1]).getinfo(sys.argv[2]); mode=(info.external_attr>>16)&0o777; sys.exit(0 if mode & 0o111 else "zip mode %s is not executable" % oct(mode))' '${{ matrix.zip }}' '${{ matrix.binary }}'
+          chmod 755 "unpack/${{ matrix.binary }}"
+          set +e
+          help="$( "unpack/${{ matrix.binary }}" --help 2>&1 )"
+          code=$?
+          set -e
+          if [ "$code" -ne 2 ]; then
+            printf '%s\n' "$help"
+            echo "Packaged unix binary exited $code; expected 2 from --help."
+            exit 1
+          fi
+          printf '%s\n' "$help" | grep -q 'STRATA'
+          "unpack/${{ matrix.binary }}" --export-materials unpack/materials
+          pngs="$(find unpack/materials -type f -name '*.png' | wc -l | tr -d ' ')"
+          test "$pngs" -ge 18
+          test -f unpack/materials/contact-sheet.png
+          test -f unpack/materials/manifest.json
+          sha256sum '${{ matrix.zip }}' | tee '${{ matrix.zip }}.sha256'
+
+      - name: Upload zip
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          path: ${{ matrix.zip }}
+          if-no-files-found: error
+          retention-days: 30
+          archive: false
+
+      - name: Upload checksum
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          path: ${{ matrix.zip }}.sha256
+          if-no-files-found: error
+          retention-days: 30
+          archive: false
+
+  checksums:
+    name: Write checksums
+    needs: package
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: write
+    steps:
+      # A player zip is itself a .zip. Without this, download-artifact
+      # unpacks it and the checksum job cannot see the file that was uploaded.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+          skip-decompress: true
+      - name: Assemble SHA256SUMS.txt
+        run: |
+          set -eu
+          find dist -type f -print
+          cd dist
+          primary=strata-windows-x86_64.zip
+          test -f "$primary"
+          test -f "$primary.sha256"
+          mapfile -t extras < <(find . -maxdepth 1 -type f -name 'strata-*.zip' ! -name "$primary" | sort)
+          {
+            cat "$primary.sha256"
+            for extra in "${extras[@]}"; do
+              base="$(basename "$extra")"
+              test -f "$base.sha256"
+              cat "$base.sha256"
+            done
+          } > SHA256SUMS.txt
+          sha256sum -c SHA256SUMS.txt
+          echo 'Checksums verified. No GitHub Release is created by this job.'
+      - name: Upload combined checksums
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          path: dist/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
+          archive: false
+
+  publish:
+    name: Publish GitHub Release
+    needs: checksums
+    if: startsWith(github.ref, 'refs/tags/v') && inputs.dry_run != true
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+          skip-decompress: true
+      - name: Check checksums and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          find dist -type f -print
+          cd dist
+          primary=strata-windows-x86_64.zip
+          test -f "$primary"
+          test -f "$primary.sha256"
+          mapfile -t extras < <(find . -maxdepth 1 -type f -name 'strata-*.zip' ! -name "$primary" | sort)
+          {
+            cat "$primary.sha256"
+            for extra in "${extras[@]}"; do
+              base="$(basename "$extra")"
+              test -f "$base.sha256"
+              cat "$base.sha256"
+            done
+          } > SHA256SUMS.txt
+          sha256sum -c SHA256SUMS.txt
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "Release $GITHUB_REF_NAME already exists. Refusing to replace it."
+            exit 1
+          fi
+          cat > release-notes.md <<'EOF'
+          Early playable build of STRATA, a working title. This is not a finished game and it is not a signed installer.
+
+          ## Files
+          - strata-windows-x86_64.zip — download this on Windows. Unzip it and run strata.exe. If SmartScreen warns, choose More info, then Run anyway. The zip is only that exe and PLAYING.md.
+          - strata-linux-x86_64.zip — extra Linux build, made on Ubuntu 22.04. It needs glibc 2.35 or newer, a Vulkan driver, and a desktop session.
+          - SHA256SUMS.txt — checksums of those zip files.
+
+          There is no Mac download. Playing, saves, and how to report a problem are in PLAYING.md inside each zip.
+
+          ## Provenance
+          - Source commit: SOURCE_SHA
+          - Workflow run: RUN_URL
+          - Build: cargo build --release --locked. Windows uses --target x86_64-pc-windows-msvc. Toolchain: rust-toolchain.toml (Rust 1.97.1).
+          - The Windows executable is a release build. The windows_subsystem attribute is windows unless debug assertions are on, so this build does not open a console. Its C runtime is linked statically via .cargo/config.toml for that target only. A startup failure is written to strata-error.txt beside the exe.
+          - One checksum proves the identity of that uploaded file. It does not prove a second clean build would hash the same.
+
+          ## Saves and rollback
+          Worlds stay on the player's computer in saves/emerald-reach and are not inside the zip. Replacing the program does not delete or migrate them. Keep both world-a.json and world-b.json when copying a backup. To go back, download an older release and leave the saves folder in place.
+
+          ## Limits
+          Development checkpoint only. No code signature, auto-update, multiplayer, or Mac build. A green package job is not interactive acceptance on the GTX 1660 Ti.
+          EOF
+          # GitHub Actions removes this block's leading YAML indent before bash
+          # runs. Fail if that ever stops, instead of publishing indented notes.
+          sed -i \
+            -e 's/SOURCE_SHA/${{ github.sha }}/' \
+            -e 's|RUN_URL|${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|' \
+            release-notes.md
+          if ! grep -q '^Early playable build of STRATA' release-notes.md; then
+            echo 'Release notes kept unexpected leading whitespace.'
+            cat -A release-notes.md
+            exit 1
+          fi
+          if grep -q 'SOURCE_SHA\|RUN_URL' release-notes.md; then
+            echo 'Release note placeholders were not filled.'
+            exit 1
+          fi
+          {
+            echo
+            echo '## Checksums'
+            echo
+            cat SHA256SUMS.txt
+          } >> release-notes.md
+          release_files=("$primary")
+          for extra in "${extras[@]}"; do
+            release_files+=("$(basename "$extra")")
+          done
+          release_files+=(SHA256SUMS.txt)
+          gh release create "$GITHUB_REF_NAME" \
+            --verify-tag \
+            --title "STRATA $GITHUB_REF_NAME" \
+            --notes-file release-notes.md \
+            "${release_files[@]}"
