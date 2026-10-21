@@ -231,7 +231,7 @@ fn scenarios() -> Vec<Scenario> {
     vec![
         Scenario {
             name: "seeded_route",
-            description: "12 fixed terrain, river, cave-depth and upper-air chunks; no edits",
+            description: "12 fixed terrain, biome, cave-depth and upper-air chunks; no edits",
             world: World::new(SEED),
             chunks: ROUTE.to_vec(),
             expected_surface_area: None,

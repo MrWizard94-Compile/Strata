@@ -6,13 +6,13 @@ The canonical local project is `C:\WPAI\Software\Rust Based Voxel`, an independe
 
 ## Source and artifact verification
 
-- Deterministic terrain, rivers/caves/trees, sparse edits, greedy meshing, DDA targeting, walking/jump/flight, body collision, bounded streaming and versioned two-slot saves are integrated.
-- Thirteen original 32×32 sRGB tiles, face-specific grass/timber layers, repeating merged faces, six linear-light mip levels and PNG export are integrated. The exported contact sheet was inspected. Tests decode all thirteen PNGs and compare them byte-for-byte with runtime pixels.
+- Deterministic generator 2 terrain is integrated: plains, forest, desert, ocean, and beach, with sea-level water, caves, grid-anchored trees, and coal, iron, gold, and diamond. Sparse edits, greedy meshing, DDA targeting, walking/jump/flight, body collision, bounded streaming and versioned two-slot saves are integrated. Generator 1 saves are rejected and left untouched.
+- Seventeen original 32×32 sRGB tiles, face-specific grass/timber layers, repeating merged faces, six linear-light mip levels and PNG export are integrated. The exported contact sheet was inspected. Tests decode all seventeen PNGs and compare them byte-for-byte with runtime pixels.
 - Eighteen streaming regressions cover stale revisions, bounded queues, byte/time/count admission, deferred work, duplicate work, halo invalidation, unload and shutdown. A dirty-resident eviction leak was corrected.
-- Spawn/fall recovery checks trees and construction. Seed 396 reproduces the former tree-spawn intersection; its regression passes. Unsafe flight-to-walk transitions are rejected with player feedback.
+- Spawn/fall recovery checks a planted trunk and player construction. Seed 396 at column `(64, -64)` is not a generator 2 trunk site, so that regression plants the wood. Seed `20261021` grows a natural trunk at `(-321, -354)`, ground 35, five blocks tall; that test uses no edits. Unsafe flight-to-walk transitions are rejected with player feedback.
 - Presentation counters now exclude skipped acquisitions. Skipped/unfocused rendering is throttled. Controlled renderer failures attempt to save the CPU world before exit; this is not panic/power-loss recovery.
 - `cargo fmt --check`: passed.
-- `cargo test --locked`: **55 passed, 0 failed, 1 explicit GPU skip**.
+- `cargo test --locked`: **65 passed, 0 failed, 1 explicit GPU skip** on 2026-10-21 after generator 2. The ignored test is the native GPU pipeline check.
 - `cargo test --locked native_gpu_validates_all_world_shader_pipelines -- --ignored --nocapture`: **1 passed**, including material mip upload validation on the native GPU.
 - `cargo clippy --locked --all-targets -- -D warnings`: passed without warnings.
 - `cargo build --release --locked`: passed.
@@ -21,6 +21,8 @@ The canonical local project is `C:\WPAI\Software\Rust Based Voxel`, an independe
 The original 40-byte vertex assertion failed when adding the texture-layer field intentionally changed the contract to 44 bytes. The test now verifies size, normal/color/layer offsets and GPU attribute format. Geometry-area and intended-behavior assertions were not weakened.
 
 ## Native evidence and limits
+
+The runs in this section are the 2026-10-20 checkpoint. They predate generator 2. The retained seed 728491 save is a generator 1 file: current code rejects it and leaves the bytes in place. Those runs are not evidence that the current generator loads that world.
 
 Earlier actual-window testing entered the world, visibly broke `[63,46,-67]`, placed grass there, saved and closed. A subsequent font-enabled build showed readable menu text; missing menu-arrow glyphs were then removed. The retained test save records seed 728491, that edit, and player eye `[64.5,46.60417,-63.5]`.
 

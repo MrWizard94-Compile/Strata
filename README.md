@@ -51,7 +51,7 @@ Flight is collision-free for development exploration; move clear of solid terrai
 
 ## Materials and CPU benchmarks
 
-The renderer samples thirteen original **32×32** sRGB material tiles, including grass top/side/underside and timber endgrain. Tiles repeat per block across merged faces. Six mip levels filter distant surfaces. These are initial art assets, pending full in-world and director review.
+The renderer samples seventeen original **32×32** sRGB material tiles, including grass top/side/underside, timber endgrain, and coal, iron, gold and diamond ore. Tiles repeat per block across merged faces. Six mip levels filter distant surfaces. These are initial art assets, pending full in-world and director review.
 
 `--export-materials <new-directory>` exports the exact runtime tiles as individual PNGs, a contact sheet and a manifest. The directory must not already exist and its parent must exist. Exported edits are not yet hot-reloaded into the game.
 

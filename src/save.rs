@@ -1,4 +1,4 @@
-use crate::world::{Block, World};
+use crate::world::{Block, GENERATOR_VERSION, World};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
@@ -33,8 +33,17 @@ pub struct Snapshot {
 
 impl Snapshot {
     fn validate(&self) -> Result<(), String> {
-        if self.schema != 1 || self.generator != 1 {
-            return Err("This world uses an unsupported save or terrain version; its files have been preserved.".into());
+        if self.generator < GENERATOR_VERSION {
+            return Err(
+                "This world was made with an older version of the world generator and can't be opened in this version. Create a new world to play. Your old world files were left as they are."
+                    .into(),
+            );
+        }
+        if self.schema != 1 || self.generator != GENERATOR_VERSION {
+            return Err(
+                "This world was saved by a different version of STRATA and can't be opened. Create a new world to play. Your old world files were left as they are."
+                    .into(),
+            );
         }
         if self.edits.len() > MAX_EDITS {
             return Err(format!(
@@ -149,7 +158,7 @@ impl SaveStore {
             .ok_or("World generation counter exhausted")?;
         let snapshot = Snapshot {
             schema: 1,
-            generator: 1,
+            generator: GENERATOR_VERSION,
             generation,
             seed: world.seed(),
             player,
@@ -266,6 +275,9 @@ mod tests {
         };
         assert!(snapshot.validate().is_err());
         snapshot.schema = 1;
+        snapshot.generator = 1;
+        assert!(snapshot.validate().is_err());
+        snapshot.generator = GENERATOR_VERSION;
         snapshot.player.eye[0] = f32::NAN;
         assert!(snapshot.validate().is_err());
         snapshot.player = player();
@@ -273,6 +285,27 @@ mod tests {
         assert!(snapshot.validate().is_err());
         snapshot.edits = vec![([1, 2, 3], 255)];
         assert!(snapshot.validate().is_err());
+    }
+
+    #[test]
+    fn generator_1_save_is_rejected_and_preserved() {
+        let path = directory();
+        fs::create_dir_all(&path).unwrap();
+        let body = br#"{"schema":1,"generator":1,"generation":1,"seed":7,"player":{"eye":[0.0,80.0,0.0],"yaw":0.0,"pitch":0.0,"flying":false},"edits":[]}"#;
+        fs::write(path.join("world-a.json"), body).unwrap();
+        let Err(error) = SaveStore::open(&path) else {
+            panic!("generator 1 save was accepted");
+        };
+        assert!(
+            error.contains("older version of the world generator"),
+            "{error}"
+        );
+        assert!(error.contains("can't be opened"), "{error}");
+        assert!(error.contains("Create a new world"), "{error}");
+        assert_eq!(fs::read(path.join("world-a.json")).unwrap(), body);
+        assert!(!path.join("world-a.json.pending").exists());
+        assert!(!path.join("world-b.json").exists());
+        fs::remove_dir_all(path).unwrap();
     }
 
     #[test]

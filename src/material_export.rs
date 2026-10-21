@@ -2,7 +2,7 @@
 use crate::materials;
 use std::{fs, io::BufWriter, path::Path};
 
-const NAMES: [&str; 13] = [
+const NAMES: [&str; 17] = [
     "grass-top",
     "grass-side",
     "soil",
@@ -16,6 +16,10 @@ const NAMES: [&str; 13] = [
     "clay",
     "crystal",
     "basalt",
+    "coal-ore",
+    "iron-ore",
+    "gold-ore",
+    "diamond-ore",
 ];
 
 pub fn export_materials(directory: &Path) -> Result<(), String> {
