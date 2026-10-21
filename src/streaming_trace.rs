@@ -21,6 +21,8 @@ pub struct TraceHeader<'a> {
     pub workers: usize,
     pub upload_max_meshes: usize,
     pub upload_max_bytes: usize,
+    pub upload_max_step_bytes: usize,
+    pub upload_max_segments: usize,
     pub upload_max_cpu_ms: f64,
     pub source_label_external: Option<String>,
     pub measurement: &'static str,
@@ -110,7 +112,7 @@ mod tests {
         ));
         let header = TraceHeader {
             kind: "header",
-            schema_version: 1,
+            schema_version: 2,
             package_version: env!("CARGO_PKG_VERSION"),
             seed: 7,
             adapter: "test, not a GPU",
@@ -120,6 +122,8 @@ mod tests {
             workers: 2,
             upload_max_meshes: 2,
             upload_max_bytes: 4 * 1024 * 1024,
+            upload_max_step_bytes: 1024 * 1024,
+            upload_max_segments: crate::streaming::MAX_COPY_SEGMENTS,
             upload_max_cpu_ms: 2.0,
             source_label_external: None,
             measurement: "test fixture",

@@ -1,0 +1,119 @@
+{
+  "recorded_utc": "2026-10-21T03:39:46.4597805Z",
+  "build_profile": "release",
+  "build_performed_by_this_invocation": false,
+  "compiler": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+  "git_commit": "a80c17f549cf08d92d44c1d91c0ca947628d0996",
+  "working_tree_changes": [
+    " M .github/workflows/ci.yml",
+    " M README.md",
+    " M docs/ARCHITECTURE.md",
+    " M docs/STREAMING.md",
+    " M src/main.rs",
+    " M src/renderer.rs",
+    " M src/streaming.rs",
+    " M src/streaming_trace.rs",
+    " M tools/summarize_streaming_trace.py",
+    "?? evidence/streaming-checkerboard-20261020-02.jsonl",
+    "?? evidence/streaming-checkerboard-20261020-02.jsonl.provenance.json",
+    "?? evidence/streaming-title-20261020-02.jsonl",
+    "?? evidence/streaming-title-20261020-02.jsonl.provenance.json",
+    "?? src/gpu_meshes.rs",
+    "?? src/upload.rs"
+  ],
+  "binary_sha256": "20D39A912941C2B3AA7E836E96AFA95A8E8DBDB98F4487D94C4669203263C7F2",
+  "source_inputs": [
+    {
+      "path": "Cargo.lock",
+      "sha256": "4297917DDD62B564975B2B993E759BA214BA8AD782F7923CC355CDDA5A5CEB99"
+    },
+    {
+      "path": "Cargo.toml",
+      "sha256": "D0C21AFEA6A1BA66FED649792CBD955169C47EFB80244F47E1B26F91BC40C06E"
+    },
+    {
+      "path": "run.ps1",
+      "sha256": "C6CD01F0BC1D9D120DA9A2114495744B237B80870A6B623180BD82D9F164810A"
+    },
+    {
+      "path": "rust-toolchain.toml",
+      "sha256": "559F488C181E0E9E77CF17C29DE663977F036EC7FF2E2060585714BF53C52D62"
+    },
+    {
+      "path": "src/benchmark.rs",
+      "sha256": "43666FC6046F19A1069524E79BD376CB86FCCD5DF31AD05D62A81AC0062F4FA8"
+    },
+    {
+      "path": "src/gpu_meshes.rs",
+      "sha256": "73DFE0565892F5356C46055D93F0508BD70D62C999B213534ECDF045B9034BE0"
+    },
+    {
+      "path": "src/main.rs",
+      "sha256": "32F6ABC29278067633AC740F35D5A9A8B96414F0B4ECBD38CF9A0DC692BD34C8"
+    },
+    {
+      "path": "src/material_export.rs",
+      "sha256": "F37D93B8AF7681BDC23AA37FD0E107FE947F90058B084EE459816C0BE7133312"
+    },
+    {
+      "path": "src/materials.rs",
+      "sha256": "CBCD4606310F04082302F81BB0587160ED5C2DFE980007461C697D5063AB8646"
+    },
+    {
+      "path": "src/player.rs",
+      "sha256": "C9A2030F5EDDEAE704E9F6C6318E1F326215323947D20198EF892039E57BB118"
+    },
+    {
+      "path": "src/renderer.rs",
+      "sha256": "98DCF9E914017D51746232CBC7CE172F346F43891E3CC26C8E0D77164DFDC3AA"
+    },
+    {
+      "path": "src/save.rs",
+      "sha256": "29EF5C4B917E5735F08AD7342AB278BA1D8C62D51CF9A29EA2D1DED2611636A5"
+    },
+    {
+      "path": "src/shaders/world.wgsl",
+      "sha256": "E283A4DB400F78A1BC04B29380593EEDECB820EB0C0947BE51477840D168AFC6"
+    },
+    {
+      "path": "src/streaming_trace.rs",
+      "sha256": "02A161FB824267AF03346AD0F029D16E9B605E8F7CC7983989AF421E85FD8650"
+    },
+    {
+      "path": "src/streaming.rs",
+      "sha256": "3C498127472A0FDE143999B8B09BA7AD7A532AB89D117B59C0939B9B955AB464"
+    },
+    {
+      "path": "src/upload.rs",
+      "sha256": "C69636005EE1A283835134C1D45B2D90818D1813E772269CEE9086A43D6BE333"
+    },
+    {
+      "path": "src/world.rs",
+      "sha256": "D8533F49D4E71968C3DBE4D5BC9A93BAE208244E88C6874E10FC7F3D67B3E355"
+    },
+    {
+      "path": "trace-streaming.ps1",
+      "sha256": "2C6E3949D37343728E13D4539D99D2A84596DE87BC22DF0DFA332783D1BE3231"
+    }
+  ],
+  "hardware": {
+    "cpu": {
+      "Name": "Intel(R) Core(TM) i7-9700 CPU @ 3.00GHz",
+      "NumberOfCores": 8,
+      "NumberOfLogicalProcessors": 8
+    },
+    "ram_bytes": 51409334272,
+    "os": {
+      "Caption": "Microsoft Windows 11 Home",
+      "Version": "10.0.26300",
+      "BuildNumber": "26300"
+    },
+    "gpu": {
+      "Name": "NVIDIA GeForce GTX 1660 Ti",
+      "DriverVersion": "32.0.16.1742"
+    },
+    "power_scheme": "Power Scheme GUID: 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c  (High performance)"
+  },
+  "smoke_seconds": 15,
+  "limits": "Source hashes are observed after build; SkipBuild requires binary/source agreement. Native title scene unless a human enters the world; record actual screen/camera rows. No automated traversal, GPU timestamps, total-memory measurement or playability acceptance. Buffered trace I/O adds observer overhead."
+}

@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3, Vec4};
@@ -6,8 +6,10 @@ use wgpu::util::DeviceExt;
 use winit::window::Window;
 
 use crate::{
+    gpu_meshes::GpuMeshes,
     materials,
-    world::{ChunkKey, Mesh, Vertex},
+    upload::UploadCommand,
+    world::{ChunkKey, Vertex},
 };
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
@@ -37,15 +39,6 @@ struct CameraUniform {
     selected: [f32; 4],
 }
 
-struct GpuChunk {
-    vertices: wgpu::Buffer,
-    indices: wgpu::Buffer,
-    index_count: u32,
-    payload_bytes: usize,
-    min: Vec3,
-    max: Vec3,
-}
-
 struct Pipelines {
     terrain: wgpu::RenderPipeline,
     sky: wgpu::RenderPipeline,
@@ -72,7 +65,7 @@ pub struct Renderer {
     depth_view: wgpu::TextureView,
     multisample_view: Option<wgpu::TextureView>,
     sample_count: u32,
-    chunks: HashMap<ChunkKey, GpuChunk>,
+    meshes: GpuMeshes,
     suspended: bool,
 }
 
@@ -175,7 +168,7 @@ impl Renderer {
             depth_view,
             multisample_view,
             sample_count,
-            chunks: HashMap::new(),
+            meshes: GpuMeshes::default(),
             suspended: size.width == 0 || size.height == 0,
         })
     }
@@ -200,66 +193,35 @@ impl Renderer {
         });
     }
 
-    pub fn upload_chunk(&mut self, key: ChunkKey, mesh: &Mesh) {
-        if mesh.vertices.is_empty() || mesh.indices.is_empty() {
-            self.remove_chunk(key);
-            return;
-        }
-        let mut min = Vec3::splat(f32::INFINITY);
-        let mut max = Vec3::splat(f32::NEG_INFINITY);
-        for vertex in &mesh.vertices {
-            let position = Vec3::from_array(vertex.position);
-            min = min.min(position);
-            max = max.max(position);
-        }
-        let vertices = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Chunk vertices"),
-                contents: bytemuck::cast_slice(&mesh.vertices),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
-        let indices = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Chunk triangle indices"),
-                contents: bytemuck::cast_slice(&mesh.indices),
-                usage: wgpu::BufferUsages::INDEX,
-            });
-        self.chunks.insert(
-            key,
-            GpuChunk {
-                vertices,
-                indices,
-                index_count: mesh.indices.len() as u32,
-                payload_bytes: std::mem::size_of_val(mesh.vertices.as_slice())
-                    + std::mem::size_of_val(mesh.indices.as_slice()),
-                min,
-                max,
-            },
-        );
+    pub fn upload(&mut self, command: UploadCommand<'_>) -> Result<(), String> {
+        self.meshes.upload(&self.device, &self.queue, command)
     }
 
     pub fn remove_chunk(&mut self, key: ChunkKey) {
-        self.chunks.remove(&key);
+        self.meshes.resident.remove(&key);
     }
 
     pub fn chunk_count(&self) -> usize {
-        self.chunks.len()
+        self.meshes.resident.len()
     }
 
     pub fn sample_count(&self) -> u32 {
         self.sample_count
     }
 
-    /// Requested vertex/index payload, excluding allocation padding, retained
-    /// in-flight buffers, staging resources, textures and other device memory.
+    /// Visible vertex/index payload, excluding the incomplete replacement,
+    /// allocation padding, old in-flight buffers, staging and other memory.
     pub fn resident_mesh_payload_bytes(&self) -> usize {
-        self.chunks.values().map(|chunk| chunk.payload_bytes).sum()
+        self.meshes
+            .resident
+            .values()
+            .map(|chunk| chunk.payload_bytes)
+            .sum()
     }
 
     pub fn triangle_count(&self) -> usize {
-        self.chunks
+        self.meshes
+            .resident
             .values()
             .map(|chunk| chunk.index_count as usize / 3)
             .sum()
@@ -279,6 +241,11 @@ impl Renderer {
             }
         }
         let result = self.render_frame(camera, egui_renderer, paint_jobs, pixels_per_point);
+        if !matches!(result, Ok(PresentOutcome::Presented)) {
+            // write_buffer staging must be submitted even when no surface frame
+            // is acquired, or repeated skips retain unsubmitted upload memory.
+            self.queue.submit([]);
+        }
         // Delta application is independent of successful presentation: font and
         // UI texture updates must not disappear during a surface resize/loss.
         for id in &textures_delta.free {
@@ -391,7 +358,7 @@ impl Renderer {
             pass.set_pipeline(&self.pipelines.sky);
             pass.draw(0..3, 0..1);
             pass.set_pipeline(&self.pipelines.terrain);
-            for chunk in self.chunks.values() {
+            for chunk in self.meshes.resident.values() {
                 if !frustum.intersects(chunk.min, chunk.max) {
                     continue;
                 }

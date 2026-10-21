@@ -45,5 +45,11 @@ jobs:
             [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $PWD $script), [ref]$tokens, [ref]$errors) | Out-Null
             if ($errors.Count) { $errors; exit 1 }
           }
-      # The explicitly ignored native GPU test and real client interaction run
+      - name: Validate recorded streaming evidence
+        run: |
+          Get-ChildItem -LiteralPath evidence -Filter '*.jsonl' | ForEach-Object {
+            python tools/summarize_streaming_trace.py $_.FullName | Out-Null
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+      # The explicitly ignored native GPU tests and real client interaction run
       # on the acceptance machine; CI success does not prove either boundary.

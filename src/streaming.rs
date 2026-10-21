@@ -1,4 +1,7 @@
-use crate::world::{CHUNK_SIZE, ChunkKey, Mesh, World};
+use crate::{
+    upload::UploadCommand,
+    world::{CHUNK_SIZE, ChunkKey, Mesh, World},
+};
 use std::{
     collections::HashSet,
     mem::size_of_val,
@@ -25,12 +28,28 @@ struct CompletedMesh {
     ready_at: Instant,
 }
 
+struct PendingUpload {
+    result: CompletedMesh,
+    started: bool,
+    cursor: usize,
+}
+
+impl PendingUpload {
+    fn bytes(&self) -> usize {
+        size_of_val(self.result.mesh.vertices.as_slice())
+            + size_of_val(self.result.mesh.indices.as_slice())
+    }
+}
+
+pub const MAX_COPY_SEGMENTS: usize = 16;
+
 /// CPU-side upload admission, not a GPU completion or frame-time guarantee.
 /// A callback already in progress cannot be preempted at the time limit.
 #[derive(Clone, Copy, Debug)]
 pub struct UploadBudget {
     pub max_meshes: usize,
     pub max_bytes: usize,
+    pub max_step_bytes: usize,
     pub max_cpu_time: Duration,
 }
 
@@ -39,6 +58,7 @@ impl Default for UploadBudget {
         Self {
             max_meshes: 2,
             max_bytes: 4 * 1024 * 1024,
+            max_step_bytes: 1024 * 1024,
             max_cpu_time: Duration::from_millis(2),
         }
     }
@@ -49,14 +69,20 @@ pub struct UploadStats {
     pub meshes: usize,
     /// Vertex/index payload only; excludes allocator capacity and GPU overhead.
     pub bytes: usize,
-    /// First meshes exceeding a positive byte budget, admitted for progress.
-    pub oversized: usize,
+    pub started: usize,
+    pub segments: usize,
+    pub max_segment_bytes: usize,
+    pub cancelled: usize,
+    pub remaining_bytes: usize,
     pub stale: usize,
     pub discarded: usize,
     pub inspected: usize,
     pub deferred: bool,
     /// Sum of actual upload callback wall-clock durations.
     pub upload_ms: f32,
+    pub allocation_ms: f32,
+    pub copy_ms: f32,
+    pub finalize_ms: f32,
     /// Whole admission call wall-clock duration, including inspection and drops.
     pub elapsed_ms: f32,
     pub max_queue_wait_ms: f32,
@@ -74,7 +100,7 @@ pub struct Streaming {
     pub loaded: HashSet<ChunkKey>,
     invalidated: HashSet<ChunkKey>,
     pending: HashSet<ChunkKey>,
-    deferred: Option<CompletedMesh>,
+    deferred: Option<PendingUpload>,
     desired: Vec<ChunkKey>,
     center: Option<(i32, i32, i32)>,
     revision: u64,
@@ -196,95 +222,163 @@ impl Streaming {
         removed
     }
 
-    /// Apply valid results directly so the budget includes the real renderer
-    /// callback. One result may wait outside the bounded channel. It retains its
-    /// pending entry and is revalidated before any later upload.
+    /// Copies at most max_bytes in aligned segments. A partially uploaded mesh
+    /// retains its old visible replacement and pending job until Commit succeeds.
+    /// Allocation and individual callbacks are not preemptible; time is soft.
     pub fn upload_ready(
         &mut self,
         budget: UploadBudget,
-        upload: impl FnMut(ChunkKey, &Mesh),
-    ) -> UploadStats {
+        upload: impl FnMut(UploadCommand<'_>) -> Result<(), String>,
+    ) -> Result<UploadStats, String> {
         self.upload_ready_with_clock(budget, upload, Instant::now)
     }
 
     fn upload_ready_with_clock(
         &mut self,
         budget: UploadBudget,
-        mut upload: impl FnMut(ChunkKey, &Mesh),
+        mut upload: impl FnMut(UploadCommand<'_>) -> Result<(), String>,
         mut now: impl FnMut() -> Instant,
-    ) -> UploadStats {
+    ) -> Result<UploadStats, String> {
         let started = now();
         let mut stats = UploadStats::default();
-        let mut callback_time = Duration::ZERO;
-        // Result channel capacity is 2*workers; at most workers results can be
-        // waiting to send, plus one previously deferred result. A producer
-        // refilling the channel cannot create an unbounded stale-draining loop.
         let inspection_limit = self.workers.saturating_mul(3).saturating_add(1);
-        let enabled =
-            budget.max_meshes > 0 && budget.max_bytes > 0 && !budget.max_cpu_time.is_zero();
-        while enabled && stats.meshes < budget.max_meshes && stats.inspected < inspection_limit {
+        // Cancel invalid partial work even while upload budgets are paused.
+        if let Some(active) = self.deferred.as_ref() {
+            stats.inspected += 1;
+            let stale = active.result.revision != self.revision;
+            let unwanted = !self.desired.contains(&active.result.key);
+            if stale || unwanted {
+                if active.started {
+                    let before = now();
+                    upload(UploadCommand::Cancel)?;
+                    stats.finalize_ms +=
+                        now().saturating_duration_since(before).as_secs_f32() * 1000.0;
+                    stats.cancelled += 1;
+                }
+                let active = self.deferred.take().expect("checked active upload");
+                if stale {
+                    // A newer revision can already own this key's pending entry.
+                    stats.stale += 1;
+                } else {
+                    self.pending.remove(&active.result.key);
+                    stats.discarded += 1;
+                }
+            }
+        }
+        let enabled = budget.max_meshes > 0
+            && budget.max_bytes >= 4
+            && budget.max_step_bytes >= 4
+            && !budget.max_cpu_time.is_zero();
+        while enabled && stats.meshes < budget.max_meshes {
             if now().saturating_duration_since(started) >= budget.max_cpu_time {
                 break;
             }
-            let result = if let Some(result) = self.deferred.take() {
-                result
-            } else if let Some(result) = self
-                .receiver
-                .as_ref()
-                .and_then(|receiver| receiver.try_recv().ok())
-            {
-                result
+            if self.deferred.is_none() {
+                if stats.inspected >= inspection_limit
+                    || budget.max_bytes.saturating_sub(stats.bytes) < 4
+                    || stats.segments >= MAX_COPY_SEGMENTS
+                {
+                    break;
+                }
+                let Some(result) = self
+                    .receiver
+                    .as_ref()
+                    .and_then(|receiver| receiver.try_recv().ok())
+                else {
+                    break;
+                };
+                stats.inspected += 1;
+                if result.revision != self.revision {
+                    stats.stale += 1;
+                    continue;
+                }
+                if !self.desired.contains(&result.key) {
+                    self.pending.remove(&result.key);
+                    stats.discarded += 1;
+                    continue;
+                }
+                self.deferred = Some(PendingUpload {
+                    result,
+                    started: false,
+                    cursor: 0,
+                });
+                // Recheck elapsed time after inspecting/acquiring a result.
+                continue;
+            }
+            let active = self.deferred.as_mut().expect("active upload");
+            let before = now();
+            if before.saturating_duration_since(started) >= budget.max_cpu_time {
+                break;
+            }
+            if !active.started {
+                upload(UploadCommand::Begin {
+                    key: active.result.key,
+                    vertex_bytes: size_of_val(active.result.mesh.vertices.as_slice()),
+                    index_count: active.result.mesh.indices.len(),
+                })?;
+                stats.allocation_ms +=
+                    now().saturating_duration_since(before).as_secs_f32() * 1000.0;
+                active.started = true;
+                stats.started += 1;
+                stats.max_queue_wait_ms = stats
+                    .max_queue_wait_ms
+                    .max(active.result.queue_wait.as_secs_f32() * 1000.0);
+                stats.max_ready_wait_ms = stats.max_ready_wait_ms.max(
+                    before
+                        .saturating_duration_since(active.result.ready_at)
+                        .as_secs_f32()
+                        * 1000.0,
+                );
+                stats.max_mesh_ms = stats.max_mesh_ms.max(active.result.milliseconds);
+            } else if active.cursor == active.bytes() {
+                upload(UploadCommand::Commit)?;
+                stats.finalize_ms += now().saturating_duration_since(before).as_secs_f32() * 1000.0;
+                let active = self.deferred.take().expect("committed upload");
+                self.pending.remove(&active.result.key);
+                self.loaded.insert(active.result.key);
+                self.invalidated.remove(&active.result.key);
+                self.last_mesh_ms = active.result.milliseconds;
+                stats.meshes += 1;
             } else {
-                break;
-            };
-            stats.inspected += 1;
-            if result.revision != self.revision {
-                // Do not erase a newer revision's pending job for the same key.
-                stats.stale += 1;
-                continue;
+                let capacity = budget
+                    .max_bytes
+                    .saturating_sub(stats.bytes)
+                    .min(budget.max_step_bytes)
+                    / 4
+                    * 4;
+                if capacity == 0 || stats.segments >= MAX_COPY_SEGMENTS {
+                    break;
+                }
+                let vertices: &[u8] = bytemuck::cast_slice(&active.result.mesh.vertices);
+                let indices: &[u8] = bytemuck::cast_slice(&active.result.mesh.indices);
+                let is_vertex = active.cursor < vertices.len();
+                let (buffer, offset) = if is_vertex {
+                    (vertices, active.cursor)
+                } else {
+                    (indices, active.cursor - vertices.len())
+                };
+                let length = capacity.min(buffer.len() - offset);
+                let data = &buffer[offset..offset + length];
+                upload(if is_vertex {
+                    UploadCommand::Vertices { offset, data }
+                } else {
+                    UploadCommand::Indices { offset, data }
+                })?;
+                stats.copy_ms += now().saturating_duration_since(before).as_secs_f32() * 1000.0;
+                active.cursor += length;
+                stats.bytes += length;
+                stats.segments += 1;
+                stats.max_segment_bytes = stats.max_segment_bytes.max(length);
             }
-            if !self.desired.contains(&result.key) {
-                self.pending.remove(&result.key);
-                stats.discarded += 1;
-                continue;
-            }
-            let bytes = size_of_val(result.mesh.vertices.as_slice())
-                .saturating_add(size_of_val(result.mesh.indices.as_slice()));
-            if stats.meshes > 0 && stats.bytes.saturating_add(bytes) > budget.max_bytes {
-                self.deferred = Some(result);
-                break;
-            }
-            let callback_started = now();
-            // Queue inspection itself can consume the remaining time. Retain
-            // this already-received result rather than dropping valid work.
-            if callback_started.saturating_duration_since(started) >= budget.max_cpu_time {
-                self.deferred = Some(result);
-                break;
-            }
-            upload(result.key, &result.mesh);
-            callback_time += now().saturating_duration_since(callback_started);
-            stats.meshes += 1;
-            stats.bytes = stats.bytes.saturating_add(bytes);
-            stats.oversized += usize::from(bytes > budget.max_bytes);
-            stats.max_queue_wait_ms = stats
-                .max_queue_wait_ms
-                .max(result.queue_wait.as_secs_f32() * 1000.0);
-            stats.max_ready_wait_ms = stats.max_ready_wait_ms.max(
-                callback_started
-                    .saturating_duration_since(result.ready_at)
-                    .as_secs_f32()
-                    * 1000.0,
-            );
-            stats.max_mesh_ms = stats.max_mesh_ms.max(result.milliseconds);
-            self.pending.remove(&result.key);
-            self.loaded.insert(result.key);
-            self.invalidated.remove(&result.key);
-            self.last_mesh_ms = result.milliseconds;
         }
         stats.deferred = self.deferred.is_some();
-        stats.upload_ms = callback_time.as_secs_f32() * 1000.0;
+        stats.remaining_bytes = self
+            .deferred
+            .as_ref()
+            .map_or(0, |active| active.bytes() - active.cursor);
+        stats.upload_ms = stats.allocation_ms + stats.copy_ms + stats.finalize_ms;
         stats.elapsed_ms = now().saturating_duration_since(started).as_secs_f32() * 1000.0;
-        stats
+        Ok(stats)
     }
 
     pub fn invalidate_edit(&mut self, position: [i32; 3]) {
@@ -365,11 +459,21 @@ mod tests {
     fn ready(streaming: &mut Streaming) -> Vec<ChunkKey> {
         let mut keys = Vec::new();
         let clock = Instant::now();
-        streaming.upload_ready_with_clock(
-            UploadBudget::default(),
-            |key, _| keys.push(key),
-            || clock,
-        );
+        let mut active_key = None;
+        streaming
+            .upload_ready_with_clock(
+                UploadBudget::default(),
+                |command| {
+                    match command {
+                        UploadCommand::Begin { key, .. } => active_key = Some(key),
+                        UploadCommand::Commit => keys.push(active_key.take().unwrap()),
+                        _ => {}
+                    }
+                    Ok(())
+                },
+                || clock,
+            )
+            .unwrap();
         keys
     }
 
@@ -574,83 +678,228 @@ mod tests {
         assert_eq!(streaming.progress(), (6, 6));
     }
 
+    type PendingBytes = (ChunkKey, usize, usize, Vec<u8>, Vec<u8>);
+
+    #[derive(Default)]
+    struct Sink {
+        active: Option<PendingBytes>,
+        visible: std::collections::HashMap<ChunkKey, (Vec<u8>, Vec<u8>)>,
+    }
+
+    impl Sink {
+        fn command(&mut self, command: UploadCommand<'_>) -> Result<(), String> {
+            match command {
+                UploadCommand::Begin {
+                    key,
+                    vertex_bytes,
+                    index_count,
+                } => {
+                    assert!(self.active.is_none());
+                    self.active =
+                        Some((key, vertex_bytes, index_count * 4, Vec::new(), Vec::new()));
+                }
+                UploadCommand::Vertices { offset, data } => {
+                    let (_, _, _, vertices, _) = self.active.as_mut().unwrap();
+                    assert_eq!(offset, vertices.len());
+                    vertices.extend_from_slice(data);
+                }
+                UploadCommand::Indices { offset, data } => {
+                    let (_, vertex_bytes, _, vertices, indices) = self.active.as_mut().unwrap();
+                    assert_eq!(vertices.len(), *vertex_bytes);
+                    assert_eq!(offset, indices.len());
+                    indices.extend_from_slice(data);
+                }
+                UploadCommand::Commit => {
+                    let (key, vertex_bytes, index_bytes, vertices, indices) =
+                        self.active.take().unwrap();
+                    assert_eq!(vertices.len(), vertex_bytes);
+                    assert_eq!(indices.len(), index_bytes);
+                    self.visible.insert(key, (vertices, indices));
+                }
+                UploadCommand::Cancel => {
+                    self.active.take();
+                }
+            }
+            Ok(())
+        }
+    }
+
     #[test]
-    fn byte_limit_includes_indices_and_defers_without_losing_pending_work() {
+    fn partial_upload_obeys_byte_and_step_caps_and_commits_exact_bytes_atomically() {
         let (mut streaming, _jobs, results) = harness(8, 8);
-        let keys = [(0, 0, 0), (0, 1, 0), (0, 2, 0)];
+        let key = (-2, 1, 3);
+        streaming.desired.push(key);
+        streaming.pending.insert(key);
+        streaming.loaded.insert(key);
+        streaming.invalidated.insert(key);
+        let mut completed = sized_result(key, 0, 3, 3);
+        completed.mesh.vertices[1].position = [-63.0, 42.0, 110.0];
+        completed.mesh.indices = vec![0, 1, 2];
+        let expected = (
+            bytemuck::cast_slice::<Vertex, u8>(&completed.mesh.vertices).to_vec(),
+            bytemuck::cast_slice::<u32, u8>(&completed.mesh.indices).to_vec(),
+        );
+        results.send(completed).unwrap();
+        let mut sink = Sink::default();
+        let old = (vec![7; 44], vec![0; 12]);
+        sink.visible.insert(key, old.clone());
+        let budget = UploadBudget {
+            max_bytes: 99,
+            max_step_bytes: 23,
+            ..UploadBudget::default()
+        };
+        let clock = Instant::now();
+        let first = streaming
+            .upload_ready_with_clock(budget, |c| sink.command(c), || clock)
+            .unwrap();
+        assert_eq!(
+            (first.bytes, first.max_segment_bytes, first.meshes),
+            (96, 20, 0)
+        );
+        assert_eq!(first.remaining_bytes, 48);
+        assert!(first.deferred && streaming.pending.contains(&key));
+        assert_eq!(streaming.progress().0, 0);
+        assert_eq!(sink.visible[&key], old);
+        let second = streaming
+            .upload_ready_with_clock(budget, |c| sink.command(c), || clock)
+            .unwrap();
+        assert_eq!((second.bytes, second.meshes), (48, 1));
+        assert!(!second.deferred && !streaming.pending.contains(&key));
+        assert_eq!(streaming.progress().0, 1);
+        assert_eq!(sink.visible[&key], expected);
+    }
+
+    #[test]
+    fn two_nonempty_meshes_share_the_byte_budget_and_resume_at_exact_offsets() {
+        let (mut streaming, _jobs, results) = harness(2, 2);
+        let keys = [(0, 0, 0), (0, 1, 0)];
         streaming.desired.extend(keys);
         streaming.pending.extend(keys);
-        let payload = std::mem::size_of::<Vertex>() + std::mem::size_of::<u32>();
-        for key in keys {
-            results.send(sized_result(key, 0, 1, 1)).unwrap();
+        let mut expected = Vec::new();
+        for (index, key) in keys.into_iter().enumerate() {
+            let mut completed = sized_result(key, 0, 3, 3);
+            completed.mesh.vertices[0].position = [index as f32, 32.0, 7.0];
+            completed.mesh.indices = vec![0, 1, 2];
+            expected.push((
+                bytemuck::cast_slice::<Vertex, u8>(&completed.mesh.vertices).to_vec(),
+                bytemuck::cast_slice::<u32, u8>(&completed.mesh.indices).to_vec(),
+            ));
+            results.send(completed).unwrap();
         }
         let budget = UploadBudget {
-            max_meshes: 3,
-            max_bytes: payload * 2,
+            max_bytes: 200,
+            max_step_bytes: 100,
             ..UploadBudget::default()
         };
         let clock = Instant::now();
-        let mut uploaded = Vec::new();
-        let first =
-            streaming.upload_ready_with_clock(budget, |key, _| uploaded.push(key), || clock);
-        assert_eq!(uploaded, keys[..2]);
-        assert_eq!(first.meshes, 2);
-        assert_eq!(first.bytes, payload * 2);
+        let mut sink = Sink::default();
+        let first = streaming
+            .upload_ready_with_clock(budget, |c| sink.command(c), || clock)
+            .unwrap();
+        assert_eq!((first.started, first.meshes, first.bytes), (2, 1, 200));
+        assert_eq!((first.segments, first.remaining_bytes), (4, 88));
         assert!(first.deferred);
-        assert!(streaming.pending.contains(&keys[2]));
-        assert!(!streaming.loaded.contains(&keys[2]));
-        let second =
-            streaming.upload_ready_with_clock(budget, |key, _| uploaded.push(key), || clock);
-        assert_eq!(second.meshes, 1);
-        assert!(!second.deferred);
-        assert_eq!(uploaded, keys);
-        assert!(streaming.pending.is_empty());
+        assert_eq!(sink.visible[&keys[0]], expected[0]);
+        assert!(!sink.visible.contains_key(&keys[1]));
+        let (key, _, _, vertices, indices) = sink.active.as_ref().unwrap();
+        assert_eq!(*key, keys[1]);
+        assert_eq!(vertices, &expected[1].0[..56]);
+        assert!(indices.is_empty());
+        assert!(!streaming.pending.contains(&keys[0]));
+        assert!(streaming.pending.contains(&keys[1]));
+
+        let mut ranges = Vec::new();
+        let second = streaming
+            .upload_ready_with_clock(
+                budget,
+                |c| {
+                    match &c {
+                        UploadCommand::Vertices { offset, data } => {
+                            ranges.push((true, *offset, data.len()));
+                        }
+                        UploadCommand::Indices { offset, data } => {
+                            ranges.push((false, *offset, data.len()));
+                        }
+                        UploadCommand::Commit => {}
+                        _ => panic!("a partial mesh must resume without restarting"),
+                    }
+                    sink.command(c)
+                },
+                || clock,
+            )
+            .unwrap();
+        assert_eq!(ranges, [(true, 56, 76), (false, 0, 12)]);
+        assert_eq!((second.started, second.meshes, second.bytes), (0, 1, 88));
+        assert!(!second.deferred && streaming.pending.is_empty());
+        assert!(sink.active.is_none());
+        assert_eq!(sink.visible[&keys[1]], expected[1]);
+        assert_eq!(streaming.progress(), (2, 2));
     }
 
     #[test]
-    fn an_oversized_first_mesh_makes_progress_and_runs_alone() {
-        let (mut streaming, _jobs, results) = harness(8, 8);
-        let keys = [(0, 0, 0), (0, 1, 0)];
-        streaming.desired.extend(keys);
-        streaming.pending.extend(keys);
-        results.send(sized_result(keys[0], 0, 2, 0)).unwrap();
-        results.send(sized_result(keys[1], 0, 1, 0)).unwrap();
-        let budget = UploadBudget {
-            max_bytes: std::mem::size_of::<Vertex>(),
-            ..UploadBudget::default()
-        };
+    fn pathological_mesh_finishes_across_frames_without_an_oversize_exception() {
+        let (mut streaming, _jobs, results) = harness(1, 1);
+        let key = (2, 4, -2);
+        streaming.desired.push(key);
+        streaming.pending.insert(key);
+        results
+            .send(sized_result(key, 0, 393_216, 589_824))
+            .unwrap();
         let clock = Instant::now();
-        let mut uploaded = Vec::new();
-        let first =
-            streaming.upload_ready_with_clock(budget, |key, _| uploaded.push(key), || clock);
-        assert_eq!(first.meshes, 1);
-        assert_eq!(first.oversized, 1);
-        assert_eq!(first.bytes, std::mem::size_of::<Vertex>() * 2);
-        assert!(first.deferred);
-        assert_eq!(uploaded, [keys[0]]);
-        let second =
-            streaming.upload_ready_with_clock(budget, |key, _| uploaded.push(key), || clock);
-        assert_eq!(second.meshes, 1);
-        assert_eq!(second.oversized, 0);
-        assert_eq!(uploaded, keys);
+        let mut sink = Sink::default();
+        let mut bytes = 0;
+        for frame in 0..5 {
+            let stats = streaming
+                .upload_ready_with_clock(UploadBudget::default(), |c| sink.command(c), || clock)
+                .unwrap();
+            assert!(stats.bytes <= 4 * 1024 * 1024);
+            assert!(stats.max_segment_bytes <= 1024 * 1024);
+            assert_eq!(stats.meshes, usize::from(frame == 4));
+            assert_eq!(streaming.loaded.contains(&key), frame == 4);
+            bytes += stats.bytes;
+        }
+        assert_eq!(bytes, 19_660_800);
+        assert_eq!(
+            sink.visible[&key].0.len() + sink.visible[&key].1.len(),
+            bytes
+        );
     }
 
     #[test]
-    fn a_zero_count_byte_or_time_budget_pauses_without_consuming_results() {
-        let (mut streaming, _jobs, results) = harness(8, 8);
-        let keys = [(0, 0, 0), (0, 1, 0)];
-        streaming.desired.extend(keys);
-        streaming.pending.extend(keys);
-        streaming.deferred = Some(sized_result(keys[0], 0, 1, 0));
-        results.send(sized_result(keys[1], 0, 1, 0)).unwrap();
+    fn segment_count_bounds_tiny_steps_even_with_a_frozen_clock() {
+        let (mut streaming, _jobs, results) = harness(1, 1);
+        let key = (0, 0, 0);
+        streaming.desired.push(key);
+        results.send(sized_result(key, 0, 3, 3)).unwrap();
         let clock = Instant::now();
+        let stats = streaming
+            .upload_ready_with_clock(
+                UploadBudget {
+                    max_step_bytes: 4,
+                    ..UploadBudget::default()
+                },
+                |_| Ok(()),
+                || clock,
+            )
+            .unwrap();
+        assert_eq!(stats.segments, MAX_COPY_SEGMENTS);
+        assert_eq!(stats.bytes, MAX_COPY_SEGMENTS * 4);
+        assert!(stats.deferred);
+    }
+
+    #[test]
+    fn disabled_or_unaligned_budgets_pause_without_losing_work() {
         for budget in [
             UploadBudget {
                 max_meshes: 0,
                 ..UploadBudget::default()
             },
             UploadBudget {
-                max_bytes: 0,
+                max_bytes: 3,
+                ..UploadBudget::default()
+            },
+            UploadBudget {
+                max_step_bytes: 3,
                 ..UploadBudget::default()
             },
             UploadBudget {
@@ -658,102 +907,206 @@ mod tests {
                 ..UploadBudget::default()
             },
         ] {
-            let stats = streaming.upload_ready_with_clock(
-                budget,
-                |_, _| panic!("disabled admission must not call the renderer"),
-                || clock,
-            );
-            assert_eq!(stats.meshes, 0);
-            assert_eq!(stats.inspected, 0);
-            assert!(stats.deferred);
-            assert_eq!(streaming.pending.len(), 2);
-        }
-        assert_eq!(ready(&mut streaming), keys);
-    }
-
-    #[test]
-    fn time_limit_measures_the_real_callback_and_stops_after_an_overrun() {
-        let (mut streaming, _jobs, results) = harness(8, 8);
-        let keys = [(0, 0, 0), (0, 1, 0)];
-        streaming.desired.extend(keys);
-        streaming.pending.extend(keys);
-        for key in keys {
+            let (mut streaming, _jobs, results) = harness(1, 1);
+            let key = (0, 0, 0);
+            streaming.desired.push(key);
+            streaming.pending.insert(key);
             results.send(result(key, 0)).unwrap();
+            let clock = Instant::now();
+            let stats = streaming
+                .upload_ready_with_clock(budget, |_| panic!("paused"), || clock)
+                .unwrap();
+            assert_eq!(stats.inspected, 0);
+            assert!(streaming.pending.contains(&key));
+            assert_eq!(ready(&mut streaming), [key]);
         }
-        let base = Instant::now();
-        let elapsed = Cell::new(Duration::ZERO);
-        let mut uploaded = Vec::new();
-        let stats = streaming.upload_ready_with_clock(
-            UploadBudget::default(),
-            |key, _| {
-                uploaded.push(key);
-                elapsed.set(elapsed.get() + Duration::from_millis(3));
-            },
-            || base + elapsed.get(),
-        );
-        assert_eq!(uploaded, [keys[0]]);
-        assert_ms(stats.upload_ms, 3.0);
-        assert_ms(stats.elapsed_ms, 3.0);
-        assert_eq!(stats.meshes, 1);
-        assert!(streaming.pending.contains(&keys[1]));
-        assert!(!streaming.loaded.contains(&keys[1]));
     }
 
     #[test]
-    fn time_spent_inspecting_defers_a_received_mesh_before_starting_the_callback() {
-        let (mut streaming, _jobs, results) = harness(8, 8);
+    fn a_slow_allocation_stops_before_copy_and_resumes_on_the_next_redraw() {
+        let (mut streaming, _jobs, results) = harness(1, 1);
         let key = (0, 0, 0);
         streaming.desired.push(key);
         streaming.pending.insert(key);
+        results.send(sized_result(key, 0, 3, 3)).unwrap();
+        let base = Instant::now();
+        let elapsed = Cell::new(Duration::ZERO);
+        let mut sink = Sink::default();
+        let stats = streaming
+            .upload_ready_with_clock(
+                UploadBudget::default(),
+                |c| {
+                    assert!(matches!(c, UploadCommand::Begin { .. }));
+                    sink.command(c)?;
+                    elapsed.set(Duration::from_millis(3));
+                    Ok(())
+                },
+                || base + elapsed.get(),
+            )
+            .unwrap();
+        assert_eq!((stats.started, stats.bytes, stats.meshes), (1, 0, 0));
+        assert_ms(stats.allocation_ms, 3.0);
+        assert_ms(stats.elapsed_ms, 3.0);
+        assert!(streaming.pending.contains(&key));
+        let next = streaming
+            .upload_ready_with_clock(UploadBudget::default(), |c| sink.command(c), || base)
+            .unwrap();
+        assert_eq!((next.started, next.bytes, next.meshes), (0, 144, 1));
+    }
+
+    #[test]
+    fn final_copy_deadline_defers_commit_and_rechecks_edits_on_the_next_redraw() {
+        for edit_before_commit in [false, true] {
+            let world = Arc::new(World::new(1));
+            let (mut streaming, jobs, results) = harness(16, 8);
+            streaming.update([0.0; 3], 0, &world);
+            let queued: Vec<_> = jobs.try_iter().collect();
+            let key = queued[0].key;
+            streaming.loaded.insert(key);
+            streaming.invalidated.insert(key);
+            let completed = sized_result(key, 0, 3, 3);
+            let expected = (
+                bytemuck::cast_slice::<Vertex, u8>(&completed.mesh.vertices).to_vec(),
+                bytemuck::cast_slice::<u32, u8>(&completed.mesh.indices).to_vec(),
+            );
+            results.send(completed).unwrap();
+            let old = (vec![7; 44], vec![0; 12]);
+            let mut sink = Sink::default();
+            sink.visible.insert(key, old.clone());
+            let base = Instant::now();
+            let elapsed = Cell::new(Duration::ZERO);
+            let first = streaming
+                .upload_ready_with_clock(
+                    UploadBudget::default(),
+                    |c| {
+                        assert!(!matches!(c, UploadCommand::Commit));
+                        let final_copy = matches!(c, UploadCommand::Indices { .. });
+                        sink.command(c)?;
+                        if final_copy {
+                            elapsed.set(Duration::from_millis(3));
+                        }
+                        Ok(())
+                    },
+                    || base + elapsed.get(),
+                )
+                .unwrap();
+            assert_eq!(
+                (first.bytes, first.meshes, first.remaining_bytes),
+                (144, 0, 0)
+            );
+            assert_ms(first.copy_ms, 3.0);
+            assert!(first.deferred && streaming.pending.contains(&key));
+            assert!(streaming.invalidated.contains(&key));
+            assert_eq!(streaming.progress().0, 0);
+            assert_eq!(sink.visible[&key], old);
+
+            if edit_before_commit {
+                streaming.invalidate_edit([
+                    key.0 * CHUNK_SIZE,
+                    key.1 * CHUNK_SIZE,
+                    key.2 * CHUNK_SIZE,
+                ]);
+                streaming.update([0.0; 3], 0, &world);
+                assert!(
+                    jobs.try_iter()
+                        .any(|job| job.key == key && job.revision == 1)
+                );
+            }
+            let second = streaming
+                .upload_ready_with_clock(
+                    UploadBudget::default(),
+                    |c| {
+                        assert!(if edit_before_commit {
+                            matches!(c, UploadCommand::Cancel)
+                        } else {
+                            matches!(c, UploadCommand::Commit)
+                        });
+                        sink.command(c)
+                    },
+                    || base + elapsed.get(),
+                )
+                .unwrap();
+            assert_eq!(
+                (second.started, second.bytes, second.remaining_bytes),
+                (0, 0, 0)
+            );
+            assert!(!second.deferred && sink.active.is_none());
+            if edit_before_commit {
+                assert_eq!((second.cancelled, second.stale, second.meshes), (1, 1, 0));
+                assert!(streaming.pending.contains(&key));
+                assert!(streaming.invalidated.contains(&key));
+                assert_eq!(sink.visible[&key], old);
+            } else {
+                assert_eq!((second.cancelled, second.stale, second.meshes), (0, 0, 1));
+                assert!(!streaming.pending.contains(&key));
+                assert!(!streaming.invalidated.contains(&key));
+                assert_eq!(sink.visible[&key], expected);
+                assert_eq!(streaming.progress().0, 1);
+            }
+        }
+    }
+
+    #[test]
+    fn time_spent_inspecting_retains_the_received_mesh_before_allocation() {
+        let (mut streaming, _jobs, results) = harness(1, 1);
+        let key = (0, 0, 0);
+        streaming.desired.push(key);
         results.send(result(key, 0)).unwrap();
         let base = Instant::now();
         let calls = Cell::new(0);
-        let stats = streaming.upload_ready_with_clock(
-            UploadBudget::default(),
-            |_, _| panic!("inspection already exhausted the time budget"),
-            || {
-                let call = calls.get();
-                calls.set(call + 1);
-                base + if call >= 2 {
-                    Duration::from_millis(2)
-                } else {
-                    Duration::ZERO
-                }
-            },
-        );
-        assert_eq!(stats.meshes, 0);
-        assert_eq!(stats.inspected, 1);
-        assert_eq!(stats.upload_ms, 0.0);
-        assert_ms(stats.elapsed_ms, 2.0);
+        let stats = streaming
+            .upload_ready_with_clock(
+                UploadBudget::default(),
+                |_| panic!("time exhausted"),
+                || {
+                    let call = calls.get();
+                    calls.set(call + 1);
+                    base + if call >= 2 {
+                        Duration::from_millis(2)
+                    } else {
+                        Duration::ZERO
+                    }
+                },
+            )
+            .unwrap();
+        assert_eq!((stats.inspected, stats.started), (1, 0));
         assert!(stats.deferred);
-        assert!(streaming.pending.contains(&key));
         assert_eq!(ready(&mut streaming), [key]);
     }
 
     #[test]
-    fn queue_mesh_and_ready_latency_are_reported_separately_from_upload_time() {
-        let (mut streaming, _jobs, results) = harness(8, 8);
+    fn queue_mesh_and_ready_waits_are_distinct_from_allocation_and_copy_time() {
+        let (mut streaming, _jobs, results) = harness(1, 1);
         let key = (0, 0, 0);
         streaming.desired.push(key);
-        streaming.pending.insert(key);
         let base = Instant::now();
-        let mut completed = result(key, 0);
+        let mut completed = sized_result(key, 0, 3, 3);
         completed.ready_at = base;
         completed.queue_wait = Duration::from_millis(7);
         completed.milliseconds = 13.0;
         results.send(completed).unwrap();
         let elapsed = Cell::new(Duration::from_millis(11));
-        let stats = streaming.upload_ready_with_clock(
-            UploadBudget::default(),
-            |_, _| elapsed.set(elapsed.get() + Duration::from_millis(5)),
-            || base + elapsed.get(),
-        );
+        let stats = streaming
+            .upload_ready_with_clock(
+                UploadBudget {
+                    max_cpu_time: Duration::from_secs(1),
+                    ..UploadBudget::default()
+                },
+                |_| {
+                    elapsed.set(elapsed.get() + Duration::from_millis(1));
+                    Ok(())
+                },
+                || base + elapsed.get(),
+            )
+            .unwrap();
         assert_eq!(stats.meshes, 1);
         assert_ms(stats.max_queue_wait_ms, 7.0);
-        assert_ms(stats.max_mesh_ms, 13.0);
         assert_ms(stats.max_ready_wait_ms, 11.0);
-        assert_ms(stats.upload_ms, 5.0);
-        assert_ms(stats.elapsed_ms, 5.0);
+        assert_ms(stats.max_mesh_ms, 13.0);
+        assert_ms(stats.allocation_ms, 1.0);
+        assert_ms(stats.copy_ms, 2.0);
+        assert_ms(stats.finalize_ms, 1.0);
+        assert_ms(stats.upload_ms, 4.0);
     }
 
     #[test]
@@ -768,94 +1121,188 @@ mod tests {
         }
         let clock = Instant::now();
         for expected in [4, 4, 2] {
-            let stats = streaming.upload_ready_with_clock(
-                UploadBudget::default(),
-                |_, _| panic!("stale results must not reach the renderer"),
-                || clock,
-            );
-            assert_eq!(stats.inspected, expected);
-            assert_eq!(stats.stale, expected);
-            assert!(
-                streaming.pending.contains(&key),
-                "new revision's job remains pending"
-            );
+            let stats = streaming
+                .upload_ready_with_clock(
+                    UploadBudget::default(),
+                    |_| panic!("stale result"),
+                    || clock,
+                )
+                .unwrap();
+            assert_eq!((stats.inspected, stats.stale), (expected, expected));
+            assert!(streaming.pending.contains(&key));
         }
     }
 
     #[test]
-    fn an_edit_invalidates_a_deferred_result_without_erasing_its_replacement_job() {
-        let world = Arc::new(World::new(1));
-        let (mut streaming, jobs, results) = harness(8, 8);
-        streaming.update([0.0; 3], 0, &world);
-        let queued: Vec<_> = jobs.try_iter().collect();
-        let keys = [queued[0].key, queued[1].key];
-        results.send(sized_result(keys[0], 0, 1, 0)).unwrap();
-        results.send(sized_result(keys[1], 0, 2, 0)).unwrap();
-        let clock = Instant::now();
-        let stats = streaming.upload_ready_with_clock(
-            UploadBudget {
-                max_bytes: std::mem::size_of::<Vertex>() * 2,
-                ..UploadBudget::default()
-            },
-            |_, _| {},
-            || clock,
-        );
-        assert!(stats.deferred);
-        streaming.invalidate_edit([0; 3]);
-        streaming.update([0.0; 3], 0, &world);
-        assert!(
-            jobs.try_iter()
-                .any(|job| job.key == keys[1] && job.revision == 1)
-        );
-        let stats = streaming.upload_ready_with_clock(
-            UploadBudget::default(),
-            |_, _| panic!("deferred old revision must be rejected"),
-            || clock,
-        );
-        assert_eq!(stats.stale, 1);
-        assert!(!stats.deferred);
-        assert!(streaming.pending.contains(&keys[1]));
-        assert!(!streaming.loaded.contains(&keys[1]));
-    }
-
-    #[test]
-    fn movement_discards_a_deferred_mesh_and_releases_its_pending_entry() {
+    fn editing_partial_upload_cancels_it_while_paused_and_preserves_the_new_pending_job() {
         let world = Arc::new(World::new(1));
         let (mut streaming, jobs, results) = harness(16, 8);
         streaming.update([0.0; 3], 0, &world);
         let queued: Vec<_> = jobs.try_iter().collect();
-        let keys = [queued[0].key, queued[1].key];
-        results.send(sized_result(keys[0], 0, 1, 0)).unwrap();
-        results.send(sized_result(keys[1], 0, 2, 0)).unwrap();
+        let key = queued[0].key;
+        results.send(sized_result(key, 0, 3, 3)).unwrap();
         let clock = Instant::now();
-        assert!(
-            streaming
-                .upload_ready_with_clock(
-                    UploadBudget {
-                        max_bytes: std::mem::size_of::<Vertex>() * 2,
-                        ..UploadBudget::default()
-                    },
-                    |_, _| {},
-                    || clock,
-                )
-                .deferred
+        let mut sink = Sink::default();
+        let old = (vec![7; 44], vec![0; 12]);
+        sink.visible.insert(key, old.clone());
+        streaming.loaded.insert(key);
+        streaming
+            .upload_ready_with_clock(
+                UploadBudget {
+                    max_bytes: 4,
+                    ..UploadBudget::default()
+                },
+                |c| sink.command(c),
+                || clock,
+            )
+            .unwrap();
+        streaming.invalidate_edit([0; 3]);
+        streaming.update([0.0; 3], 0, &world);
+        assert!(jobs.try_iter().any(|j| j.key == key && j.revision == 1));
+        let stats = streaming
+            .upload_ready_with_clock(
+                UploadBudget {
+                    max_bytes: 0,
+                    ..UploadBudget::default()
+                },
+                |c| sink.command(c),
+                || clock,
+            )
+            .unwrap();
+        assert_eq!((stats.cancelled, stats.stale, stats.bytes), (1, 1, 0));
+        assert!(!stats.deferred && sink.active.is_none());
+        assert_eq!(sink.visible[&key], old);
+        assert!(streaming.pending.contains(&key));
+        assert!(streaming.invalidated.contains(&key));
+    }
+
+    #[test]
+    fn movement_cancels_partial_work_and_evicts_its_old_visible_mesh() {
+        let world = Arc::new(World::new(1));
+        let (mut streaming, jobs, results) = harness(16, 8);
+        streaming.update([0.0; 3], 0, &world);
+        let key = jobs.try_iter().next().unwrap().key;
+        streaming.loaded.insert(key);
+        results.send(sized_result(key, 0, 3, 3)).unwrap();
+        let clock = Instant::now();
+        let mut sink = Sink::default();
+        sink.visible.insert(key, (vec![7; 44], vec![0; 12]));
+        streaming
+            .upload_ready_with_clock(
+                UploadBudget {
+                    max_bytes: 4,
+                    ..UploadBudget::default()
+                },
+                |c| sink.command(c),
+                || clock,
+            )
+            .unwrap();
+        let removed = streaming.update([320.0, 0.0, 0.0], 0, &world);
+        assert_eq!(removed, [key]);
+        for key in removed {
+            sink.visible.remove(&key);
+        }
+        let stats = streaming
+            .upload_ready_with_clock(UploadBudget::default(), |c| sink.command(c), || clock)
+            .unwrap();
+        assert_eq!((stats.cancelled, stats.discarded), (1, 1));
+        assert!(sink.active.is_none() && sink.visible.is_empty());
+        assert!(!streaming.pending.contains(&key));
+    }
+
+    #[test]
+    fn movement_cancels_a_first_time_partial_upload_even_when_bytes_are_paused() {
+        let world = Arc::new(World::new(1));
+        let (mut streaming, jobs, results) = harness(16, 8);
+        streaming.update([0.0; 3], 0, &world);
+        let queued: Vec<_> = jobs.try_iter().collect();
+        let key = queued[0].key;
+        results.send(sized_result(key, 0, 3, 3)).unwrap();
+        let clock = Instant::now();
+        let mut sink = Sink::default();
+        let first = streaming
+            .upload_ready_with_clock(
+                UploadBudget {
+                    max_bytes: 4,
+                    ..UploadBudget::default()
+                },
+                |c| sink.command(c),
+                || clock,
+            )
+            .unwrap();
+        assert_eq!((first.started, first.bytes, first.meshes), (1, 4, 0));
+        assert!(first.deferred && streaming.pending.contains(&key));
+        assert!(!streaming.loaded.contains(&key));
+        assert!(sink.active.is_some() && sink.visible.is_empty());
+        assert!(streaming.update([320.0, 0.0, 0.0], 0, &world).is_empty());
+        assert!(!streaming.desired.contains(&key));
+
+        let second = streaming
+            .upload_ready_with_clock(
+                UploadBudget {
+                    max_bytes: 0,
+                    ..UploadBudget::default()
+                },
+                |c| {
+                    assert!(matches!(c, UploadCommand::Cancel));
+                    sink.command(c)
+                },
+                || clock,
+            )
+            .unwrap();
+        assert_eq!(
+            (second.cancelled, second.discarded, second.bytes),
+            (1, 1, 0)
         );
-        assert_eq!(streaming.update([320.0, 0.0, 0.0], 0, &world), [keys[0]]);
-        let stats = streaming.upload_ready_with_clock(
-            UploadBudget::default(),
-            |_, _| panic!("deferred mesh left the desired region"),
-            || clock,
-        );
-        assert_eq!(stats.discarded, 1);
-        assert!(!stats.deferred);
-        assert!(!streaming.pending.contains(&keys[1]));
-        assert!(!streaming.loaded.contains(&keys[1]));
+        assert_eq!((second.meshes, second.remaining_bytes), (0, 0));
+        assert!(!second.deferred && !streaming.pending.contains(&key));
+        assert!(!streaming.loaded.contains(&key));
+        assert!(sink.active.is_none() && sink.visible.is_empty());
+        streaming.update([0.0; 3], 0, &world);
+        assert_eq!(jobs.try_iter().filter(|job| job.key == key).count(), 1);
+        assert!(streaming.pending.contains(&key));
+    }
+
+    #[test]
+    fn a_copy_error_cannot_mark_a_partial_mesh_current_or_replace_visible_data() {
+        let (mut streaming, _jobs, results) = harness(1, 1);
+        let key = (0, 0, 0);
+        streaming.desired.push(key);
+        streaming.loaded.insert(key);
+        streaming.invalidated.insert(key);
+        streaming.pending.insert(key);
+        results.send(sized_result(key, 0, 3, 3)).unwrap();
+        let clock = Instant::now();
+        let mut sink = Sink::default();
+        let old = (vec![7; 44], vec![0; 12]);
+        sink.visible.insert(key, old.clone());
+        let error = streaming
+            .upload_ready_with_clock(
+                UploadBudget::default(),
+                |c| {
+                    if matches!(c, UploadCommand::Vertices { .. }) {
+                        Err("injected copy failure".into())
+                    } else {
+                        sink.command(c)
+                    }
+                },
+                || clock,
+            )
+            .unwrap_err();
+        assert_eq!(error, "injected copy failure");
+        assert!(streaming.pending.contains(&key) && streaming.invalidated.contains(&key));
+        assert_eq!(sink.visible[&key], old);
+        assert_eq!(streaming.progress().0, 0);
     }
 
     #[test]
     fn shutdown_disconnects_a_blocked_result_sender_before_joining_the_worker() {
         let (mut streaming, _jobs, results) = harness(1, 1);
-        streaming.deferred = Some(result((2, 0, 0), 0));
+        streaming.deferred = Some(PendingUpload {
+            result: result((2, 0, 0), 0),
+            started: false,
+            cursor: 0,
+        });
         results.send(result((0, 0, 0), 0)).unwrap();
         let (entered, receiving) = mpsc::sync_channel(1);
         let (finished, completion) = mpsc::sync_channel(1);

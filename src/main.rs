@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod benchmark;
+mod gpu_meshes;
 mod material_export;
 mod materials;
 mod player;
@@ -8,6 +9,7 @@ mod renderer;
 mod save;
 mod streaming;
 mod streaming_trace;
+mod upload;
 mod world;
 
 use egui::{Align2, Color32, FontId, Pos2, Rect, RichText, Stroke, Vec2};
@@ -227,7 +229,7 @@ impl Game {
         let streaming_trace = options.trace_streaming.as_ref().map(|path| {
             StreamingTrace::create(path, &TraceHeader {
                 kind: "header",
-                schema_version: 1,
+                schema_version: 2,
                 package_version: env!("CARGO_PKG_VERSION"),
                 seed: world.seed(),
                 adapter: &renderer.adapter_name,
@@ -237,9 +239,11 @@ impl Game {
                 workers: streaming.workers,
                 upload_max_meshes: budget.max_meshes,
                 upload_max_bytes: budget.max_bytes,
+                upload_max_step_bytes: budget.max_step_bytes,
+                upload_max_segments: streaming::MAX_COPY_SEGMENTS,
                 upload_max_cpu_ms: budget.max_cpu_time.as_secs_f64() * 1000.0,
                 source_label_external: std::env::var("STRATA_SOURCE_REVISION").ok(),
-                measurement: "CPU-observed admission/upload callback/queue waits and presentation submission intervals. No GPU timestamps, display timing or total RAM/VRAM. Buffered trace I/O is observer overhead. Byte/time budgets permit one oversized/slow callback for progress.",
+                measurement: "CPU-observed admission/upload callback/queue waits and presentation submission intervals. No GPU timestamps, display timing or total RAM/VRAM. Buffered trace I/O is observer overhead. Mesh copy payload is capped per redraw and per segment. Allocation/callback time remains non-preemptible; time is a soft limit.",
             })
         }).transpose()?;
         Ok(Self {
@@ -514,11 +518,19 @@ impl Game {
         for key in self.streaming.update(camera.eye, self.radius, &self.world) {
             self.renderer.remove_chunk(key);
         }
-        self.last_upload = self
+        match self
             .streaming
-            .upload_ready(UploadBudget::default(), |key, mesh| {
-                self.renderer.upload_chunk(key, mesh);
-            });
+            .upload_ready(UploadBudget::default(), |command| {
+                self.renderer.upload(command)
+            }) {
+            Ok(stats) => self.last_upload = stats,
+            Err(error) => {
+                self.fatal = Some(format!("Mesh upload failed: {error}"));
+                self.should_exit = true;
+                self.save();
+                return;
+            }
+        }
         if self.has_entered && now.duration_since(self.last_save) > Duration::from_secs(30) {
             self.last_save = now;
             self.save();

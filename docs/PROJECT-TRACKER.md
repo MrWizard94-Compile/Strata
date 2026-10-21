@@ -1,6 +1,6 @@
 # STRATA delivery tracker
 
-Updated 2026-10-20. Active project: `C:\WPAI\Software\Rust Based Voxel`.
+Updated 2026-10-21. Active project: `C:\WPAI\Software\Rust Based Voxel`.
 
 ## Director objective
 
@@ -35,16 +35,16 @@ The root integrator owns integration and this tracker. Micro-agents own bounded 
 | S0.P1 — Scope and success criteria | Director + root product integrator | partial | Director confirmed engine, survival/combat/building/exploration and 32×32 textures. Product brief retains living-world/engineering direction; creative thesis and proposed budgets need director review. |
 | S0.P2 — Primary-source audit | Research micro-agent (`evolution`, second bounded assignment) | verified | Integrator reviewed RESEARCH.md and PRODUCT-BRIEF.md: arithmetic/API/sandbox/console corrections, primary-source links and R01–R08 experiments. Research artifact verified; experiments and game remain open. |
 | S0.P3 — Architecture and risk experiments | Root engine architect | active | Architecture recorded; hardest risks need executable experiments before final budgets or platform promises. |
-| S0.P4 — Reproducible toolchain and tracking | Root build integrator | partial | Rust 1.97.1, locked dependencies, integrated release build and strict checks pass; ledger exists. A pinned-action Windows CI workflow now checks clean-runner builds; its result must be verified separately from the local build. |
+| S0.P4 — Reproducible toolchain and tracking | Root build integrator | partial | Rust 1.97.1, locked dependencies, integrated release build and strict checks pass; ledger exists. Pinned-action Windows CI passed for a80c17f; later commits must pass independently. The workflow now also validates recorded trace structure/provenance. |
 
 ## S1 — Playable engine foundation
 
 | Phase | Specialized owner | State | Evidence / closure requirement |
 |---|---|---|---|
 | S1.P1 — Terrain, materials, meshing and queries | `world` micro-agent; root integration | partial | Geometry/determinism/halo/DDA tests pass. Earlier actual window showed terrain and visible keyboard edits. 32×32 material integration is tracked in S5.P3; extended visual coverage remains open. |
-| S1.P2 — GPU presentation | `renderer` micro-agent; root integration | partial | Native pipelines validate. Two current textured runs each submitted 900 presentations in 15 seconds, including an oversized checkerboard fixture. Presentation/skip accounting and CPU traces verified. Resize and surface-loss injection remain open. |
+| S1.P2 — GPU presentation | `renderer` micro-agent; root integration | partial | Native pipelines validate. Three final segmented-upload runs each submitted 899 presentations in 15 seconds, including two checkerboard repetitions; native GPU readback validates atomic replacement/cancellation. Presentation/skip accounting and CPU traces verified. Resize and surface-loss injection remain open. |
 | S1.P3 — Movement and interaction | Root gameplay integrator; `renderer` review | partial | Actual keyboard break/place/save observed. Regression tests cover seed396 tree spawn and unsafe flight exit. Mouse editing, extended traversal and fresh fixes in-world remain open. |
-| S1.P4 — Bounded streaming and scheduling | Root + `world` concurrency work | partial | Eighteen streaming tests cover stale results, byte/time/count admission, bounded inspection/queues, unload, duplicate work, halo invalidation and shutdown. Native stress run verified one 18.75 MiB mesh admitted alone. Moving-world traces and hard upload bounds remain open. |
+| S1.P4 — Bounded streaming and scheduling | Root + `world` concurrency work | partial | Twenty-three streaming tests cover revisions, partial ownership, deadlines, shared byte caps, cancellation, bounded queues, unload and shutdown. Native stress meshes complete across five redraws within 4 MiB/call and 1 MiB/segment; time remains soft. Moving-world and memory acceptance remain open. |
 | S1.P5 — Save integrity and re-entry | Root persistence integrator | partial | Two-slot saves, rejection and exclusive-writer tests pass. Actual edited world saved and subsequent boot reported saved_world=true; visual retained-block/position re-entry remains open. No power-loss guarantee. |
 | S1.P6 — Native acceptance and baseline | Root QA integrator / native computer-use skill | partial | Source checks and explicit GPU validation pass; release startup/close succeeds with retained save. Native UI helper currently fails before initialization, so current interactive/resize acceptance is incomplete. See STATUS.md. |
 
@@ -52,8 +52,8 @@ The root integrator owns integration and this tracker. Micro-agents own bounded 
 
 | Phase | Specialized micro-agent role | State | Evidence / closure requirement |
 |---|---|---|---|
-| S2.P1 — Benchmark harness and budgets | `world` CPU specialist + root measurement | partial | Six-scenario production CPU mesher harness and three release reports verified; raw samples/source/binary provenance retained. CPU-BASELINE.md summarizes results. Two native title/stress traces now measure upload/queue costs. Full R01 movement/GPU/resource traces and accepted budgets remain open. |
-| S2.P2 — Storage and scheduling | `world` scheduling specialist + root integration | active | Byte/time/count admission and native latency evidence integrated. Oversized allocation still costs 7.13 ms in the observed run. Segmented uploads, palette/compression, lifetime/resource traces, edit priority and large-world precision remain open. |
+| S2.P1 — Benchmark harness and budgets | `world` CPU specialist + root measurement | partial | Six-scenario production CPU mesher harness and three release reports verified; raw samples/source/binary provenance retained. CPU-BASELINE.md summarizes results. Historical and segmented native title/stress traces measure upload/queue costs with exact provenance. Full R01 movement/GPU/resource traces and accepted budgets remain open. |
+| S2.P2 — Storage and scheduling | `world` scheduling specialist + root integration | active | Segmented uploads, atomic residency and cancellation integrated and measured; final stress callback maxima 0.7045/0.7140 ms with hard copy caps. Palette/compression, GPU failure recovery, lifetime/resource traces, edit priority and large-world precision remain open. |
 | S2.P3 — Mesh and GPU submission | Renderer optimization engineer | planned | Compare current greedy meshing with binary algorithm; capability-gated indirect draw/culling; no false visibility loss |
 | S2.P4 — Distance and lighting | LOD/lighting researcher | planned | LOD seam and edit propagation tests; measured skylight/shadows/GI quality-cost tradeoff; graceful quality tiers |
 
@@ -113,9 +113,9 @@ The root integrator owns integration and this tracker. Micro-agents own bounded 
 
 ## Current blockers and next integration order
 
-Two specialized source agents stopped due to an account usage limit after writing files. Their files are present and root integration continues. This limits further parallel capacity, not local progress. The director subsequently authorized committing and pushing all project changes to Strata. This does not extend to commercial release, the separate Constitution amendment, or external outreach.
+Temporary specialist capacity limits did not stop root integration. Renderer and world subsequently completed independent upload reviews; world added three boundary regressions. The director subsequently authorized committing and pushing all project changes to Strata. This does not extend to commercial release, the separate Constitution amendment, or external outreach.
 
-1. Split oversized GPU uploads and measure allocation/copy costs; native tracing measured a 7.13 ms callback despite the soft 2 ms admission limit.
+1. Measure GPU transfer/initialization, peak temporary memory and observer overhead after segmented uploads; harden actual GPU failure recovery.
 2. Recover native UI tooling and finish rendered re-entry, mouse input, resize and traversal acceptance.
 3. Measure moving-world streaming, GPU time and peak memory; decide further optimization from evidence.
 4. Implement persistent world authority and an early meaningful survival/combat/building loop alongside rendering/scale work.

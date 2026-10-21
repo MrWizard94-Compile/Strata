@@ -1,6 +1,6 @@
 # Current checkpoint
 
-2026-10-20. **Goal active.** STRATA has a native editable-world foundation, original 32×32 materials and reproducible CPU meshing evidence. The requested production and studio grade survival/combat/building/exploration game and Microsoft pitch remain incomplete.
+2026-10-21. **Goal active.** STRATA has a native editable-world foundation, original 32×32 materials and reproducible CPU meshing evidence. The requested production and studio grade survival/combat/building/exploration game and Microsoft pitch remain incomplete.
 
 The canonical local project is `C:\WPAI\Software\Rust Based Voxel`, an independent Git root. `origin` now points to `https://github.com/MrWizard94-Compile/Strata.git`; fetch succeeded. The repository is public. The director subsequently authorized committing and pushing all project changes. Source checkpoints and a Windows CI workflow are being delivered on development; this is not a production release.
 
@@ -8,12 +8,12 @@ The canonical local project is `C:\WPAI\Software\Rust Based Voxel`, an independe
 
 - Deterministic terrain, rivers/caves/trees, sparse edits, greedy meshing, DDA targeting, walking/jump/flight, body collision, bounded streaming and versioned two-slot saves are integrated.
 - Thirteen original 32×32 sRGB tiles, face-specific grass/timber layers, repeating merged faces, six linear-light mip levels and PNG export are integrated. The exported contact sheet was inspected. Tests decode all thirteen PNGs and compare them byte-for-byte with runtime pixels.
-- Eighteen streaming regressions cover stale revisions, bounded queues, byte/time/count admission, deferred work, duplicate work, halo invalidation, unload and shutdown. A dirty-resident eviction leak was corrected.
+- Twenty-three streaming regressions cover revisions, bounded queues, segmented byte/time/count limits, atomic completion, cancellation across edits/movement, duplicate work, halo invalidation, unload and shutdown. A dirty-resident eviction leak was corrected.
 - Spawn/fall recovery checks trees and construction. Seed 396 reproduces the former tree-spawn intersection; its regression passes. Unsafe flight-to-walk transitions are rejected with player feedback.
 - Presentation counters now exclude skipped acquisitions. Skipped/unfocused rendering is throttled. Controlled renderer failures attempt to save the CPU world before exit; this is not panic/power-loss recovery.
 - `cargo fmt --check`: passed.
-- `cargo test --locked`: **55 passed, 0 failed, 1 explicit GPU skip**.
-- `cargo test --locked native_gpu_validates_all_world_shader_pipelines -- --ignored --nocapture`: **1 passed**, including material mip upload validation on the native GPU.
+- `cargo test --locked`: **61 passed, 0 failed, 2 explicit GPU skips**.
+- `cargo test --locked native_gpu_ -- --ignored --nocapture`: **2 passed**, covering material/shader pipelines and segmented uploads with byte-exact GPU readback, cancellation and atomic replacement.
 - `cargo clippy --locked --all-targets -- -D warnings`: passed without warnings.
 - `cargo build --release --locked`: passed.
 - All three PowerShell entry points parsed; CPU benchmark, native launcher and streaming-trace wrapper ran. The launcher retains diagnostics; benchmark reports and exports preserve existing destinations.
@@ -34,11 +34,13 @@ Fresh visual retained-block/position re-entry, mouse editing, resize, long trave
 
 ## Current native streaming checkpoint
 
-The current release SHA256 is `4E799BA96150765A1A2A7115490C4BCCD3C3A3E7FE8A0BF224BB8412F0ECE90D`. Two 15-second native runs each submitted 900 presentations with zero skips, exited 0 and produced empty error logs. Both remained on a stationary title camera. The normal world delivered 294 chunks, including empty meshes, in 2.48 seconds from Game start; the checkerboard fixture delivered 294 in 2.50 seconds. These exclude world loading and graphics initialization.
+The current measured release SHA256 is `20D39A912941C2B3AA7E836E96AFA95A8E8DBDB98F4487D94C4669203263C7F2`. Its normal-world and two checkerboard runs each submitted 899 presentations in 15 seconds, with zero skips, exit 0 and empty error logs. All remained on stationary title cameras and delivered 294 chunks including empty meshes. Final payload and triangle counts match the previous scenes exactly.
 
-The stress fixture admitted its 19,660,800-byte center mesh alone, with a 7.1273 ms upload callback and 8.1734 ms full admission call. This verifies oversized progress and exposes the soft time limit. A 4 MiB / 2 ms budget does not interrupt one running callback. The source suite covers deferred edits/movement; neither native run needed deferral. Existing trace paths were rejected with their hashes preserved. See [STREAMING.md](STREAMING.md) for raw paths, metrics, fixture reproduction and exact limitations.
+Streaming now copies at most 4 MiB per redraw in segments up to 1 MiB, with no oversized exception. Old visible meshes remain until replacements complete. The 18.75 MiB stress mesh finished across five redraws. Callback maxima were 0.7045 and 0.7140 ms, compared with 7.1273 ms in the monolithic stress run; full desired-world delivery was about 60 ms later. Total admission peaked at 1.6257 ms in these final runs. The 2 ms time limit remains soft. Removing the vertex scan and changing allocation also contribute; GPU transfer time and peak temporary memory remain open.
 
-The original foundation is local commit `b06c1da`; the current trace sidecars identify subsequent dirty source with exact hashes. The supplied stage/phase scope remains intact.
+Schema 2 distinguishes started/copied/completed work and allocation/copy/finalize CPU time. The summary tool validates historical schema 1 and current schema 2 evidence and rejected three deliberately corrupted byte/step/count limits. Native GPU readback verifies cancellation before/after submission and atomic replacement; it does not establish rendered edit/traversal acceptance. Actual GPU OOM/device errors can still use wgpu's default panic/error behavior rather than the controlled save path.
+
+See [STREAMING.md](STREAMING.md) for raw reports, exact source/binary hashes, timing definitions and comparison limits. Final sidecars match all current source inputs; earlier candidate traces remain preserved. The stage/phase scope is intact.
 
 ## Measurements and provenance
 
@@ -54,9 +56,9 @@ Historical CPU-baseline executable SHA256: `8987752CF362DBC4CB780B6DDC31AD8D78C5
 
 ## Ownership and next work
 
-The [stage/phase tracker](PROJECT-TRACKER.md) preserves S0–S8 and the full objective. `world` contributed terrain, streaming regressions, CPU measurements tooling and materials; `renderer` contributed presentation and independent player/lifecycle review; `evolution` contributed primary research/product criteria and the separate governance candidate. Root reviewed, integrated and tested their output. Intermittent agent usage limits did not prevent local progress.
+The [stage/phase tracker](PROJECT-TRACKER.md) preserves S0–S8 and the full objective. `world` contributed terrain, streaming regressions, CPU measurements tooling and materials; `renderer` contributed presentation and independent player/lifecycle review; `evolution` contributed primary research/product criteria and the separate governance candidate. Root reviewed, integrated and tested their output. Intermittent agent usage limits did not prevent local progress. Renderer reviewed GPU lifetime/error boundaries, world reviewed scheduling and added three boundary regressions, and root integrated and measured the assembled client.
 
-Next: split oversized GPU uploads, measure observer overhead and moving-world/GPU/memory costs; finish native interactive acceptance; establish persistent simulation authority and an early meaningful survival/combat/building/exploration loop. Ecology, creatures, machines, progression, audio, controller/accessibility, mods, multiplayer, world scale/LOD, production releases, external playtests and pitch remain open. Public GDK research does not establish console support.
+Next: measure observer overhead and moving-world/GPU/memory costs, harden GPU failure recovery; finish native interactive acceptance; establish persistent simulation authority and an early meaningful survival/combat/building/exploration loop. Ecology, creatures, machines, progression, audio, controller/accessibility, mods, multiplayer, world scale/LOD, production releases, external playtests and pitch remain open. Public GDK research does not establish console support.
 
 ## Section 0 completion audit
 
@@ -74,14 +76,14 @@ This is scored against the full requested result. FAIL rows prevent a production
 | 8 | PASS | Declared toolchain and library graph respected |
 | 9 | FAIL | Coherent source checkpoint; production installation/update/recovery package incomplete |
 | 10 | PASS | Hardware/storage considered; authority and user data preserved |
-| 11 | FAIL | Locked local build/hashes; Windows CI added, independent result and release reproducibility remain separate gates |
+| 11 | FAIL | Locked local builds/hashes and clean-runner CI verified at a80c17f; each later commit needs its own CI result, and release reproducibility remains open |
 | 12 | FAIL | Original material provenance; full dependency/license/advisory/name review open |
 | 13 | PASS | Bounded specialist ownership and root integration recorded |
 | 14 | PASS | Commands, provenance, review artifacts, limits and next actions recorded |
 | 15 | PASS | Self-audit below separates evidence classes |
 
-Source tests and native GPU validation passed for the textured implementation.
-The executable loaded the retained save, presented the scene, closed and rejected a concurrent writer.
+Source tests and native GPU validation passed, including segmented upload readback and cancellation.
+The current executable loaded both retained scenes, obeyed copy caps and closed cleanly; concurrent-writer rejection was verified at the earlier checkpoint.
 Exported materials were decoded against runtime bytes and the contact sheet was inspected.
 Three CPU runs retained matching geometry with exact source/binary provenance.
 Interactive re-entry and complete presentation quality remain unverified because current UI control failed.

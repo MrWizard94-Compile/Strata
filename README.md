@@ -40,12 +40,12 @@ The client supports `--seed <u64>` for a new world and `--save-dir <path>` for a
 ```powershell
 cargo fmt --check
 cargo test --locked
-cargo test --locked native_gpu_validates_all_world_shader_pipelines -- --ignored --nocapture
+cargo test --locked native_gpu_ -- --ignored --nocapture
 cargo clippy --locked --all-targets -- -D warnings
 cargo build --release --locked
 ```
 
-The GPU test is opt-in because it requires real hardware. Running it validates shader pipelines, not the window/input/save lifecycle. Native playtest evidence and remaining gates are recorded in [docs/STATUS.md](docs/STATUS.md).
+The GPU tests are opt-in because they require real hardware. They validate shader pipelines and segmented mesh uploads with GPU readback. The window/input/save lifecycle has separate acceptance gates. Native playtest evidence and remaining work are recorded in [docs/STATUS.md](docs/STATUS.md).
 
 Flight is collision-free for development exploration; move clear of solid terrain before toggling back to walking. New spawns and fall recovery test the entire body against trees and construction.
 
@@ -66,7 +66,7 @@ Run `./benchmark-cpu.ps1` for a release CPU meshing report plus source/binary ha
 - [Primary research and experiment gates](docs/RESEARCH.md)
 - [Game pillars and pitch acceptance criteria](docs/PRODUCT-BRIEF.md)
 
-Source is private/unpublished project work. No general redistribution license has been selected. Third-party crates retain their own licenses; dependency license/advisory review is a separate release gate.
+Source checkpoints are published in the public development repository. No general redistribution license has been selected. Third-party crates retain their own licenses; dependency license/advisory review is a separate release gate.
 
 ## Streaming diagnostics and CI
 
