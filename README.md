@@ -33,14 +33,15 @@ One full day lasts 20 real minutes and advances only while playing. Pausing the 
 | Space / Shift | Jump / sprint |
 | F | Toggle creative flight |
 | Space / Left Ctrl in flight | Rise / descend |
-| Left click or X | Break targeted block |
-| Right click or C | Place selected material |
-| 1–8 / mouse wheel | Select material |
+| Left click or X | Break the targeted block. Hold the mouse button to repeat |
+| Right click or C | Place the selected material. Hold the mouse button to repeat |
+| 1–8 / mouse wheel | Select a hotbar slot |
+| E | Open or close the material picker for the selected slot |
 | Arrow keys | Turn camera without mouse |
 | F5 | Save world |
 | F3 | Toggle frame-time, clock, and world statistics |
 | F4 | With the F3 overlay open, skip the clock forward one hour |
-| Escape | Pause / resume |
+| Escape | Close the material picker, or pause / resume |
 
 ## Verification
 
