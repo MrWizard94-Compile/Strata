@@ -9,12 +9,12 @@ From `C:\WPAI\Software\Rust Based Voxel`, build the locked release binary and re
 The recommended Windows entry point is `./benchmark-cpu.ps1 -ReportPath evidence/cpu-baseline-001.json`. It builds the locked release executable, records SHA256 hashes of source inputs and the binary, captures hardware/compiler/power-plan details, runs the headless benchmark and checks its exit status. A sibling `.provenance.json` identifies dirty/uncommitted trees explicitly. `-SkipBuild` requires the caller to establish that the binary matches the current source. The native CLI below is also available; use `Start-Process -Wait -PassThru` when a Windows GUI-subsystem executable needs explicit exit-status capture.
 
 ```powershell
-cargo build --release --locked
+cargo build --release --locked --target x86_64-pc-windows-msvc
 $env:STRATA_BUILD_PROFILE = 'release'
 $env:STRATA_RUSTC_VERSION = (rustc --version)
 $env:STRATA_SOURCE_REVISION = (git rev-parse HEAD)
 $env:STRATA_HARDWARE_LABEL = 'Record the measured CPU, RAM, OS and power mode here'
-.\target\release\strata.exe --benchmark-cpu .\evidence\cpu-baseline-001.json
+.\target\x86_64-pc-windows-msvc\release\strata.exe --benchmark-cpu .\evidence\cpu-baseline-001.json
 ```
 
 Use an accurate hardware label, and record any uncommitted source changes alongside the report; a Git SHA does not identify a dirty tree. Remove unset labels instead of guessing them. The report also records package version, target OS/architecture, available logical parallelism, actual `debug_assertions`, and the benchmark's one-thread execution. Profile names cannot reliably be inferred from debug assertions, so an absent external profile or compiler label is `null`.

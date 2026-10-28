@@ -81,6 +81,17 @@ function Assert-NoVcRedist([string]$Path) {
     }
 }
 
+function Invoke-StrataPython([string[]]$ArgumentList) {
+    if (Get-Command python -ErrorAction SilentlyContinue) {
+        & python @ArgumentList
+    } elseif (Get-Command py -ErrorAction SilentlyContinue) {
+        & py -3 @ArgumentList
+    } else {
+        throw 'Python 3 is required to write the player zip.'
+    }
+    if ($LASTEXITCODE -ne 0) { throw "Python failed ($LASTEXITCODE)." }
+}
+
 function Invoke-PackagedStrata([string]$Exe, [string]$Work, [string[]]$ArgumentList, [int]$ExpectExit) {
     $stdout = Join-Path $Work 'stdout.log'
     $stderr = Join-Path $Work 'stderr.log'
@@ -111,12 +122,21 @@ Assert-NoVcRedist $built
 $stage = Join-Path ([System.IO.Path]::GetTempPath()) ('strata-win-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $stage | Out-Null
 try {
-    Copy-Item -LiteralPath $built -Destination (Join-Path $stage 'strata.exe')
-    Copy-Item -LiteralPath $Guide -Destination (Join-Path $stage 'PLAYING.md')
     $zipFull = Join-Path (Get-Location) $ZipName
     if (Test-Path -LiteralPath $zipFull) { Remove-Item -LiteralPath $zipFull -Force }
-    & tar -a -c -f $zipFull -C $stage strata.exe PLAYING.md
-    if ($LASTEXITCODE -ne 0) { throw 'Could not create the Windows zip.' }
+    # Commit-time DOS timestamps and fixed modes. tar -a stores the clock and
+    # changes the hash on every build.
+    Invoke-StrataPython @(
+        (Join-Path $PSScriptRoot 'tools\repro_build.py'),
+        '--scan', $built
+    )
+    Invoke-StrataPython @(
+        (Join-Path $PSScriptRoot 'tools\player_zip.py'),
+        'package', '--player', 'windows',
+        '--binary', $built,
+        '--guide', (Resolve-Path -LiteralPath $Guide).Path,
+        '--output', $zipFull
+    )
 
     $unpack = Join-Path $stage 'unpack'
     New-Item -ItemType Directory -Path $unpack | Out-Null
