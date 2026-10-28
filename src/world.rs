@@ -14,9 +14,19 @@ pub const SEA_LEVEL: i32 = 28;
 /// y=192 benchmark fixtures.
 pub const MIN_SURFACE: i32 = 12;
 pub const MAX_SURFACE: i32 = 96;
-/// Save-file terrain version. Generator 1 is rejected so older files keep
-/// their bytes instead of being reinterpreted under these rules.
-pub const GENERATOR_VERSION: u32 = 2;
+/// Save-file terrain version. Generators 1 and 2 are pre-release and are
+/// rejected so older files keep their bytes. Generator 2 had the biome model
+/// without snow caps, clay beds, crystal clusters, or deep basalt.
+pub const GENERATOR_VERSION: u32 = 3;
+/// Cool grass wears snow from this surface height up.
+///
+/// On seed `20261021`, 231_361 columns (`x` and `z` in `-960..=960`, step 4)
+/// have a 97th-percentile height of 41 and a maximum of 46. About 3.4% are
+/// at least 41. A cutoff of 47 is above every column in that sample. The
+/// height-46 columns found on a step-1 pass of the same square are warm
+/// forest, so the cool-temperature gate still leaves them bare. The highest
+/// columns that are only cool are height 45.
+const HIGH_GROUND_SNOW: i32 = 41;
 pub type ChunkKey = (i32, i32, i32);
 
 const TREE_GRID: i32 = 9;
@@ -173,6 +183,8 @@ struct Column {
     biome: Biome,
     /// Desert influence in `0.0..=1.0`, used to dither sand onto neighboring land.
     sand: f64,
+    /// Climate sample already used for biome weights. Snow reads it; no second noise.
+    temperature: f64,
 }
 
 #[derive(Clone, Copy)]
@@ -213,6 +225,33 @@ struct OreRule {
     radius_sq: i32,
     block: Block,
 }
+
+struct Cluster {
+    salt: u64,
+    cell: i32,
+    min_y: i32,
+    max_y: i32,
+    chance: u64,
+    radius_sq: i32,
+}
+
+const CRYSTAL_CLUSTER: Cluster = Cluster {
+    salt: 0xC757,
+    cell: 12,
+    min_y: 2,
+    max_y: 14,
+    chance: 11,
+    radius_sq: 2,
+};
+
+const BASALT_CLUSTER: Cluster = Cluster {
+    salt: 0xBA5A,
+    cell: 8,
+    min_y: 1,
+    max_y: 8,
+    chance: 16,
+    radius_sq: 3,
+};
 
 const ORE_RULES: [OreRule; 4] = [
     OreRule {
@@ -364,7 +403,62 @@ impl World {
             height,
             biome,
             sand: desert_w.clamp(0.0, 1.0),
+            temperature,
         }
+    }
+
+    /// One block of snow on cold grass, and on high ground that is merely cool.
+    /// Sand, beaches, deserts, and ocean stay bare. The cap is applied after trees
+    /// so a trunk still occupies the column.
+    fn wears_snow(&self, x: i32, z: i32, column: Column) -> bool {
+        match column.biome {
+            Biome::Ocean | Biome::Beach | Biome::Desert => false,
+            Biome::Plains | Biome::Forest => {
+                if self.sandy(x, z, column) {
+                    return false;
+                }
+                column.temperature < -0.16
+                    || (column.temperature < 0.02 && column.height >= HIGH_GROUND_SNOW)
+            }
+        }
+    }
+
+    /// Clay patches in beach sand and shallow seabeds. Deep ocean and desert stay sand.
+    fn clay_patch(&self, x: i32, z: i32, column: Column) -> bool {
+        if !matches!(column.biome, Biome::Ocean | Biome::Beach) {
+            return false;
+        }
+        if !(SEA_LEVEL - 3..=SEA_LEVEL + 2).contains(&column.height) {
+            return false;
+        }
+        hash3(self.seed ^ 0xC1A7, x.div_euclid(5), 2, z.div_euclid(5)) % 100 < 28
+    }
+
+    /// One hash per cell. Clusters stay inside that cell, so a chunk border cannot
+    /// change them and the deep path does not grow a neighbor search.
+    fn cell_cluster(&self, at: [i32; 3], cluster: Cluster) -> bool {
+        let [x, y, z] = at;
+        if !(cluster.min_y..=cluster.max_y).contains(&y) {
+            return false;
+        }
+        let cx = x.div_euclid(cluster.cell);
+        let cy = y.div_euclid(cluster.cell);
+        let cz = z.div_euclid(cluster.cell);
+        let hash = hash3(self.seed ^ cluster.salt, cx, cy, cz);
+        if hash % 100 >= cluster.chance {
+            return false;
+        }
+        let span = u64::from(cluster.cell as u32);
+        let ox = cx * cluster.cell + (hash % span) as i32;
+        let oy = cy * cluster.cell + ((hash >> 8) % span) as i32;
+        let oz = cz * cluster.cell + ((hash >> 16) % span) as i32;
+        if !(cluster.min_y..=cluster.max_y).contains(&oy) {
+            return false;
+        }
+        let dx = x - ox;
+        let dy = y - oy;
+        let dz = z - oz;
+        dx * dx + dy * dy + dz * dz <= cluster.radius_sq
     }
 
     fn sandy(&self, x: i32, z: i32, column: Column) -> bool {
@@ -478,11 +572,33 @@ impl World {
         let depth = column.height - y;
         let sandy = self.sandy(x, z, column);
         if depth == 0 {
-            if sandy { Block::Sand } else { Block::Grass }
+            if sandy {
+                if self.clay_patch(x, z, column) {
+                    Block::Clay
+                } else {
+                    Block::Sand
+                }
+            } else {
+                Block::Grass
+            }
         } else if depth < 4 {
-            if sandy { Block::Sand } else { Block::Dirt }
+            if sandy {
+                if depth == 1 && self.clay_patch(x, z, column) {
+                    Block::Clay
+                } else {
+                    Block::Sand
+                }
+            } else {
+                Block::Dirt
+            }
+        } else if let Some(ore) = self.ore_at(x, y, z) {
+            ore
+        } else if self.cell_cluster([x, y, z], CRYSTAL_CLUSTER) {
+            Block::Crystal
+        } else if self.cell_cluster([x, y, z], BASALT_CLUSTER) {
+            Block::Basalt
         } else {
-            self.ore_at(x, y, z).unwrap_or(Block::Stone)
+            Block::Stone
         }
     }
 
@@ -550,7 +666,15 @@ impl World {
         if y <= column.height || terrain != Block::Air {
             return terrain;
         }
-        self.foliage_at(x, y, z)
+        let foliage = self.foliage_at(x, y, z);
+        if foliage != Block::Air {
+            return foliage;
+        }
+        if y == column.height + 1 && y > SEA_LEVEL && self.wears_snow(x, z, column) {
+            Block::Snow
+        } else {
+            Block::Air
+        }
     }
 
     /// Mesh positions are world-space f32. Camera-relative large-world rendering
@@ -566,13 +690,16 @@ impl World {
     fn sample_halo(&self, origin: [i32; 3]) -> Vec<Block> {
         let mut blocks = vec![Block::Air; HALO_VOLUME];
         let mut heights = vec![0; HALO_SIDE * HALO_SIDE];
+        let mut snow_caps = vec![false; HALO_SIDE * HALO_SIDE];
         // Compute a column once, rather than running fBm for every voxel or face.
         for z in -1..=CHUNK_SIZE {
             for x in -1..=CHUNK_SIZE {
                 let wx = origin[0] + x;
                 let wz = origin[2] + z;
                 let column = self.column(wx, wz);
-                heights[(x + 1) as usize + (z + 1) as usize * HALO_SIDE] = column.height;
+                let column_index = (x + 1) as usize + (z + 1) as usize * HALO_SIDE;
+                heights[column_index] = column.height;
+                snow_caps[column_index] = self.wears_snow(wx, wz, column);
                 for y in -1..=CHUNK_SIZE {
                     let wy = origin[1] + y;
                     blocks[halo_index([x, y, z])] = self.terrain_block(wx, wy, wz, column);
@@ -617,6 +744,26 @@ impl World {
                             }
                         }
                     }
+                }
+            }
+        }
+        for z in -1..=CHUNK_SIZE {
+            for x in -1..=CHUNK_SIZE {
+                let column_index = (x + 1) as usize + (z + 1) as usize * HALO_SIDE;
+                if !snow_caps[column_index] {
+                    continue;
+                }
+                let wy = heights[column_index] + 1;
+                if wy <= SEA_LEVEL {
+                    continue;
+                }
+                let y = wy - origin[1];
+                if !(-1..=CHUNK_SIZE).contains(&y) {
+                    continue;
+                }
+                let index = halo_index([x, y, z]);
+                if blocks[index] == Block::Air {
+                    blocks[index] = Block::Snow;
                 }
             }
         }
@@ -1087,14 +1234,20 @@ mod tests {
     /// table to hide it.
     const GOLDEN_SEED: u64 = 20261021;
     const GOLDEN_CHUNK_HASHES: &[((i32, i32, i32), u64, &str)] = &[
-        ((-1, 0, -8), 0xbdec_8b26_2b9a_9845, "ocean"),
+        ((-1, 0, -8), 0x24f4_9364_cb10_5b1b, "ocean"),
         ((20, 1, -25), 0x26f9_ca54_ab95_53c9, "desert surface"),
-        ((-2, 1, -2), 0xc802_ddd2_84ce_1d27, "forest canopy"),
-        ((-5, 0, -6), 0xf385_23ea_2448_a242, "caves and ores"),
+        ((-2, 1, -2), 0x939a_5de1_ffa4_4b37, "forest canopy"),
+        ((-5, 0, -6), 0x26cc_513b_7122_963a, "caves and ores"),
         (
             (-25, 0, -27),
-            0x7ec8_79e1_b84f_eb60,
+            0xe417_9e0a_b5c3_f4d0,
             "far negative caves and ores",
+        ),
+        ((-11, 1, -15), 0x9c71_9975_76c7_986c, "snow cap"),
+        (
+            (-15, 0, -15),
+            0x9cc4_e3bc_280b_83a0,
+            "clay, crystal, and deep basalt",
         ),
     ];
 
@@ -1147,6 +1300,17 @@ mod tests {
             "forest canopy" => {
                 assert!(count(Block::Wood) > 0, "{key:?} should contain a trunk");
                 assert!(count(Block::Leaves) > 0, "{key:?} should contain leaves");
+            }
+            "snow cap" => {
+                assert!(count(Block::Snow) > 0, "{key:?} should contain snow");
+            }
+            "clay, crystal, and deep basalt" => {
+                assert!(count(Block::Clay) > 0, "{key:?} clay");
+                assert!(count(Block::Crystal) > 0, "{key:?} crystal");
+                assert!(
+                    count(Block::Basalt) > 1024,
+                    "{key:?} deep basalt above the floor"
+                );
             }
             "caves and ores" | "far negative caves and ores" => {
                 assert!(
@@ -1567,8 +1731,21 @@ mod tests {
                         oceans += 1;
                         assert!(height < SEA_LEVEL);
                         assert_eq!(world.block_at(x, SEA_LEVEL, z), Block::Water);
-                        assert_eq!(surface, Block::Sand);
-                        assert_eq!(world.block_at(x, height - 1, z), Block::Sand);
+                        let bed = world.block_at(x, height - 1, z);
+                        assert!(
+                            matches!(surface, Block::Sand | Block::Clay),
+                            "ocean bed {surface:?}"
+                        );
+                        assert!(
+                            matches!(bed, Block::Sand | Block::Clay),
+                            "ocean subsurface {bed:?}"
+                        );
+                        if surface == Block::Clay || bed == Block::Clay {
+                            assert!(
+                                height >= SEA_LEVEL - 3,
+                                "clay in deep ocean at height {height}"
+                            );
+                        }
                         for dy in 0..6 {
                             let block = world.block_at(x, height - dy, z);
                             assert!(block.is_solid(), "ocean floor opened at y={}", height - dy);
@@ -1588,7 +1765,14 @@ mod tests {
                         desert_seen += usize::from(biome == Biome::Desert);
                         desert_sand +=
                             usize::from(biome == Biome::Desert && surface == Block::Sand);
-                        assert_eq!(surface, Block::Sand);
+                        if biome == Biome::Desert {
+                            assert_eq!(surface, Block::Sand);
+                        } else {
+                            assert!(
+                                matches!(surface, Block::Sand | Block::Clay),
+                                "beach cover {surface:?}"
+                            );
+                        }
                         assert!(height >= SEA_LEVEL);
                     }
                     Biome::Forest => {
@@ -1650,6 +1834,48 @@ mod tests {
             forest > plains && plains > 0,
             "forest {forest}, plains {plains}"
         );
+    }
+
+    #[test]
+    fn high_ground_snow_uses_the_height_clause_on_a_cool_peak() {
+        let world = World::new(20261021);
+        let (x, z) = (280, -772);
+        let column = world.column(x, z);
+        assert_eq!(column.height, 45);
+        assert!(column.height >= HIGH_GROUND_SNOW);
+        assert!(
+            (-0.16..0.02).contains(&column.temperature),
+            "temperature {} must miss the cold clause and hit the cool clause",
+            column.temperature
+        );
+        assert!(matches!(column.biome, Biome::Forest));
+        assert!(!world.sandy(x, z, column));
+        assert!(world.edits().is_empty());
+        assert_eq!(world.block_at(x, column.height, z), Block::Grass);
+        assert_eq!(world.block_at(x, column.height + 1, z), Block::Snow);
+        // The sample maximum is warmer than the cool gate, so it stays bare.
+        let warm = world.column(884, -460);
+        assert_eq!(warm.height, 46);
+        assert!(warm.temperature >= 0.02, "{}", warm.temperature);
+        assert_ne!(world.block_at(884, warm.height + 1, -460), Block::Snow);
+    }
+
+    #[test]
+    fn snow_clay_crystal_and_deep_basalt_generate_at_fixed_columns() {
+        let world = World::new(20261021);
+        assert!(world.edits().is_empty());
+        assert_eq!(world.surface_height(-340, -480), 31);
+        assert_eq!(world.block_at(-340, 31, -480), Block::Grass);
+        assert_eq!(world.block_at(-340, 32, -480), Block::Snow);
+        assert!(matches!(
+            world.biome_at(-340, -480),
+            Biome::Plains | Biome::Forest
+        ));
+        assert_eq!(world.block_at(-480, 29, -480), Block::Clay);
+        assert!((SEA_LEVEL - 3..=SEA_LEVEL + 2).contains(&world.surface_height(-480, -480)));
+        assert_eq!(world.block_at(-12, 6, -96), Block::Crystal);
+        assert_eq!(world.block_at(-92, 0, -96), Block::Basalt);
+        assert_eq!(world.block_at(-92, 1, -96), Block::Basalt);
     }
 
     #[test]
@@ -1773,7 +1999,10 @@ mod tests {
                 let wx = origin_x + x;
                 let wz = origin_z + z;
                 let height = world.surface_height(wx, wz);
-                let biome = biome_rgb(world.biome_at(wx, wz), height);
+                let mut biome = biome_rgb(world.biome_at(wx, wz), height);
+                if world.block_at(wx, height + 1, wz) == Block::Snow {
+                    biome = [230, 236, 238];
+                }
                 let height_shade = height_rgb(height, world.biome_at(wx, wz));
                 put_rgb(&mut map, span * 2 + 8, x, z, biome);
                 put_rgb(&mut map, span * 2 + 8, span + 8 + x, z, height_shade);
@@ -1846,6 +2075,7 @@ mod tests {
             let mut iron = 0;
             let mut gold = 0;
             let mut diamond = 0;
+            let mut restored = 0;
             for x in (origin_x..origin_x + PREVIEW_SPAN).step_by(4) {
                 match world.biome_at(x, z) {
                     Biome::Ocean => saw_ocean = true,
@@ -1853,6 +2083,9 @@ mod tests {
                     _ => saw_land = true,
                 }
                 let height = world.surface_height(x, z).min(72);
+                if world.block_at(x, height + 1, z) == Block::Snow {
+                    restored += 1;
+                }
                 for y in 1..height {
                     match world.block_at(x, y, z) {
                         Block::Air => caves += 1,
@@ -1860,19 +2093,37 @@ mod tests {
                         Block::IronOre => iron += 1,
                         Block::GoldOre => gold += 1,
                         Block::DiamondOre => diamond += 1,
+                        Block::Clay | Block::Crystal | Block::Basalt | Block::Snow => {
+                            restored += 1;
+                        }
                         _ => {}
                     }
                 }
             }
-            if saw_ocean && saw_land && caves > 0 && coal > 0 && iron > 0 && gold > 0 && diamond > 0
+            if saw_ocean
+                && saw_land
+                && caves > 0
+                && coal > 0
+                && iron > 0
+                && gold > 0
+                && diamond > 0
+                && restored > 0
             {
-                let score = caves.min(40) + coal.min(20) + iron.min(20) + gold * 3 + diamond * 5;
+                let score = caves.min(40)
+                    + coal.min(20)
+                    + iron.min(20)
+                    + gold * 3
+                    + diamond * 5
+                    + restored.min(30) * 4;
                 if score > best.1 {
                     best = (z, score);
                 }
             }
         }
-        assert!(best.1 > 0, "preview slice missed caves or an ore band");
+        assert!(
+            best.1 > 0,
+            "preview slice missed caves, an ore band, or a restored block"
+        );
         best.0
     }
 
