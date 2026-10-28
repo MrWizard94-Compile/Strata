@@ -21,7 +21,7 @@ class PlayerZipTests(unittest.TestCase):
             binary = root / "strata.exe"
             guide = root / "PLAYING.md"
             binary.write_bytes(b"MZ" + bytes(range(256)) * 40)
-            guide.write_text("play\n", encoding="utf-8")
+            guide.write_bytes(b"play\n")
             first = root / "a.zip"
             second = root / "b.zip"
             entries = [
