@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod benchmark;
+mod block_textures;
 mod daylight;
 mod material_export;
 mod materials;
@@ -9,6 +10,8 @@ mod renderer;
 mod save;
 mod streaming;
 mod streaming_trace;
+#[allow(dead_code)]
+mod texture_pack;
 mod world;
 
 use daylight::DayClock;

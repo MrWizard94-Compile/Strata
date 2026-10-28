@@ -38,10 +38,11 @@ pub struct Vertex {
 /// per-draw immediate so a later camera-relative pass can translate it once.
 ///
 /// `word0`: x:6, y:6, z:6, width-1:5, height-1:5, axis:2, positive:1, diagonal:1.
-/// `word1`: ao0..ao3:2 each, layer:5, variation:3, water:1, cutout:1. Local axes
-/// are 0..=32 and quad sizes are 1..=32. The diagonal bit preserves the AO-aware
-/// split. Water and cutout are never both set: water is the translucent range,
-/// cutout is the leaf range, and neither bit is an opaque quad.
+/// `word1`: ao0..ao3:2 each, base layer:10, variation:3, water:1, cutout:1,
+/// variant count minus one:4, random top:1. Local axes are 0..=32 and quad sizes
+/// are 1..=32. The diagonal bit preserves the AO-aware split. Water and cutout
+/// are never both set. The base layer is the first texture-array slice of a
+/// contiguous variant run (1..=16). The quad stays 8 bytes.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct PackedQuad {
@@ -62,6 +63,9 @@ pub struct DecodedQuad {
     pub variation: u8,
     pub water: bool,
     pub cutout: bool,
+    /// 1..=16. Variants occupy `layer .. layer + variant_count`.
+    pub variant_count: u8,
+    pub random_top: bool,
 }
 
 impl PackedQuad {
@@ -70,7 +74,8 @@ impl PackedQuad {
         debug_assert!((1..=32).contains(&quad.width) && (1..=32).contains(&quad.height));
         debug_assert!(quad.axis < 3);
         debug_assert!(quad.ao.iter().all(|value| *value <= 3));
-        debug_assert!(quad.layer < 32 && quad.variation < 7);
+        debug_assert!(quad.layer < 1024 && quad.variation < 7);
+        debug_assert!((1..=16).contains(&quad.variant_count));
         debug_assert!(!(quad.water && quad.cutout));
         let word0 = quad.local[0]
             | (quad.local[1] << 6)
@@ -85,9 +90,11 @@ impl PackedQuad {
             | (u32::from(quad.ao[2]) << 4)
             | (u32::from(quad.ao[3]) << 6)
             | (quad.layer << 8)
-            | (u32::from(quad.variation) << 13)
-            | (u32::from(quad.water) << 16)
-            | (u32::from(quad.cutout) << 17);
+            | (u32::from(quad.variation) << 18)
+            | (u32::from(quad.water) << 21)
+            | (u32::from(quad.cutout) << 22)
+            | (u32::from(quad.variant_count - 1) << 23)
+            | (u32::from(quad.random_top) << 27);
         Self { word0, word1 }
     }
 
@@ -107,10 +114,12 @@ impl PackedQuad {
                 ((word1 >> 4) & 3) as u8,
                 ((word1 >> 6) & 3) as u8,
             ],
-            layer: (word1 >> 8) & 31,
-            variation: ((word1 >> 13) & 7) as u8,
-            water: (word1 >> 16) & 1 == 1,
-            cutout: (word1 >> 17) & 1 == 1,
+            layer: (word1 >> 8) & 1023,
+            variation: ((word1 >> 18) & 7) as u8,
+            water: (word1 >> 21) & 1 == 1,
+            cutout: (word1 >> 22) & 1 == 1,
+            variant_count: (((word1 >> 23) & 15) + 1) as u8,
+            random_top: (word1 >> 27) & 1 == 1,
         }
     }
 }
@@ -1129,6 +1138,7 @@ fn emit_quad(
     ];
     let mut normal = [0; 3];
     normal[axis] = sign;
+    let material = crate::block_textures::quad_material(face.block, normal);
     quads.push(PackedQuad::pack(DecodedQuad {
         local,
         width: size[0] as u32,
@@ -1137,10 +1147,12 @@ fn emit_quad(
         positive: sign > 0,
         diagonal_high: face.ao[0] + face.ao[2] > face.ao[1] + face.ao[3],
         ao: face.ao,
-        layer: crate::materials::layer_for(face.block, normal),
+        layer: material.layer,
         variation: face.variation,
         water: face.block == Block::Water,
         cutout: face.block == Block::Leaves,
+        variant_count: material.variant_count,
+        random_top: material.random_top,
     }));
 }
 
@@ -2196,6 +2208,8 @@ mod tests {
             variation: 6,
             water: true,
             cutout: false,
+            variant_count: 1,
+            random_top: false,
         });
         let decoded = packed.decode();
         assert_eq!(decoded.local, [32, 0, 17]);
@@ -2211,8 +2225,10 @@ mod tests {
         );
         assert!(decoded.water);
         assert!(!decoded.cutout);
-        assert_eq!((packed.word1 >> 16) & 1, 1);
-        assert_eq!((packed.word1 >> 17) & 1, 0);
+        assert_eq!((packed.word1 >> 21) & 1, 1);
+        assert_eq!((packed.word1 >> 22) & 1, 0);
+        assert_eq!(decoded.variant_count, 1);
+        assert!(!decoded.random_top);
         let cutout = PackedQuad::pack(DecodedQuad {
             water: false,
             cutout: true,
@@ -2221,7 +2237,7 @@ mod tests {
         let cutout_decoded = cutout.decode();
         assert!(cutout_decoded.cutout);
         assert!(!cutout_decoded.water);
-        assert_eq!((cutout.word1 >> 17) & 1, 1);
+        assert_eq!((cutout.word1 >> 22) & 1, 1);
         assert_eq!(decoded.triangle_corners(), [0, 3, 1, 1, 3, 2]);
         let mesh = Mesh {
             origin: [-32, 192, -64],
@@ -2285,14 +2301,20 @@ mod tests {
         assert_eq!((word1 >> 2) & 3, u32::from(quad.ao[1]), "ao1 mask");
         assert_eq!((word1 >> 4) & 3, u32::from(quad.ao[2]), "ao2 mask");
         assert_eq!((word1 >> 6) & 3, u32::from(quad.ao[3]), "ao3 mask");
-        assert_eq!((word1 >> 8) & 31, quad.layer, "layer mask");
+        assert_eq!((word1 >> 8) & 1023, quad.layer, "layer mask");
         assert_eq!(
-            (word1 >> 13) & 7,
+            (word1 >> 18) & 7,
             u32::from(quad.variation),
             "variation mask"
         );
-        assert_eq!((word1 >> 16) & 1 == 1, quad.water, "water mask");
-        assert_eq!((word1 >> 17) & 1 == 1, quad.cutout, "cutout mask");
+        assert_eq!((word1 >> 21) & 1 == 1, quad.water, "water mask");
+        assert_eq!((word1 >> 22) & 1 == 1, quad.cutout, "cutout mask");
+        assert_eq!(
+            ((word1 >> 23) & 15) + 1,
+            u32::from(quad.variant_count),
+            "variant count"
+        );
+        assert_eq!((word1 >> 27) & 1 == 1, quad.random_top, "random top");
         assert!(!(quad.water && quad.cutout));
         assert_eq!(packed.decode(), quad);
     }
@@ -2310,10 +2332,12 @@ mod tests {
             "((input.word0 >> 30u) & 1u) == 1u",
             "(input.word0 >> 31u) == 1u",
             "(input.word1 >> (corner * 2u)) & 3u",
-            "(input.word1 >> 8u) & 31u",
-            "(input.word1 >> 13u) & 7u",
-            "(input.word1 >> 16u) & 1u",
-            "(input.word1 >> 17u) & 1u",
+            "(input.word1 >> 8u) & 1023u",
+            "(input.word1 >> 18u) & 7u",
+            "(input.word1 >> 21u) & 1u",
+            "(input.word1 >> 22u) & 1u",
+            "((input.word1 >> 23u) & 15u) + 1u",
+            "(input.word1 >> 27u) & 1u",
         ] {
             assert!(shader.contains(needle), "WGSL unpack missing {needle}");
         }
@@ -2353,6 +2377,8 @@ mod tests {
                                                 variation,
                                                 water,
                                                 cutout,
+                                                variant_count: 1,
+                                                random_top: false,
                                             });
                                             cases += 1;
                                         }
@@ -2390,6 +2416,8 @@ mod tests {
                                                         variation,
                                                         water,
                                                         cutout,
+                                                        variant_count: 1,
+                                                        random_top: false,
                                                     });
                                                     cases += 1;
                                                 }
@@ -2419,16 +2447,43 @@ mod tests {
                             variation: 6,
                             water: false,
                             cutout,
+                            variant_count: 1,
+                            random_top: false,
                         });
                         cases += 1;
                     }
                 }
             }
         }
+        // Every 10-bit layer, variant count, and top-spin flag, with the other
+        // fields fixed. 1024 * 16 * 2 = 32_768.
+        for layer in 0..1024u32 {
+            for variant_count in 1..=16u8 {
+                for random_top in [false, true] {
+                    assert_quad_matches_wgsl_masks(DecodedQuad {
+                        local: [1, 2, 3],
+                        width: 4,
+                        height: 5,
+                        axis: 1,
+                        positive: true,
+                        diagonal_high: false,
+                        ao: [3, 2, 1, 0],
+                        layer,
+                        variation: 3,
+                        water: false,
+                        cutout: false,
+                        variant_count,
+                        random_top,
+                    });
+                    cases += 1;
+                }
+            }
+        }
         // Legal combinations only. Water and cutout together are excluded.
         // Size/winding/variation/layer: 4_386_816. AO tuples: 1_096_704.
         // Positions 0..=32, with and without the cutout bit: 71_874.
-        assert_eq!(cases, 4_386_816 + 1_096_704 + 71_874);
+        // Full layer/variant/spin sweep: 32_768.
+        assert_eq!(cases, 4_386_816 + 1_096_704 + 71_874 + 32_768);
     }
 
     #[test]

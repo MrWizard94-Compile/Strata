@@ -61,7 +61,11 @@ Compared with the same generator and the previous face rule (a solid neighbor hi
 
 The extra 2,368 route bytes still fit in one 4 MiB callback. Upload milliseconds were not measured. Leaf holes are 208 of 1,024 texels. The 1-pixel leaf mip alpha is 203. Non-leaf mips stay opaque, including the sRGB black/white average of 188.
 
-`cargo fmt --check`, `cargo test --locked` (94 passed, 0 failed, 1 ignored) and `cargo clippy --locked --all-targets -- -D warnings` passed on this VM. The ignored GPU pipeline test was run here and failed immediately: no wgpu adapter (`supported_backends` Vulkan and GL, `active_backends` empty). Opaque, cutout, and water pipelines were not validated on a GPU. The 2026-10-20 Windows GPU pass and the lavapipe pass recorded for day/night do not cover this shader.
+## 2026-10-28 block texture pack
+
+The runtime samples PNGs from `assets/<namespace>/textures/block/`, embedded with `include_bytes!`. The shipped `strata` files match `materials.rs` byte for byte, including leaf alpha. The quad is still 8 bytes, so this pack does not change upload size. The layer field is now 10 bits. Variant count and a top-face spin flag share the remaining bits. The default pack uses one variant and leaves spin off, so the route digests above stay valid. A debug build may replace tiles from `STRATA_BLOCK_TEXTURES`. Release builds ignore that variable.
+
+`cargo fmt --check`, `cargo test --locked` (98 passed, 0 failed, 2 ignored) and `cargo clippy --locked --all-targets -- -D warnings` are the source checks for this pack. The ignored GPU pipeline test still has no adapter on this VM.
 
 ## Source and artifact verification
 

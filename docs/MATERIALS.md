@@ -1,6 +1,6 @@
 # Original 32×32 material set
 
-The material generator in `src/materials.rs` authors seventeen 32×32 pixel albedo tiles for STRATA. Every pixel comes from project-owned geometric rules and fixed palettes. There are no downloaded images, sampled photographs, copied game textures, bundled art dependencies, or claims of legal clearance for the working title.
+The generator in `src/materials.rs` authors seventeen 32×32 albedo tiles. Every pixel comes from project-owned geometric rules and fixed palettes. There are no downloaded images, sampled photographs, copied game textures, or bundled art dependencies. The runtime does not call this generator while drawing. It decodes the PNG pack under `assets/<namespace>/textures/block/`, which for `strata` is a byte-for-byte export of these pixels, including leaf alpha. `mip_chain_from` builds the same coverage-weighted chain for whatever square power-of-two size the pack loaded. The shipped 32×32 set still has six levels.
 
 This is the source material set for the director's explicit 32×32 texture requirement. Source tests establish dimensions, mapping, deterministic output, visible variation and mip behavior. They do not establish approval of its appearance in the rendered game.
 

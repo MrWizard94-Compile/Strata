@@ -28,6 +28,7 @@ const DIAMOND_ORE: u32 = 16;
 /// Axis-aligned block face to texture-array layer. Grass side v=0 is its top
 /// edge; wood grain runs along increasing v. Air is never meshed and falls back
 /// to limestone instead of an invalid layer.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn layer_for(block: Block, normal: [i32; 3]) -> u32 {
     match block {
         Block::Grass if normal[1] > 0 => GRASS_TOP,
@@ -70,21 +71,30 @@ pub fn rgba_layers() -> Vec<u8> {
 /// Opaque texels average evenly. Cutout texels weight that average by coverage
 /// and store the coverage in alpha, so a distant leaf stays partly open.
 /// No layer ever contributes to another layer's mip.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn mip_chain() -> Vec<Vec<u8>> {
-    let mut levels = vec![rgba_layers()];
-    let mut size = TILE_SIZE;
-    while size > 1 {
-        let next = downsample(levels.last().expect("base level exists"), size);
+    mip_chain_from(&rgba_layers(), TILE_SIZE, LAYER_COUNT)
+}
+
+/// Mip chain for an already packed layer array. `size` is the base edge.
+/// The level count is `log2(size) + 1`, down to 1 pixel. The average is the
+/// same coverage-weighted linear-light filter as the procedural tiles.
+pub fn mip_chain_from(base: &[u8], size: u32, layers: u32) -> Vec<Vec<u8>> {
+    assert_eq!(base.len(), (size * size * layers * 4) as usize);
+    let mut levels = vec![base.to_vec()];
+    let mut current = size;
+    while current > 1 {
+        let next = downsample(levels.last().expect("base level exists"), current, layers);
         levels.push(next);
-        size /= 2;
+        current /= 2;
     }
     levels
 }
 
-fn downsample(source: &[u8], size: u32) -> Vec<u8> {
+fn downsample(source: &[u8], size: u32, layers: u32) -> Vec<u8> {
     let next = size / 2;
-    let mut destination = vec![0; (next * next * LAYER_COUNT * 4) as usize];
-    for layer in 0..LAYER_COUNT {
+    let mut destination = vec![0; (next * next * layers * 4) as usize];
+    for layer in 0..layers {
         for y in 0..next {
             for x in 0..next {
                 let target = ((layer * next * next + y * next + x) * 4) as usize;
@@ -585,7 +595,7 @@ mod tests {
                 pixels[offset..offset + 4].copy_from_slice(&[37 + layer as u8, 113, 209, 255]);
             }
         }
-        let filtered = downsample(&pixels, 2);
+        let filtered = downsample(&pixels, 2, LAYER_COUNT);
         for (layer, pixel) in filtered.chunks_exact(4).enumerate() {
             assert_eq!(pixel, [37 + layer as u8, 113, 209, 255]);
         }
@@ -593,6 +603,45 @@ mod tests {
             let value = if pixel < 2 { 0 } else { 255 };
             bytes.copy_from_slice(&[value, value, value, 255]);
         }
-        assert_eq!(&downsample(&pixels, 2)[..4], &[188, 188, 188, 255]);
+        assert_eq!(
+            &downsample(&pixels, 2, LAYER_COUNT)[..4],
+            &[188, 188, 188, 255]
+        );
+    }
+
+    #[test]
+    #[ignore = "rewrites the shipped block PNGs from the procedural generator"]
+    fn write_shipped_block_pngs() {
+        let names = [
+            "grass-top.png",
+            "grass-side.png",
+            "soil.png",
+            "limestone.png",
+            "sand.png",
+            "water.png",
+            "wood-bark.png",
+            "wood-endgrain.png",
+            "leaves.png",
+            "snow.png",
+            "clay.png",
+            "crystal.png",
+            "basalt.png",
+            "coal-ore.png",
+            "iron-ore.png",
+            "gold-ore.png",
+            "diamond-ore.png",
+        ];
+        let pixels = rgba_layers();
+        let stride = (TILE_SIZE * TILE_SIZE * 4) as usize;
+        let directory = std::path::Path::new("assets/strata/textures/block");
+        std::fs::create_dir_all(directory).unwrap();
+        for (index, name) in names.iter().enumerate() {
+            let png = crate::texture_pack::encode_png(
+                &pixels[index * stride..(index + 1) * stride],
+                TILE_SIZE,
+            )
+            .unwrap();
+            std::fs::write(directory.join(name), png).unwrap();
+        }
     }
 }

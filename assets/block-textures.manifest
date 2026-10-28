@@ -1,0 +1,62 @@
+# Block texture pack, version 1
+#
+# A pack is this manifest plus PNGs at:
+#   assets/<namespace>/textures/block/<file>.png
+# The namespace comes from the layer line. `strata` is the shipped game
+# namespace, not a special case in the loader.
+#
+# `layer <namespace> <file> [file...]` appends a contiguous variant run.
+# The first file is what a bind names. At most 16 files. The whole pack
+# holds at most 1024 layers, which fits the packed quad and is under the
+# 2048 array layers typical of a GTX 1660 Ti.
+#
+# `bind <namespace:name> <face> <first-file> [rotate]`
+# Face is all, top, bottom, side, east, west, north, or south.
+# More specific faces win over side, and side wins over all.
+# `rotate` enables a stable per-block rotation and flip on top faces only.
+# The default pack leaves it off so the exported tiles match the current frames.
+# Add it for grass, sand, or stone tops when an artist wants that variation.
+#
+# Tiles in one pack are one square power-of-two size from 16 to 512, RGBA8.
+# The shipped set is 32. Alpha is the cutout coverage. Water's blend alpha
+# still comes from the shader, not from this file.
+#
+# Do not reorder these layer lines. Mesh digests store the layer index.
+
+layer strata grass-top.png
+layer strata grass-side.png
+layer strata soil.png
+layer strata limestone.png
+layer strata sand.png
+layer strata water.png
+layer strata wood-bark.png
+layer strata wood-endgrain.png
+layer strata leaves.png
+layer strata snow.png
+layer strata clay.png
+layer strata crystal.png
+layer strata basalt.png
+layer strata coal-ore.png
+layer strata iron-ore.png
+layer strata gold-ore.png
+layer strata diamond-ore.png
+
+bind strata:grass top grass-top.png
+bind strata:grass side grass-side.png
+bind strata:grass bottom soil.png
+bind strata:dirt all soil.png
+bind strata:stone all limestone.png
+bind strata:sand all sand.png
+bind strata:water all water.png
+bind strata:wood top wood-endgrain.png
+bind strata:wood bottom wood-endgrain.png
+bind strata:wood side wood-bark.png
+bind strata:leaves all leaves.png
+bind strata:snow all snow.png
+bind strata:clay all clay.png
+bind strata:crystal all crystal.png
+bind strata:basalt all basalt.png
+bind strata:coal_ore all coal-ore.png
+bind strata:iron_ore all iron-ore.png
+bind strata:gold_ore all gold-ore.png
+bind strata:diamond_ore all diamond-ore.png

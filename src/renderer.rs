@@ -7,7 +7,7 @@ use winit::window::Window;
 
 use crate::{
     daylight::Daylight,
-    materials, streaming,
+    streaming,
     world::{CHUNK_SIZE, ChunkKey, LIGHTING_TABLE, Mesh, PackedQuad},
 };
 
@@ -19,6 +19,7 @@ const CHUNK_ORIGIN_IMMEDIATE_BYTES: u32 = 16;
 fn graphics_device_descriptor() -> wgpu::DeviceDescriptor<'static> {
     let limits = wgpu::Limits {
         max_immediate_size: CHUNK_ORIGIN_IMMEDIATE_BYTES,
+        max_texture_array_layers: crate::block_textures::LAYER_COUNT.max(256),
         ..Default::default()
     };
     wgpu::DeviceDescriptor {
@@ -206,7 +207,7 @@ impl Renderer {
             }),
             usage: wgpu::BufferUsages::UNIFORM,
         });
-        let (material_view, material_sampler) = create_material_texture(&device, &queue);
+        let (material_view, material_sampler) = create_material_texture(&device, &queue)?;
         let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Camera bind group"),
             layout: &pipelines.camera_layout,
@@ -633,14 +634,15 @@ impl Renderer {
 fn create_material_texture(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
-) -> (wgpu::TextureView, wgpu::Sampler) {
-    let mips = materials::mip_chain();
+) -> Result<(wgpu::TextureView, wgpu::Sampler), String> {
+    let (tile_size, mips) = crate::block_textures::gpu_mips()?;
+    let layers = crate::block_textures::LAYER_COUNT;
     let texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("Original 32x32 material tiles"),
+        label: Some("Block texture pack"),
         size: wgpu::Extent3d {
-            width: materials::TILE_SIZE,
-            height: materials::TILE_SIZE,
-            depth_or_array_layers: materials::LAYER_COUNT,
+            width: tile_size,
+            height: tile_size,
+            depth_or_array_layers: layers,
         },
         mip_level_count: mips.len() as u32,
         sample_count: 1,
@@ -650,7 +652,7 @@ fn create_material_texture(
         view_formats: &[],
     });
     for (level, bytes) in mips.iter().enumerate() {
-        let side = materials::TILE_SIZE >> level;
+        let side = tile_size >> level;
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &texture,
@@ -667,7 +669,7 @@ fn create_material_texture(
             wgpu::Extent3d {
                 width: side,
                 height: side,
-                depth_or_array_layers: materials::LAYER_COUNT,
+                depth_or_array_layers: layers,
             },
         );
     }
@@ -684,7 +686,7 @@ fn create_material_texture(
         mipmap_filter: wgpu::MipmapFilterMode::Linear,
         ..Default::default()
     });
-    (view, sampler)
+    Ok((view, sampler))
 }
 
 fn create_attachment_view(
@@ -1106,7 +1108,8 @@ mod tests {
                 &pipelines.sky,
                 &pipelines.selection,
             );
-            let _materials = create_material_texture(&device, &queue);
+            let _materials =
+                create_material_texture(&device, &queue).expect("embedded block textures");
             queue.submit([]);
             let result = scope.pop().await;
             assert!(

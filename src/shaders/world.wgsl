@@ -121,6 +121,8 @@ struct TerrainFragment {
     @location(3) @interpolate(flat) texture_layer: u32,
     @location(4) @interpolate(flat) water: u32,
     @location(5) @interpolate(flat) cutout: u32,
+    @location(6) @interpolate(flat) variant_count: u32,
+    @location(7) @interpolate(flat) random_top: u32,
 };
 
 fn corner_brightness(ao: u32, variation: u32, direction: u32) -> f32 {
@@ -182,7 +184,7 @@ fn vs_terrain(input: QuadInput, @builtin(vertex_index) vertex_index: u32) -> Ter
     else if axis == 1u { normal.y = sign; }
     else { normal.z = sign; }
     let ao = (input.word1 >> (corner * 2u)) & 3u;
-    let variation = (input.word1 >> 13u) & 7u;
+    let variation = (input.word1 >> 18u) & 7u;
     var direction = 2u;
     if axis == 1u { direction = select(0u, 1u, positive); }
     var out: TerrainFragment;
@@ -190,10 +192,48 @@ fn vs_terrain(input: QuadInput, @builtin(vertex_index) vertex_index: u32) -> Ter
     out.world = world;
     out.normal = normal;
     out.brightness = corner_brightness(ao, variation, direction);
-    out.texture_layer = (input.word1 >> 8u) & 31u;
-    out.water = (input.word1 >> 16u) & 1u;
-    out.cutout = (input.word1 >> 17u) & 1u;
+    out.texture_layer = (input.word1 >> 8u) & 1023u;
+    out.water = (input.word1 >> 21u) & 1u;
+    out.cutout = (input.word1 >> 22u) & 1u;
+    out.variant_count = ((input.word1 >> 23u) & 15u) + 1u;
+    out.random_top = (input.word1 >> 27u) & 1u;
     return out;
+}
+
+fn variant_hash(x: i32, y: i32, z: i32, face: u32) -> u32 {
+    var h = bitcast<u32>(x) * 0x9E3779B1u;
+    h ^= bitcast<u32>(y) * 0x85EBCA77u;
+    h ^= bitcast<u32>(z) * 0xC2B2AE3Du;
+    h ^= face * 0x27D4EB2Fu;
+    h ^= h >> 16u;
+    h *= 0x7FEB352Du;
+    h ^= h >> 15u;
+    h *= 0x846CA68Bu;
+    h ^= h >> 16u;
+    return h;
+}
+
+fn face_of(normal: vec3<f32>) -> u32 {
+    if normal.x > 0.5 { return 0u; }
+    if normal.x < -0.5 { return 1u; }
+    if normal.y < -0.5 { return 3u; }
+    if normal.y > 0.5 { return 2u; }
+    if normal.z > 0.5 { return 4u; }
+    return 5u;
+}
+
+fn spin_top_uv(uv: vec2<f32>, hash: u32) -> vec2<f32> {
+    let turns = (hash >> 16u) & 3u;
+    let flip = ((hash >> 18u) & 1u) == 1u;
+    let tile = floor(uv);
+    var f = fract(uv);
+    if flip { f.x = 1.0 - f.x; }
+    let c = f - vec2<f32>(0.5);
+    var r = c;
+    if turns == 1u { r = vec2<f32>(-c.y, c.x); }
+    else if turns == 2u { r = -c; }
+    else if turns == 3u { r = vec2<f32>(c.y, -c.x); }
+    return tile + r + vec2<f32>(0.5);
 }
 
 @fragment
@@ -201,15 +241,25 @@ fn fs_terrain(input: TerrainFragment) -> @location(0) vec4<f32> {
     let eye_direction = normalize(camera.eye_time.xyz - input.world);
     let distance = length(camera.eye_time.xyz - input.world);
     let normal = normalize(input.normal);
-    // World-axis coordinates repeat one 32x32 tile per block, including merged
-    // faces and negative coordinates. Side V increases from top to bottom.
+    // One tile per block. The pack's pixel size is not used here; the sampler
+    // repeats, so a 16 or 512 tile still covers one world unit. Side V increases
+    // from top to bottom. Merged quads vary per block in the fragment stage.
     var uv = input.world.xz;
     if abs(normal.x) > 0.5 {
         uv = vec2<f32>(input.world.z, -input.world.y);
     } else if abs(normal.z) > 0.5 {
         uv = vec2<f32>(input.world.x, -input.world.y);
     }
-    let texel = textureSample(material_tiles, material_sampler, uv, i32(input.texture_layer));
+    let count = max(input.variant_count, 1u);
+    let cell = floor(input.world - normal * 0.5);
+    let face = face_of(normal);
+    let choice = variant_hash(i32(cell.x), i32(cell.y), i32(cell.z), face);
+    var sample_uv = uv;
+    if input.random_top != 0u && normal.y > 0.5 {
+        sample_uv = spin_top_uv(uv, choice);
+    }
+    let layer = input.texture_layer + (choice % count);
+    let texel = textureSample(material_tiles, material_sampler, sample_uv, i32(layer));
     // Leaf cutout is sampled in every pass; only the cutout bit discards.
     // Sampling stays outside the branch so the texture lookup is uniform.
     if input.cutout != 0u && texel.a < 0.5 {
