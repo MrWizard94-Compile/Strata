@@ -24,7 +24,7 @@ try {
     }
     New-Item -ItemType Directory -Path ([IO.Path]::GetDirectoryName($strataOutput)) -Force | Out-Null
     $strataBinary = Join-Path $PSScriptRoot 'target/release/strata.exe'
-    $strataInputs = @('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml')
+    $strataInputs = @('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml', 'benchmark-cpu.ps1')
     $strataInputs += @(Get-ChildItem -LiteralPath (Join-Path $PSScriptRoot 'src') -File -Recurse |
         ForEach-Object { $_.FullName.Substring($PSScriptRoot.Length + 1).Replace('\', '/') })
     $strataHashes = @($strataInputs | Sort-Object | ForEach-Object {

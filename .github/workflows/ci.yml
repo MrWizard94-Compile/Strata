@@ -1,19 +1,31 @@
-name: Windows source checks
+name: Source checks
+
+# Runs on pull requests into development, on pushes to that branch, and on
+# version tags. Pushes of other branches are omitted so an open pull request
+# is not checked twice. These jobs do not block a merge until branch
+# protection requires them. See README.md, "Stopping a broken change".
 
 on:
-  push:
   pull_request:
+    branches:
+      - development
+  push:
+    branches:
+      - development
+    tags:
+      - "v*"
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: windows-source-${{ github.ref }}
+  group: source-checks-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  check:
+  windows:
+    name: Windows source checks
     runs-on: windows-latest
     timeout-minutes: 30
     defaults:
@@ -23,33 +35,91 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Install the pinned toolchain
-        run: |
-          rustup toolchain install 1.97.1 --profile minimal --component rustfmt --component clippy
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          rustc --version
-          cargo --version
-      - name: Formatting
-        run: cargo fmt --check
-      - name: Source regression suite
-        run: cargo test --locked
-      - name: Strict linting
-        run: cargo clippy --locked --all-targets -- -D warnings
-      - name: Locked release build
-        run: cargo build --release --locked
       - name: PowerShell entry point syntax
         run: |
-          foreach ($script in @('run.ps1', 'benchmark-cpu.ps1', 'trace-streaming.ps1')) {
+          foreach ($script in @('run.ps1', 'benchmark-cpu.ps1', 'trace-streaming.ps1', 'package-windows.ps1', 'tools/test_package_windows.ps1')) {
             $tokens = $null
             $errors = $null
             [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $PWD $script), [ref]$tokens, [ref]$errors) | Out-Null
             if ($errors.Count) { $errors; exit 1 }
           }
+      - name: Package output safety checks
+        run: ./tools/test_package_windows.ps1
       - name: Validate recorded streaming evidence
         run: |
           Get-ChildItem -LiteralPath evidence -Filter '*.jsonl' | ForEach-Object {
             python tools/summarize_streaming_trace.py $_.FullName | Out-Null
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
-      # The explicitly ignored native GPU tests and real client interaction run
-      # on the acceptance machine; CI success does not prove either boundary.
+      - name: Install the pinned toolchain
+        run: |
+          rustup show
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup target add x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustc --version
+          cargo --version
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Formatting
+        run: cargo fmt --check
+      # Same command as the Linux job: no test name, --lib, --bins, or --skip.
+      # Cargo still omits #[ignore] on every OS. The GPU pipeline and segmented
+      # upload/readback checks run afterwards on lavapipe in the Linux job.
+      # golden_chunks_match_platform_independent_hashes is a normal #[test]
+      # with no target cfg, so this command runs it on Windows whenever the
+      # revision under test contains it.
+      - name: Full locked test suite
+        run: cargo test --locked
+      - name: Strict linting
+        run: cargo clippy --locked --all-targets -- -D warnings
+      # --target selects x86_64-pc-windows-msvc so .cargo/config.toml applies
+      # +crt-static only to that target. The output is not target\release.
+      - name: Locked release build
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+      - name: Validate the Windows player zip
+        run: ./package-windows.ps1 -Executable target\x86_64-pc-windows-msvc\release\strata.exe -ZipName strata-windows-x86_64.zip
+      # The ignored GPU tests run on the Linux job with lavapipe. Neither job
+      # proves interactive play on the acceptance machine.
+
+  linux:
+    name: Linux source checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install lavapipe
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers libvulkan1
+          icd="$(find /usr/share/vulkan/icd.d -name 'lvp_icd*.json' -print -quit)"
+          if [ -z "$icd" ]; then
+            echo 'lavapipe ICD was not installed'
+            find /usr/share/vulkan -type f || true
+            exit 1
+          fi
+          echo "LAVAPIPE_ICD=$icd" >> "$GITHUB_ENV"
+          echo "Using $icd"
+      - name: Install the pinned toolchain
+        run: |
+          rustup show
+          rustc --version
+          cargo --version
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Formatting
+        run: cargo fmt --check
+      - name: Full locked test suite
+        run: cargo test --locked
+      - name: Native graphics validation
+        env:
+          VK_DRIVER_FILES: ${{ env.LAVAPIPE_ICD }}
+          VK_ICD_FILENAMES: ${{ env.LAVAPIPE_ICD }}
+          WGPU_BACKEND: vulkan
+        run: |
+          cargo test --locked native_gpu_validates_all_world_shader_pipelines -- --ignored --nocapture
+          cargo test --locked native_gpu_segmented_upload_preserves_old_mesh_until_commit_and_cancels_safely -- --ignored --nocapture
+      - name: Strict linting
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Locked release build
+        run: cargo build --release --locked

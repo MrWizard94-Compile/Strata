@@ -1,5 +1,9 @@
 # CPU meshing baseline — 2026-10-20
 
+These reports measure generator 1. Generator 2 changes terrain, biomes and ores;
+its terrain-route timings and geometry need a separate baseline. Historical
+reports and sidecars are preserved rather than relabelled as current evidence.
+
 Three sequential invocations of `benchmark-cpu.ps1 -SkipBuild` exercised the just-built release executable. Each used dataset 1, seed 728491, 32³ chunks, one warmup and five measured runs per scenario. Full raw samples, geometry and source/binary/hardware provenance are retained under `evidence/`. The observed compiler was rustc 1.97.1; `debug_assertions=false`; one benchmark thread.
 
 | Scenario | Chunks/run | Median milliseconds, runs 1 / 2 / 3 | All 15 samples min–max (ms) | Triangles/run | Mesh payload bytes/run |

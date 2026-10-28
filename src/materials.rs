@@ -5,7 +5,7 @@
 use crate::world::Block;
 
 pub const TILE_SIZE: u32 = 32;
-pub const LAYER_COUNT: u32 = 13;
+pub const LAYER_COUNT: u32 = 17;
 
 const GRASS_TOP: u32 = 0;
 const GRASS_SIDE: u32 = 1;
@@ -20,6 +20,10 @@ const SNOW: u32 = 9;
 const CLAY: u32 = 10;
 const CRYSTAL: u32 = 11;
 const BASALT: u32 = 12;
+const COAL_ORE: u32 = 13;
+const IRON_ORE: u32 = 14;
+const GOLD_ORE: u32 = 15;
+const DIAMOND_ORE: u32 = 16;
 
 /// Axis-aligned block face to texture-array layer. Grass side v=0 is its top
 /// edge; wood grain runs along increasing v. Air is never meshed and falls back
@@ -40,6 +44,10 @@ pub fn layer_for(block: Block, normal: [i32; 3]) -> u32 {
         Block::Clay => CLAY,
         Block::Crystal => CRYSTAL,
         Block::Basalt => BASALT,
+        Block::CoalOre => COAL_ORE,
+        Block::IronOre => IRON_ORE,
+        Block::GoldOre => GOLD_ORE,
+        Block::DiamondOre => DIAMOND_ORE,
     }
 }
 
@@ -132,6 +140,10 @@ fn pixel(layer: u32, x: i32, y: i32) -> [u8; 4] {
         CLAY => clay(x, y),
         CRYSTAL => crystal(x, y),
         BASALT => basalt(x, y),
+        COAL_ORE => ore(x, y, [32, 32, 34], 13),
+        IRON_ORE => ore(x, y, [176, 96, 64], 29),
+        GOLD_ORE => ore(x, y, [228, 184, 62], 47),
+        DIAMOND_ORE => ore(x, y, [86, 228, 214], 61),
         _ => unreachable!("all generated layer IDs are defined"),
     };
     let color = shade(color, grain);
@@ -346,6 +358,25 @@ fn crystal(x: i32, y: i32) -> [u8; 3] {
     }
 }
 
+fn ore(x: i32, y: i32, speck: [u8; 3], salt: u32) -> [u8; 3] {
+    let host = limestone(x, y);
+    let col = x.div_euclid(8);
+    let row = y.div_euclid(8);
+    let anchor_x = (col * 8 + 2 + (hash(col, row, salt) % 4) as i32).rem_euclid(TILE_SIZE as i32);
+    let anchor_y =
+        (row * 8 + 2 + (hash(col, row, salt + 5) % 4) as i32).rem_euclid(TILE_SIZE as i32);
+    let dx = wrap_distance(x, anchor_x);
+    let dy = wrap_distance(y, anchor_y);
+    let distance = dx * dx + dy * dy;
+    if distance <= 2 {
+        speck
+    } else if distance <= 5 || (dx == 2 && dy == 0) || (dx == -1 && dy == 1) {
+        shade(speck, -28)
+    } else {
+        host
+    }
+}
+
 fn basalt(x: i32, y: i32) -> [u8; 3] {
     let row = y.div_euclid(16);
     let local_x = (x + row * 8).rem_euclid(16);
@@ -396,7 +427,7 @@ mod tests {
     #[test]
     fn dimensions_alpha_and_bytes_are_deterministic() {
         let first = rgba_layers();
-        assert_eq!(first.len(), (32 * 32 * 13 * 4) as usize);
+        assert_eq!(first.len(), (32 * 32 * LAYER_COUNT * 4) as usize);
         assert_eq!(first, rgba_layers());
         assert!(first.chunks_exact(4).all(|rgba| rgba[3] == 255));
     }
@@ -411,11 +442,27 @@ mod tests {
             [0, 0, 1],
             [0, 0, -1],
         ];
-        for id in 0..=11 {
-            let block = Block::from_id(id).unwrap();
+        let mut id = 0_u8;
+        while let Some(block) = Block::from_id(id) {
             for normal in normals {
                 assert!(layer_for(block, normal) < LAYER_COUNT);
             }
+            id += 1;
+        }
+        assert!(id > 15);
+        let ore_layers = [
+            layer_for(Block::CoalOre, [0, 1, 0]),
+            layer_for(Block::IronOre, [0, 1, 0]),
+            layer_for(Block::GoldOre, [0, 1, 0]),
+            layer_for(Block::DiamondOre, [0, 1, 0]),
+        ];
+        assert!(
+            ore_layers
+                .iter()
+                .all(|layer| *layer != layer_for(Block::Stone, [0, 1, 0]))
+        );
+        for (index, layer) in ore_layers.iter().enumerate() {
+            assert!(!ore_layers[..index].contains(layer));
         }
         assert_ne!(
             layer_for(Block::Grass, [0, 1, 0]),

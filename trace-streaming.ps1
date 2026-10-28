@@ -23,7 +23,7 @@ try {
         throw 'Choose a new trace path; existing traces and provenance are preserved.'
     }
     New-Item -ItemType Directory -Path ([IO.Path]::GetDirectoryName($strataOutput)) -Force | Out-Null
-    $strataInputs = @('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'run.ps1', 'trace-streaming.ps1')
+    $strataInputs = @('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml', 'run.ps1', 'trace-streaming.ps1')
     $strataInputs += @(Get-ChildItem -LiteralPath (Join-Path $PSScriptRoot 'src') -File -Recurse |
         ForEach-Object { $_.FullName.Substring($PSScriptRoot.Length + 1).Replace('\', '/') })
     $strataHashes = @($strataInputs | Sort-Object | ForEach-Object {

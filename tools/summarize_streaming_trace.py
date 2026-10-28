@@ -26,6 +26,9 @@ for frame in frames:
     assert frame["presented"] == previous_presented
     assert frame["skipped"] == previous_skipped
     stats = frame["uploads"]
+    if "initial_time_of_day" in header:
+        assert 0 <= header["initial_time_of_day"] < 1
+        assert 0 <= frame["time_of_day"] < 1
     assert stats["meshes"] <= header["upload_max_meshes"]
     assert stats["inspected"] <= 3 * header["workers"] + 1
     if segmented:
@@ -57,6 +60,8 @@ full = next((f["elapsed_ms"] for f in frames if f["desired_chunks"] > 0
 result = {
     "trace": args.trace.name,
     "schema_version": header["schema_version"],
+    "generator_version": header.get("generator_version"),
+    "initial_time_of_day": header.get("initial_time_of_day"),
     "trace_sha256": hashlib.sha256(args.trace.read_bytes()).hexdigest(),
     "binary_sha256": json.loads(provenance_path.read_bytes())["binary_sha256"],
     "frames": len(frames), "presented": previous_presented, "skipped": previous_skipped,
