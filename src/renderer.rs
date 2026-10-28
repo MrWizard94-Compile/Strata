@@ -7,13 +7,34 @@ use winit::window::Window;
 
 use crate::{
     daylight::Daylight,
-    materials,
-    world::{ChunkKey, Mesh, Vertex},
+    materials, streaming,
+    world::{ChunkKey, LIGHTING_TABLE, Mesh, PackedQuad},
 };
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
-const VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 4] =
-    wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4, 3 => Uint32];
+const QUAD_ATTRIBUTES: [wgpu::VertexAttribute; 2] =
+    wgpu::vertex_attr_array![0 => Uint32, 1 => Uint32];
+const CHUNK_ORIGIN_IMMEDIATE_BYTES: u32 = 16;
+
+fn graphics_device_descriptor() -> wgpu::DeviceDescriptor<'static> {
+    let limits = wgpu::Limits {
+        max_immediate_size: CHUNK_ORIGIN_IMMEDIATE_BYTES,
+        ..Default::default()
+    };
+    wgpu::DeviceDescriptor {
+        label: Some("STRATA graphics device"),
+        required_features: wgpu::Features::IMMEDIATES,
+        required_limits: limits,
+        ..Default::default()
+    }
+}
+
+/// Startup refusal when the selected adapter cannot supply chunk-origin immediates.
+fn missing_immediates_message(adapter_name: &str) -> String {
+    format!(
+        "STRATA cannot start on {adapter_name}. Graphics device unavailable; save files left unchanged. The terrain renderer needs 16-byte per-draw chunk origins, which this adapter does not provide. On a GTX 1660 Ti, select Vulkan or Direct3D 12."
+    )
+}
 
 pub enum PresentOutcome {
     Presented,
@@ -47,13 +68,35 @@ struct CameraUniform {
     sun_color: [f32; 4],
 }
 
+/// 84 historical brightness products. Binding 3, not the camera uniform.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct TerrainLightingUniform {
+    brightness: [[f32; 4]; 21],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct ChunkOriginImmediate {
+    origin: [i32; 4],
+}
+
 struct GpuChunk {
-    vertices: wgpu::Buffer,
-    indices: wgpu::Buffer,
-    index_count: u32,
+    quads: wgpu::Buffer,
+    quad_count: u32,
     payload_bytes: usize,
+    origin: [i32; 3],
     min: Vec3,
     max: Vec3,
+}
+
+struct InflightMesh {
+    key: ChunkKey,
+    revision: u64,
+    buffer: wgpu::Buffer,
+    total_bytes: usize,
+    written: usize,
+    origin: [i32; 3],
 }
 
 struct Pipelines {
@@ -83,6 +126,8 @@ pub struct Renderer {
     multisample_view: Option<wgpu::TextureView>,
     sample_count: u32,
     chunks: HashMap<ChunkKey, GpuChunk>,
+    /// Bytes written for a mesh that is not drawable until the final slice.
+    inflight: Option<InflightMesh>,
     suspended: bool,
 }
 
@@ -103,13 +148,19 @@ impl Renderer {
             .map_err(|error| format!("No compatible graphics adapter is available: {error}"))?;
         let info = adapter.get_info();
         let adapter_name = format!("{} / {:?}", info.name, info.backend);
+        if !adapter.features().contains(wgpu::Features::IMMEDIATES)
+            || adapter.limits().max_immediate_size < CHUNK_ORIGIN_IMMEDIATE_BYTES
+        {
+            return Err(missing_immediates_message(&adapter_name));
+        }
         let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                label: Some("STRATA graphics device"),
-                ..Default::default()
-            })
+            .request_device(&graphics_device_descriptor())
             .await
-            .map_err(|error| format!("Could not initialize the graphics device: {error}"))?;
+            .map_err(|error| {
+                format!(
+                    "STRATA cannot start on {adapter_name}. Graphics device unavailable; save files left unchanged. The graphics device could not be created: {error}"
+                )
+            })?;
         let mut config = surface
             .get_default_config(&adapter, size.width.max(1), size.height.max(1))
             .ok_or("The graphics adapter cannot present to this window")?;
@@ -143,6 +194,13 @@ impl Renderer {
             contents: bytemuck::bytes_of(&CameraUniform::zeroed()),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
+        let lighting_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Terrain lighting table"),
+            contents: bytemuck::bytes_of(&TerrainLightingUniform {
+                brightness: LIGHTING_TABLE,
+            }),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
         let (material_view, material_sampler) = create_material_texture(&device, &queue);
         let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Camera bind group"),
@@ -159,6 +217,10 @@ impl Renderer {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: wgpu::BindingResource::Sampler(&material_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: lighting_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -186,6 +248,7 @@ impl Renderer {
             multisample_view,
             sample_count,
             chunks: HashMap::new(),
+            inflight: None,
             suspended: size.width == 0 || size.height == 0,
         })
     }
@@ -210,48 +273,120 @@ impl Renderer {
         });
     }
 
-    pub fn upload_chunk(&mut self, key: ChunkKey, mesh: &Mesh) {
-        if mesh.vertices.is_empty() || mesh.indices.is_empty() {
-            self.remove_chunk(key);
+    /// Reserve the full destination buffer before a timed copy. The previous
+    /// drawable mesh stays in `chunks` until the last slice completes.
+    pub fn allocate_upload(&mut self, key: ChunkKey, revision: u64, mesh: &Mesh) {
+        if mesh.payload_bytes() == 0 {
             return;
         }
-        let mut min = Vec3::splat(f32::INFINITY);
-        let mut max = Vec3::splat(f32::NEG_INFINITY);
-        for vertex in &mesh.vertices {
-            let position = Vec3::from_array(vertex.position);
-            min = min.min(position);
-            max = max.max(position);
+        let ready = self.inflight.as_ref().is_some_and(|inflight| {
+            inflight.key == key
+                && inflight.revision == revision
+                && inflight.total_bytes == mesh.payload_bytes()
+        });
+        if ready {
+            return;
         }
-        let vertices = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Chunk vertices"),
-                contents: bytemuck::cast_slice(&mesh.vertices),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
-        let indices = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Chunk triangle indices"),
-                contents: bytemuck::cast_slice(&mesh.indices),
-                usage: wgpu::BufferUsages::INDEX,
-            });
-        self.chunks.insert(
+        self.begin_inflight(key, revision, mesh);
+    }
+
+    fn begin_inflight(&mut self, key: ChunkKey, revision: u64, mesh: &Mesh) {
+        let total = mesh.payload_bytes();
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Chunk quad instances"),
+            size: total as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.inflight = Some(InflightMesh {
             key,
-            GpuChunk {
-                vertices,
-                indices,
-                index_count: mesh.indices.len() as u32,
-                payload_bytes: std::mem::size_of_val(mesh.vertices.as_slice())
-                    + std::mem::size_of_val(mesh.indices.as_slice()),
-                min,
-                max,
-            },
+            revision,
+            buffer,
+            total_bytes: total,
+            written: 0,
+            origin: mesh.origin,
+        });
+    }
+
+    /// Copy one budgeted slice. Production allocates the buffer first, so this
+    /// copy does not create it. The chunk stays invisible until `complete`,
+    /// and any previous drawable mesh remains until that replacement finishes.
+    pub fn upload_slice(&mut self, slice: streaming::UploadSlice<'_>) {
+        if slice.mesh.quads.is_empty() {
+            if slice.complete {
+                self.remove_chunk(slice.key);
+            }
+            return;
+        }
+        let stride = std::mem::size_of::<PackedQuad>();
+        if !slice.byte_offset.is_multiple_of(stride) || !slice.byte_len.is_multiple_of(stride) {
+            self.cancel_upload(slice.key);
+            return;
+        }
+        let total = slice.mesh.payload_bytes();
+        let end = slice.byte_offset.saturating_add(slice.byte_len);
+        if end > total {
+            self.cancel_upload(slice.key);
+            return;
+        }
+        let matches = self.inflight.as_ref().is_some_and(|inflight| {
+            inflight.key == slice.key
+                && inflight.revision == slice.revision
+                && inflight.written == slice.byte_offset
+        });
+        if slice.byte_offset == 0 && !matches {
+            self.begin_inflight(slice.key, slice.revision, slice.mesh);
+        } else if !matches {
+            self.cancel_upload(slice.key);
+            return;
+        }
+        let bytes = bytemuck::cast_slice(&slice.mesh.quads);
+        let buffer = self
+            .inflight
+            .as_ref()
+            .expect("aligned in-range slice has an inflight buffer")
+            .buffer
+            .clone();
+        self.queue.write_buffer(
+            &buffer,
+            slice.byte_offset as u64,
+            &bytes[slice.byte_offset..end],
         );
+        let inflight = self
+            .inflight
+            .as_mut()
+            .expect("aligned in-range slice has an inflight buffer");
+        inflight.written = end;
+        if slice.complete && inflight.written == inflight.total_bytes {
+            let finished = self.inflight.take().expect("completed slice");
+            let (min, max) = mesh_bounds(slice.mesh);
+            self.chunks.insert(
+                slice.key,
+                GpuChunk {
+                    quads: finished.buffer,
+                    quad_count: slice.mesh.quads.len() as u32,
+                    payload_bytes: finished.total_bytes,
+                    origin: finished.origin,
+                    min,
+                    max,
+                },
+            );
+        }
+    }
+
+    pub fn cancel_upload(&mut self, key: ChunkKey) {
+        if self
+            .inflight
+            .as_ref()
+            .is_some_and(|inflight| inflight.key == key)
+        {
+            self.inflight = None;
+        }
     }
 
     pub fn remove_chunk(&mut self, key: ChunkKey) {
         self.chunks.remove(&key);
+        self.cancel_upload(key);
     }
 
     pub fn chunk_count(&self) -> usize {
@@ -271,7 +406,7 @@ impl Renderer {
     pub fn triangle_count(&self) -> usize {
         self.chunks
             .values()
-            .map(|chunk| chunk.index_count as usize / 3)
+            .map(|chunk| chunk.quad_count as usize * 2)
             .sum()
     }
 
@@ -409,6 +544,7 @@ impl Renderer {
                 ..Default::default()
             });
             pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            pass.set_immediates(0, &[0u8; CHUNK_ORIGIN_IMMEDIATE_BYTES as usize]);
             pass.set_pipeline(&self.pipelines.sky);
             pass.draw(0..3, 0..1);
             pass.set_pipeline(&self.pipelines.terrain);
@@ -416,11 +552,13 @@ impl Renderer {
                 if !frustum.intersects(chunk.min, chunk.max) {
                     continue;
                 }
-                pass.set_vertex_buffer(0, chunk.vertices.slice(..));
-                pass.set_index_buffer(chunk.indices.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..chunk.index_count, 0, 0..1);
+                let mut origin = [0; 4];
+                origin[..3].copy_from_slice(&chunk.origin);
+                pass.set_immediates(0, bytemuck::bytes_of(&ChunkOriginImmediate { origin }));
+                pass.set_vertex_buffer(0, chunk.quads.slice(..));
+                pass.draw(0..6, 0..chunk.quad_count);
                 self.visible_chunks += 1;
-                self.visible_triangles += chunk.index_count as usize / 3;
+                self.visible_triangles += chunk.quad_count as usize * 2;
             }
             if camera.selected.is_some() {
                 pass.set_pipeline(&self.pipelines.selection);
@@ -543,6 +681,33 @@ fn color_uniform(rgb: [f32; 3], w: f32) -> [f32; 4] {
     [rgb[0], rgb[1], rgb[2], w]
 }
 
+fn terrain_vertex_layout() -> wgpu::VertexBufferLayout<'static> {
+    wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<PackedQuad>() as u64,
+        step_mode: wgpu::VertexStepMode::Instance,
+        attributes: &QUAD_ATTRIBUTES,
+    }
+}
+
+fn mesh_bounds(mesh: &Mesh) -> (Vec3, Vec3) {
+    let mut min = Vec3::splat(f32::INFINITY);
+    let mut max = Vec3::splat(f32::NEG_INFINITY);
+    let origin = Vec3::new(
+        mesh.origin[0] as f32,
+        mesh.origin[1] as f32,
+        mesh.origin[2] as f32,
+    );
+    for quad in &mesh.quads {
+        let decoded = quad.decode();
+        for corner in 0..4 {
+            let position = origin + Vec3::from_array(decoded.corner_local(corner));
+            min = min.min(position);
+            max = max.max(position);
+        }
+    }
+    (min, max)
+}
+
 fn create_pipelines(
     device: &wgpu::Device,
     format: wgpu::TextureFormat,
@@ -583,23 +748,31 @@ fn create_pipelines(
                 ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                 count: None,
             },
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: wgpu::BufferSize::new(std::mem::size_of::<
+                        TerrainLightingUniform,
+                    >() as u64),
+                },
+                count: None,
+            },
         ],
     });
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("World pipeline layout"),
         bind_group_layouts: &[Some(&camera_layout)],
-        immediate_size: 0,
+        immediate_size: CHUNK_ORIGIN_IMMEDIATE_BYTES,
     });
     let targets = [Some(wgpu::ColorTargetState {
         format,
         blend: None,
         write_mask: wgpu::ColorWrites::ALL,
     })];
-    let vertex_layout = [Some(wgpu::VertexBufferLayout {
-        array_stride: std::mem::size_of::<Vertex>() as u64,
-        step_mode: wgpu::VertexStepMode::Vertex,
-        attributes: &VERTEX_ATTRIBUTES,
-    })];
+    let vertex_layout = [Some(terrain_vertex_layout())];
     let make_pipeline =
         |label: &str, vertex: &str, fragment: &str, terrain: bool, selection: bool| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -752,12 +925,44 @@ mod tests {
         assert_eq!(std::mem::offset_of!(CameraUniform, ambient_ground), 224);
         assert_eq!(std::mem::offset_of!(CameraUniform, ambient_sky), 240);
         assert_eq!(std::mem::offset_of!(CameraUniform, sun_color), 256);
+    }
+
+    #[test]
+    fn packed_quad_instance_layout_matches_the_gpu_contract() {
+        use crate::world::Vertex;
+        // Digest corners stay 44 bytes so material/geometry hashes still see
+        // position, normal, lighting color and layer. The uploaded attribute
+        // is the 8-byte instance quad, not that corner.
         assert_eq!(std::mem::size_of::<Vertex>(), 44);
         assert_eq!(std::mem::offset_of!(Vertex, normal), 12);
         assert_eq!(std::mem::offset_of!(Vertex, color), 24);
         assert_eq!(std::mem::offset_of!(Vertex, texture_layer), 40);
-        assert_eq!(VERTEX_ATTRIBUTES[3].offset, 40);
-        assert_eq!(VERTEX_ATTRIBUTES[3].format, wgpu::VertexFormat::Uint32);
+        assert_eq!(std::mem::size_of::<PackedQuad>(), 8);
+        assert_eq!(std::mem::offset_of!(PackedQuad, word0), 0);
+        assert_eq!(std::mem::offset_of!(PackedQuad, word1), 4);
+        assert_eq!(std::mem::size_of::<CameraUniform>(), 272);
+        assert_eq!(std::mem::size_of::<TerrainLightingUniform>(), 336);
+        assert_eq!(std::mem::size_of::<ChunkOriginImmediate>(), 16);
+        let layout = terrain_vertex_layout();
+        assert_eq!(layout.array_stride, 8);
+        assert_eq!(layout.step_mode, wgpu::VertexStepMode::Instance);
+        assert_eq!(layout.attributes.len(), 2);
+        assert_eq!(layout.attributes[0].offset, 0);
+        assert_eq!(layout.attributes[0].shader_location, 0);
+        assert_eq!(layout.attributes[0].format, wgpu::VertexFormat::Uint32);
+        assert_eq!(layout.attributes[1].offset, 4);
+        assert_eq!(layout.attributes[1].shader_location, 1);
+        assert_eq!(layout.attributes[1].format, wgpu::VertexFormat::Uint32);
+        assert_eq!(CHUNK_ORIGIN_IMMEDIATE_BYTES, 16);
+    }
+
+    #[test]
+    fn missing_immediates_reports_a_startup_refusal() {
+        let message = missing_immediates_message("Example GPU / Vulkan");
+        assert!(message.contains("STRATA cannot start on Example GPU / Vulkan"));
+        assert!(message.contains("Graphics device unavailable; save files left unchanged"));
+        assert!(message.contains("16-byte per-draw chunk origins"));
+        assert!(message.contains("Vulkan or Direct3D 12"));
     }
 
     #[test]
@@ -770,8 +975,13 @@ mod tests {
                 .request_adapter(&wgpu::RequestAdapterOptions::default())
                 .await
                 .expect("native GPU adapter");
+            assert!(
+                adapter.features().contains(wgpu::Features::IMMEDIATES),
+                "native adapter {} lacks per-draw immediates",
+                adapter.get_info().name
+            );
             let (device, queue) = adapter
-                .request_device(&wgpu::DeviceDescriptor::default())
+                .request_device(&graphics_device_descriptor())
                 .await
                 .expect("native GPU device");
             let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);

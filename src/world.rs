@@ -23,6 +23,8 @@ const TREE_GRID: i32 = 9;
 const TREE_CANOPY: i32 = 2;
 const TREE_CROWN_ABOVE: i32 = 2;
 
+/// Logical corner used by geometry digests and CPU-side checks.
+/// The GPU payload is [`PackedQuad`], not this 44-byte corner.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Vertex {
@@ -32,8 +34,221 @@ pub struct Vertex {
     pub texture_layer: u32,
 }
 
+/// One greedy quad, 8 bytes. Positions are chunk-local; the chunk origin is a
+/// per-draw immediate so a later camera-relative pass can translate it once.
+///
+/// `word0`: x:6, y:6, z:6, width-1:5, height-1:5, axis:2, positive:1, diagonal:1.
+/// `word1`: ao0..ao3:2 each, layer:5, variation:3, water:1. Local axes are 0..=32
+/// and quad sizes are 1..=32. The diagonal bit preserves the AO-aware split.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct PackedQuad {
+    pub word0: u32,
+    pub word1: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DecodedQuad {
+    pub local: [u32; 3],
+    pub width: u32,
+    pub height: u32,
+    pub axis: u32,
+    pub positive: bool,
+    pub diagonal_high: bool,
+    pub ao: [u8; 4],
+    pub layer: u32,
+    pub variation: u8,
+    pub water: bool,
+}
+
+impl PackedQuad {
+    fn pack(quad: DecodedQuad) -> Self {
+        debug_assert!(quad.local.iter().all(|value| *value <= 32));
+        debug_assert!((1..=32).contains(&quad.width) && (1..=32).contains(&quad.height));
+        debug_assert!(quad.axis < 3);
+        debug_assert!(quad.ao.iter().all(|value| *value <= 3));
+        debug_assert!(quad.layer < 32 && quad.variation < 7);
+        let word0 = quad.local[0]
+            | (quad.local[1] << 6)
+            | (quad.local[2] << 12)
+            | ((quad.width - 1) << 18)
+            | ((quad.height - 1) << 23)
+            | (quad.axis << 28)
+            | (u32::from(quad.positive) << 30)
+            | (u32::from(quad.diagonal_high) << 31);
+        let word1 = u32::from(quad.ao[0])
+            | (u32::from(quad.ao[1]) << 2)
+            | (u32::from(quad.ao[2]) << 4)
+            | (u32::from(quad.ao[3]) << 6)
+            | (quad.layer << 8)
+            | (u32::from(quad.variation) << 13)
+            | (u32::from(quad.water) << 16);
+        Self { word0, word1 }
+    }
+
+    pub fn decode(self) -> DecodedQuad {
+        let word0 = self.word0;
+        let word1 = self.word1;
+        DecodedQuad {
+            local: [word0 & 63, (word0 >> 6) & 63, (word0 >> 12) & 63],
+            width: ((word0 >> 18) & 31) + 1,
+            height: ((word0 >> 23) & 31) + 1,
+            axis: (word0 >> 28) & 3,
+            positive: (word0 >> 30) & 1 == 1,
+            diagonal_high: word0 >> 31 == 1,
+            ao: [
+                (word1 & 3) as u8,
+                ((word1 >> 2) & 3) as u8,
+                ((word1 >> 4) & 3) as u8,
+                ((word1 >> 6) & 3) as u8,
+            ],
+            layer: (word1 >> 8) & 31,
+            variation: ((word1 >> 13) & 7) as u8,
+            water: (word1 >> 16) & 1 == 1,
+        }
+    }
+}
+
+impl DecodedQuad {
+    pub fn corner_local(self, corner: u32) -> [f32; 3] {
+        let (u, v) = match corner {
+            0 => (0.0, 0.0),
+            1 => (self.width as f32, 0.0),
+            2 => (self.width as f32, self.height as f32),
+            _ => (0.0, self.height as f32),
+        };
+        let mut position = [
+            self.local[0] as f32,
+            self.local[1] as f32,
+            self.local[2] as f32,
+        ];
+        let u_axis = (self.axis as usize + 1) % 3;
+        let v_axis = (self.axis as usize + 2) % 3;
+        position[u_axis] += u;
+        position[v_axis] += v;
+        position
+    }
+
+    pub fn normal(self) -> [f32; 3] {
+        let mut normal = [0.0; 3];
+        normal[self.axis as usize] = if self.positive { 1.0 } else { -1.0 };
+        normal
+    }
+
+    /// 0 = downward, 1 = upward, 2 = side. Matches [`corner_brightness`].
+    pub fn direction(self) -> u8 {
+        if self.axis == 1 && !self.positive {
+            0
+        } else if self.axis == 1 {
+            1
+        } else {
+            2
+        }
+    }
+
+    pub fn triangle_corners(self) -> [u8; 6] {
+        match (self.positive, self.diagonal_high) {
+            (true, true) => [0, 1, 3, 1, 2, 3],
+            (true, false) => [0, 1, 2, 0, 2, 3],
+            (false, true) => [0, 3, 1, 1, 3, 2],
+            (false, false) => [0, 2, 1, 0, 3, 2],
+        }
+    }
+}
+
+/// `ao + variation * 4 + direction * 28`, matching the terrain shader.
+pub const fn lighting_index(ao: u8, variation: u8, direction: u8) -> usize {
+    ao as usize + variation as usize * 4 + direction as usize * 28
+}
+
+const fn corner_brightness(ao: u8, variation: u8, direction: u8) -> f32 {
+    let scale = 0.94 + variation as f32 * 0.02;
+    let directional = if direction == 0 {
+        0.80
+    } else if direction == 1 {
+        1.0
+    } else {
+        0.94
+    };
+    (0.55 + ao as f32 * 0.15) * scale * directional
+}
+
+pub const fn lighting_table() -> [[f32; 4]; 21] {
+    let mut table = [[0.0; 4]; 21];
+    let mut direction = 0u8;
+    while direction < 3 {
+        let mut variation = 0u8;
+        while variation < 7 {
+            let mut ao = 0u8;
+            while ao < 4 {
+                let index = lighting_index(ao, variation, direction);
+                table[index / 4][index % 4] = corner_brightness(ao, variation, direction);
+                ao += 1;
+            }
+            variation += 1;
+        }
+        direction += 1;
+    }
+    table
+}
+
+/// Exact f32 bits of the historical per-corner brightness product.
+pub const LIGHTING_TABLE: [[f32; 4]; 21] = lighting_table();
+
 #[derive(Clone, Debug, Default)]
 pub struct Mesh {
+    pub origin: [i32; 3],
+    pub quads: Vec<PackedQuad>,
+}
+
+impl Mesh {
+    pub fn payload_bytes(&self) -> usize {
+        self.quads.len() * std::mem::size_of::<PackedQuad>()
+    }
+
+    /// Rebuild the corner stream the digest and material tests inspect.
+    /// Absolute positions use one integer-to-f32 conversion, which matches the
+    /// previous vertex buffer for every coordinate this build actually meshes.
+    pub fn expand(&self) -> ExpandedMesh {
+        let mut expanded = ExpandedMesh {
+            vertices: Vec::with_capacity(self.quads.len() * 4),
+            indices: Vec::with_capacity(self.quads.len() * 6),
+        };
+        for quad in &self.quads {
+            let decoded = quad.decode();
+            let base = expanded.vertices.len() as u32;
+            let normal = decoded.normal();
+            let direction = decoded.direction();
+            let alpha = if decoded.water {
+                Block::Water.color()[3]
+            } else {
+                1.0
+            };
+            for corner in 0..4u32 {
+                let mut position = decoded.corner_local(corner);
+                for (axis, component) in position.iter_mut().enumerate() {
+                    *component += self.origin[axis] as f32;
+                }
+                let index =
+                    lighting_index(decoded.ao[corner as usize], decoded.variation, direction);
+                let brightness = LIGHTING_TABLE[index / 4][index % 4];
+                expanded.vertices.push(Vertex {
+                    position,
+                    normal,
+                    color: [brightness, brightness, brightness, alpha],
+                    texture_layer: decoded.layer,
+                });
+            }
+            for corner in decoded.triangle_corners() {
+                expanded.indices.push(base + u32::from(corner));
+            }
+        }
+        expanded
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ExpandedMesh {
     pub vertices: Vec<Vertex>,
     pub indices: Vec<u32>,
 }
@@ -553,8 +768,9 @@ impl World {
         self.foliage_at(x, y, z)
     }
 
-    /// Mesh positions are world-space f32. Camera-relative large-world rendering
-    /// is a later renderer contract; avoid claiming precision beyond 2^24 blocks.
+    /// Quads store chunk-local corners. The renderer adds `chunk_origin(key)`
+    /// per draw. Far-coordinate precision is unchanged until camera-relative
+    /// rendering subtracts the camera anchor from that origin.
     pub fn mesh_chunk(&self, key: ChunkKey) -> Mesh {
         let Some(origin) = chunk_origin(key) else {
             return Mesh::default();
@@ -757,7 +973,10 @@ impl Face {
 }
 
 fn mesh_halo(origin: [i32; 3], halo: &[Block]) -> Mesh {
-    let mut mesh = Mesh::default();
+    let mut mesh = Mesh {
+        origin,
+        quads: Vec::new(),
+    };
     let side = CHUNK_SIZE as usize;
     let mut mask = vec![None; side * side];
     for axis in 0..3 {
@@ -865,50 +1084,25 @@ fn corner_ao(halo: &[Block], outside: [i32; 3], u: usize, v: usize) -> [u8; 4] {
 }
 
 fn emit_quad(mesh: &mut Mesh, p: [i32; 3], axis: usize, sign: i32, size: [f32; 2], face: Face) {
-    let base = mesh.vertices.len() as u32;
-    let u = (axis + 1) % 3;
-    let v = (axis + 2) % 3;
-    let mut normal = [0.0; 3];
-    normal[axis] = sign as f32;
-    let texture_layer = crate::materials::layer_for(face.block, normal.map(|v| v as i32));
-    let variation = 0.94 + f32::from(face.variation) * 0.02;
-    let directional = if axis == 1 && sign < 0 {
-        0.80
-    } else if axis == 1 {
-        1.0
-    } else {
-        0.94
-    };
-    for (corner, uv) in [[0.0, 0.0], [size[0], 0.0], size, [0.0, size[1]]]
-        .into_iter()
-        .enumerate()
-    {
-        let mut position = p.map(|value| value as f32);
-        position[u] += uv[0];
-        position[v] += uv[1];
-        let brightness = (0.55 + f32::from(face.ao[corner]) * 0.15) * variation * directional;
-        mesh.vertices.push(Vertex {
-            position,
-            normal,
-            // Texture owns albedo. Vertex RGB carries only linear AO/variation.
-            color: [brightness, brightness, brightness, face.block.color()[3]],
-            texture_layer,
-        });
-    }
-    // Pick the diagonal with the lower AO discontinuity. Reverse negative faces
-    // so every triangle's cross product points along its declared normal.
-    let diagonal = if face.ao[0] + face.ao[2] > face.ao[1] + face.ao[3] {
-        [0, 1, 3, 1, 2, 3]
-    } else {
-        [0, 1, 2, 0, 2, 3]
-    };
-    for triangle in diagonal.chunks_exact(3) {
-        mesh.indices.push(base + triangle[0]);
-        mesh.indices
-            .push(base + triangle[if sign > 0 { 1 } else { 2 }]);
-        mesh.indices
-            .push(base + triangle[if sign > 0 { 2 } else { 1 }]);
-    }
+    let local = [
+        (p[0] - mesh.origin[0]) as u32,
+        (p[1] - mesh.origin[1]) as u32,
+        (p[2] - mesh.origin[2]) as u32,
+    ];
+    let mut normal = [0; 3];
+    normal[axis] = sign;
+    mesh.quads.push(PackedQuad::pack(DecodedQuad {
+        local,
+        width: size[0] as u32,
+        height: size[1] as u32,
+        axis: axis as u32,
+        positive: sign > 0,
+        diagonal_high: face.ao[0] + face.ao[2] > face.ao[1] + face.ao[3],
+        ao: face.ao,
+        layer: crate::materials::layer_for(face.block, normal),
+        variation: face.variation,
+        water: face.block == Block::Water,
+    }));
 }
 
 fn mix64(mut value: u64) -> u64 {
@@ -1044,12 +1238,14 @@ mod tests {
     }
 
     fn triangle_area(mesh: &Mesh) -> f32 {
-        mesh.indices
+        let expanded = mesh.expand();
+        expanded
+            .indices
             .chunks_exact(3)
             .map(|tri| {
-                let a = glam::Vec3::from(mesh.vertices[tri[0] as usize].position);
-                let b = glam::Vec3::from(mesh.vertices[tri[1] as usize].position);
-                let c = glam::Vec3::from(mesh.vertices[tri[2] as usize].position);
+                let a = glam::Vec3::from(expanded.vertices[tri[0] as usize].position);
+                let b = glam::Vec3::from(expanded.vertices[tri[1] as usize].position);
+                let c = glam::Vec3::from(expanded.vertices[tri[2] as usize].position);
                 (b - a).cross(c - a).length() * 0.5
             })
             .sum()
@@ -1236,13 +1432,18 @@ mod tests {
 
     #[test]
     fn empty_single_and_adjacent_voxels_have_expected_surface_area() {
-        assert!(artificial_mesh(&[]).indices.is_empty());
+        assert!(artificial_mesh(&[]).quads.is_empty());
         let single = artificial_mesh(&[([8, 8, 8], Block::Stone)]);
-        assert_eq!(single.indices.len(), 36);
+        assert_eq!(single.quads.len(), 6);
+        assert_eq!(single.expand().indices.len(), 36);
         assert_eq!(triangle_area(&single), 6.0);
         let pair = artificial_mesh(&[([8, 8, 8], Block::Stone), ([9, 8, 8], Block::Stone)]);
         assert_eq!(triangle_area(&pair), 10.0);
-        assert_eq!(pair.indices.len(), 36, "coplanar equal-lit faces merge");
+        assert_eq!(
+            pair.expand().indices.len(),
+            36,
+            "coplanar equal-lit faces merge"
+        );
     }
 
     #[test]
@@ -1250,7 +1451,8 @@ mod tests {
         let edge = artificial_mesh(&[([31, 8, 8], Block::Stone), ([32, 8, 8], Block::Stone)]);
         assert_eq!(triangle_area(&edge), 5.0);
         assert!(
-            edge.vertices
+            edge.expand()
+                .vertices
                 .iter()
                 .all(|vertex| vertex.normal != [1.0, 0.0, 0.0])
         );
@@ -1273,8 +1475,9 @@ mod tests {
     fn emitted_grass_and_timber_faces_select_their_distinct_material_tiles() {
         for (block, top, side, bottom) in [(Block::Grass, 0, 1, 2), (Block::Wood, 7, 6, 7)] {
             let mesh = artificial_mesh(&[([8, 8, 8], block)]);
-            assert_eq!(mesh.vertices.len(), 24);
-            for vertex in mesh.vertices {
+            let expanded = mesh.expand();
+            assert_eq!(expanded.vertices.len(), 24);
+            for vertex in expanded.vertices {
                 let expected = if vertex.normal[1] > 0.0 {
                     top
                 } else if vertex.normal[1] < 0.0 {
@@ -1295,11 +1498,12 @@ mod tests {
     #[test]
     fn all_triangles_have_outward_winding_and_valid_indices() {
         let mesh = artificial_mesh(&[([8, 8, 8], Block::Stone), ([9, 9, 8], Block::Wood)]);
-        for tri in mesh.indices.chunks_exact(3) {
+        let expanded = mesh.expand();
+        for tri in expanded.indices.chunks_exact(3) {
             let vertices = [
-                mesh.vertices[tri[0] as usize],
-                mesh.vertices[tri[1] as usize],
-                mesh.vertices[tri[2] as usize],
+                expanded.vertices[tri[0] as usize],
+                expanded.vertices[tri[1] as usize],
+                expanded.vertices[tri[2] as usize],
             ];
             let a = glam::Vec3::from(vertices[0].position);
             let b = glam::Vec3::from(vertices[1].position);
@@ -1937,5 +2141,237 @@ mod tests {
         encoder.set_depth(png::BitDepth::Eight);
         let mut writer = encoder.write_header().unwrap();
         writer.write_image_data(rgb).unwrap();
+    }
+
+    #[test]
+    fn packed_quad_fields_round_trip_and_preserve_winding_and_brightness() {
+        let packed = PackedQuad::pack(DecodedQuad {
+            local: [32, 0, 17],
+            width: 32,
+            height: 1,
+            axis: 1,
+            positive: false,
+            diagonal_high: true,
+            ao: [0, 3, 1, 2],
+            layer: 12,
+            variation: 6,
+            water: true,
+        });
+        let decoded = packed.decode();
+        assert_eq!(decoded.local, [32, 0, 17]);
+        assert_eq!((decoded.width, decoded.height, decoded.axis), (32, 1, 1));
+        assert!(!decoded.positive);
+        assert!(decoded.diagonal_high);
+        assert_eq!(decoded.ao, [0, 3, 1, 2]);
+        assert_eq!(decoded.layer, 12);
+        assert_eq!(
+            decoded.direction(),
+            0,
+            "downward faces use the darker factor"
+        );
+        assert!(decoded.water);
+        assert_eq!(decoded.triangle_corners(), [0, 3, 1, 1, 3, 2]);
+        let mesh = Mesh {
+            origin: [-32, 192, -64],
+            quads: vec![packed],
+        };
+        let expanded = mesh.expand();
+        assert_eq!(expanded.vertices.len(), 4);
+        assert_eq!(expanded.indices, vec![0, 3, 1, 1, 3, 2]);
+        assert_eq!(expanded.vertices[0].position, [0.0, 192.0, -47.0]);
+        assert_eq!(expanded.vertices[1].normal, [0.0, -1.0, 0.0]);
+        assert_eq!(expanded.vertices[0].texture_layer, 12);
+        assert_eq!(
+            expanded.vertices[0].color[3].to_bits(),
+            Block::Water.color()[3].to_bits()
+        );
+        let expected = corner_brightness(0, 6, 0);
+        assert_eq!(expanded.vertices[0].color[0].to_bits(), expected.to_bits());
+        assert!(expanded.vertices[1].color[0] > expanded.vertices[0].color[0]);
+    }
+
+    #[test]
+    fn lighting_table_matches_the_historical_corner_formula() {
+        let mut seen = 0;
+        for direction in 0..3 {
+            for variation in 0..7 {
+                for ao in 0..4 {
+                    let index = lighting_index(ao, variation, direction);
+                    assert_eq!(
+                        LIGHTING_TABLE[index / 4][index % 4].to_bits(),
+                        corner_brightness(ao, variation, direction).to_bits()
+                    );
+                    seen += 1;
+                }
+            }
+        }
+        assert_eq!(seen, 84);
+        assert_eq!(std::mem::size_of::<PackedQuad>(), 8);
+        assert_eq!(lighting_index(0, 7, 2), 84);
+        assert!(
+            lighting_index(0, 7, 2) >= LIGHTING_TABLE.len() * 4,
+            "variation 7 is past the 84-entry table"
+        );
+    }
+
+    fn assert_quad_matches_wgsl_masks(quad: DecodedQuad) {
+        let packed = PackedQuad::pack(quad);
+        let word0 = packed.word0;
+        let word1 = packed.word1;
+        assert_eq!(word0 & 63, quad.local[0], "x mask");
+        assert_eq!((word0 >> 6) & 63, quad.local[1], "y mask");
+        assert_eq!((word0 >> 12) & 63, quad.local[2], "z mask");
+        assert_eq!(((word0 >> 18) & 31) + 1, quad.width, "width mask");
+        assert_eq!(((word0 >> 23) & 31) + 1, quad.height, "height mask");
+        assert_eq!((word0 >> 28) & 3, quad.axis, "axis mask");
+        assert_eq!((word0 >> 30) & 1 == 1, quad.positive, "positive mask");
+        assert_eq!(word0 >> 31 == 1, quad.diagonal_high, "diagonal mask");
+        assert_eq!(word1 & 3, u32::from(quad.ao[0]), "ao0 mask");
+        assert_eq!((word1 >> 2) & 3, u32::from(quad.ao[1]), "ao1 mask");
+        assert_eq!((word1 >> 4) & 3, u32::from(quad.ao[2]), "ao2 mask");
+        assert_eq!((word1 >> 6) & 3, u32::from(quad.ao[3]), "ao3 mask");
+        assert_eq!((word1 >> 8) & 31, quad.layer, "layer mask");
+        assert_eq!(
+            (word1 >> 13) & 7,
+            u32::from(quad.variation),
+            "variation mask"
+        );
+        assert_eq!((word1 >> 16) & 1 == 1, quad.water, "water mask");
+        assert_eq!(packed.decode(), quad);
+    }
+
+    #[test]
+    fn every_packed_quad_field_combination_round_trips_and_matches_wgsl_masks() {
+        let shader = include_str!("shaders/world.wgsl");
+        for needle in [
+            "input.word0 & 63u",
+            "(input.word0 >> 6u) & 63u",
+            "(input.word0 >> 12u) & 63u",
+            "((input.word0 >> 18u) & 31u) + 1u",
+            "((input.word0 >> 23u) & 31u) + 1u",
+            "(input.word0 >> 28u) & 3u",
+            "((input.word0 >> 30u) & 1u) == 1u",
+            "(input.word0 >> 31u) == 1u",
+            "(input.word1 >> (corner * 2u)) & 3u",
+            "(input.word1 >> 8u) & 31u",
+            "(input.word1 >> 13u) & 7u",
+            "(input.word1 >> 16u) & 1u",
+        ] {
+            assert!(shader.contains(needle), "WGSL unpack missing {needle}");
+        }
+        let mut cases = 0u32;
+        for width in 1..=32u32 {
+            for height in 1..=32u32 {
+                for axis in 0..3u32 {
+                    for positive in [false, true] {
+                        for diagonal_high in [false, true] {
+                            for variation in 0..7u8 {
+                                for water in [false, true] {
+                                    for layer in 0..crate::materials::LAYER_COUNT {
+                                        let shift = width + height + axis + u32::from(variation);
+                                        assert_quad_matches_wgsl_masks(DecodedQuad {
+                                            local: [
+                                                shift % 33,
+                                                (shift + 11) % 33,
+                                                (shift + 22) % 33,
+                                            ],
+                                            width,
+                                            height,
+                                            axis,
+                                            positive,
+                                            diagonal_high,
+                                            ao: [
+                                                (shift as u8) & 3,
+                                                ((shift + 1) as u8) & 3,
+                                                ((shift + 2) as u8) & 3,
+                                                ((shift + 3) as u8) & 3,
+                                            ],
+                                            layer,
+                                            variation,
+                                            water,
+                                        });
+                                        cases += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for ao0 in 0..4u8 {
+            for ao1 in 0..4u8 {
+                for ao2 in 0..4u8 {
+                    for ao3 in 0..4u8 {
+                        for layer in 0..crate::materials::LAYER_COUNT {
+                            for variation in 0..7u8 {
+                                for water in [false, true] {
+                                    for axis in 0..3u32 {
+                                        for positive in [false, true] {
+                                            for diagonal_high in [false, true] {
+                                                assert_quad_matches_wgsl_masks(DecodedQuad {
+                                                    local: [32, 0, 17],
+                                                    width: 32,
+                                                    height: 1,
+                                                    axis,
+                                                    positive,
+                                                    diagonal_high,
+                                                    ao: [ao0, ao1, ao2, ao3],
+                                                    layer,
+                                                    variation,
+                                                    water,
+                                                });
+                                                cases += 1;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for x in 0..=32u32 {
+            for y in 0..=32u32 {
+                for z in 0..=32u32 {
+                    assert_quad_matches_wgsl_masks(DecodedQuad {
+                        local: [x, y, z],
+                        width: 32,
+                        height: 32,
+                        axis: 2,
+                        positive: true,
+                        diagonal_high: false,
+                        ao: [0, 1, 2, 3],
+                        layer: 16,
+                        variation: 6,
+                        water: false,
+                    });
+                    cases += 1;
+                }
+            }
+        }
+        assert_eq!(cases, 2_924_544 + 731_136 + 35_937);
+    }
+
+    #[test]
+    fn checkerboard_chunk_keeps_its_triangle_count_and_shrinks_the_payload() {
+        let mut world = World::new(728_491);
+        for z in -1..=CHUNK_SIZE {
+            for y in -1..=CHUNK_SIZE {
+                for x in -1..=CHUNK_SIZE {
+                    if (x + y + z).rem_euclid(2) == 0 {
+                        world.set_block([x, 6 * CHUNK_SIZE + y, z], Block::Stone);
+                    }
+                }
+            }
+        }
+        let mesh = world.mesh_chunk((0, 6, 0));
+        let expanded = mesh.expand();
+        assert_eq!(mesh.quads.len(), 98_304);
+        assert_eq!(expanded.indices.len() / 3, 196_608);
+        assert_eq!(expanded.vertices.len(), 393_216);
+        assert_eq!(mesh.payload_bytes(), 786_432);
+        assert_eq!(mesh.origin, [0, 192, 0]);
     }
 }
