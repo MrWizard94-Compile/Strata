@@ -12,10 +12,10 @@ $ErrorActionPreference = 'Stop'
 Push-Location -LiteralPath $PSScriptRoot
 try {
     if (-not $SkipBuild) {
-        cargo build --release --locked
+        cargo build --release --locked --target x86_64-pc-windows-msvc
         if ($LASTEXITCODE -ne 0) { throw 'STRATA build failed. See Cargo diagnostics above.' }
     }
-    $strataExecutable = Join-Path $PSScriptRoot 'target\release\strata.exe'
+    $strataExecutable = Join-Path $PSScriptRoot 'target\x86_64-pc-windows-msvc\release\strata.exe'
     if (-not (Test-Path -LiteralPath $strataExecutable -PathType Leaf)) {
         throw 'No release build found. Run without -SkipBuild first.'
     }

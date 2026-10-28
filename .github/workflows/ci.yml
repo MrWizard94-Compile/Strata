@@ -43,6 +43,8 @@ jobs:
             [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $PWD $script), [ref]$tokens, [ref]$errors) | Out-Null
             if ($errors.Count) { $errors; exit 1 }
           }
+      - name: Deterministic zip writer
+        run: python -m unittest tools/test_player_zip.py
       - name: Install the pinned toolchain
         run: |
           rustup show
@@ -64,10 +66,11 @@ jobs:
         run: cargo test --locked
       - name: Strict linting
         run: cargo clippy --locked --all-targets -- -D warnings
-      # --target selects x86_64-pc-windows-msvc so .cargo/config.toml applies
-      # +crt-static only to that target. The output is not target\release.
+      # repro_build.py passes --target x86_64-pc-windows-msvc and repeats
+      # +crt-static. CARGO_ENCODED_RUSTFLAGS replaces .cargo/config.toml.
+      # The output is not target\release.
       - name: Locked release build
-        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+        run: python tools/repro_build.py --target x86_64-pc-windows-msvc
       - name: Validate the Windows player zip
         run: ./package-windows.ps1 -Executable target\x86_64-pc-windows-msvc\release\strata.exe -ZipName strata-windows-x86_64.zip
       # The ignored GPU test runs on the Linux job with lavapipe. Neither job
@@ -98,6 +101,8 @@ jobs:
           rustup show
           rustc --version
           cargo --version
+      - name: Deterministic zip writer
+        run: python3 -m unittest tools/test_player_zip.py
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Formatting
         run: cargo fmt --check
@@ -112,4 +117,4 @@ jobs:
       - name: Strict linting
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Locked release build
-        run: cargo build --release --locked
+        run: python3 tools/repro_build.py

@@ -12,7 +12,7 @@ foreach ($strataLabelName in $strataLabelNames) {
 }
 try {
     if (-not $SkipBuild) {
-        cargo build --release --locked
+        cargo build --release --locked --target x86_64-pc-windows-msvc
         if ($LASTEXITCODE -ne 0) { throw 'Release build failed; benchmark not run.' }
     }
     $strataOutput = if ([IO.Path]::IsPathRooted($ReportPath)) {
@@ -23,7 +23,7 @@ try {
         throw 'Choose a new report path; existing results and provenance are preserved.'
     }
     New-Item -ItemType Directory -Path ([IO.Path]::GetDirectoryName($strataOutput)) -Force | Out-Null
-    $strataBinary = Join-Path $PSScriptRoot 'target/release/strata.exe'
+    $strataBinary = Join-Path $PSScriptRoot 'target/x86_64-pc-windows-msvc/release/strata.exe'
     $strataInputs = @('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml')
     $strataInputs += @(Get-ChildItem -LiteralPath (Join-Path $PSScriptRoot 'src') -File -Recurse |
         ForEach-Object { $_.FullName.Substring($PSScriptRoot.Length + 1).Replace('\', '/') })
