@@ -1,0 +1,96 @@
+{
+  "recorded_utc": "2026-10-21T04:36:50Z",
+  "host": "Linux cloud VM; not the Windows / GTX 1660 Ti acceptance machine",
+  "build_profile": "release",
+  "build_performed_by_this_invocation": true,
+  "compiler": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+  "git_commit": "a80c17f549cf08d92d44c1d91c0ca947628d0996",
+  "branch": "cursor/packed-quad-upload-budget-f0c1",
+  "working_tree_changes": [
+    " M README.md",
+    " M docs/ARCHITECTURE.md",
+    " M docs/BENCHMARKING.md",
+    " M docs/CPU-BASELINE.md",
+    " M docs/PROJECT-TRACKER.md",
+    " M docs/RESEARCH.md",
+    " M docs/STATUS.md",
+    " M docs/STREAMING.md",
+    " M src/benchmark.rs",
+    " M src/main.rs",
+    " M src/renderer.rs",
+    " M src/shaders/world.wgsl",
+    " M src/streaming.rs",
+    " M src/world.rs",
+    " M tools/create_streaming_fixture.py",
+    " M tools/summarize_streaming_trace.py",
+    "?? evidence/cpu-20261021-linux-vm-01.json"
+  ],
+  "binary_sha256": "B56AE320EAEEF358C5A569C6D20A4D8B38440A6385B662B4FDD00E28AB9CDEE2",
+  "binary_note": "Release binary and this report were produced from the dirty working tree below, before this sidecar was written. Geometry digests are compared with evidence/cpu-20261020-01.json. Upload milliseconds were not measured; this VM has no wgpu adapter.",
+  "source_inputs": [
+    {
+      "path": "Cargo.lock",
+      "sha256": "4297917DDD62B564975B2B993E759BA214BA8AD782F7923CC355CDDA5A5CEB99"
+    },
+    {
+      "path": "Cargo.toml",
+      "sha256": "D0C21AFEA6A1BA66FED649792CBD955169C47EFB80244F47E1B26F91BC40C06E"
+    },
+    {
+      "path": "rust-toolchain.toml",
+      "sha256": "559F488C181E0E9E77CF17C29DE663977F036EC7FF2E2060585714BF53C52D62"
+    },
+    {
+      "path": "src/benchmark.rs",
+      "sha256": "44FB37960053C6ED8728B17F33E45072F76B311F5F901BA1D27EE9CFE86071DE"
+    },
+    {
+      "path": "src/main.rs",
+      "sha256": "CCE5661C12C57C7FC41D301431856681E26FF1E00B830A4345A1B879867F8197"
+    },
+    {
+      "path": "src/material_export.rs",
+      "sha256": "F37D93B8AF7681BDC23AA37FD0E107FE947F90058B084EE459816C0BE7133312"
+    },
+    {
+      "path": "src/materials.rs",
+      "sha256": "CBCD4606310F04082302F81BB0587160ED5C2DFE980007461C697D5063AB8646"
+    },
+    {
+      "path": "src/player.rs",
+      "sha256": "C9A2030F5EDDEAE704E9F6C6318E1F326215323947D20198EF892039E57BB118"
+    },
+    {
+      "path": "src/renderer.rs",
+      "sha256": "71BE48C056C6084731A0CFB19E7C7F49311CE0ED0902BC4B000A8A2920744133"
+    },
+    {
+      "path": "src/save.rs",
+      "sha256": "29EF5C4B917E5735F08AD7342AB278BA1D8C62D51CF9A29EA2D1DED2611636A5"
+    },
+    {
+      "path": "src/shaders/world.wgsl",
+      "sha256": "9C620F65449C08F7CFE83C3B936B89A44EAD6093448730599436C8431E32B081"
+    },
+    {
+      "path": "src/streaming.rs",
+      "sha256": "6B52B212D3ED307B4B991E08639804B1EBF3FD04842BD4EE480ECA1816A0B5F8"
+    },
+    {
+      "path": "src/streaming_trace.rs",
+      "sha256": "EC5F414C6BB5B9AFCDCC5C514E8630DBD7B7629C532877F9ED3D2A513F418B1B"
+    },
+    {
+      "path": "src/world.rs",
+      "sha256": "520E33B2E0459287F76865BD0C8134EFDAA94D9233B63576E3F88951C67A6831"
+    }
+  ],
+  "hardware": {
+    "uname": "Linux cursor 6.12.94+ #1 SMP PREEMPT_DYNAMIC Mon Oct 19 22:12:29 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux",
+    "cpu_model": "Intel(R) Xeon(R) Processor",
+    "logical_cpus": 4,
+    "mem_total_kb": 16387280,
+    "gpu_adapter": "none; explicit native_gpu test returned NotFound"
+  },
+  "comparison_limit": "Payload bytes and digests are properties of the mesher. Elapsed milliseconds are one Linux VM invocation and are not a speedup against the 2026-10-20 i7-9700 table."
+}

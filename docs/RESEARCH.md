@@ -12,7 +12,7 @@ These observations came from source inspection; this research phase did not run 
 |---|---|---|
 | Stack | `Cargo.toml` pins wgpu 30.0.1, winit 0.30.13 and egui 0.37.0; `Cargo.lock` records resolution | No Rapier, Wasmtime, Bevy ECS or Rayon dependency is currently declared |
 | World | `src/world.rs`: 32³ chunks, procedural terrain, stable block IDs, sparse edit map, DDA selection, greedy meshing with a one-cell halo | This is not an SVO, binary bit-mask mesher, simulated ecosystem, or unbounded persistent world |
-| Streaming | `src/streaming.rs`: bounded channels, 1–4 workers, revision rejection, distance priority, at most two ready uploads per frame | Uses a mutex; job time and upload bytes are not bounded merely by bounding job count |
+| Streaming | `src/streaming.rs`: bounded channels, 1–4 workers, revision rejection, distance priority, at most two slice callbacks and 4 MiB of packed-quad payload per redraw | Uses a mutex. One callback cannot be preempted. Job time is not bounded by bounding the job count. The 2026-10-20 oversized exception is no longer in source |
 | Rendering | `src/renderer.rs`: CPU frustum checks, per-chunk indexed draws, sky and terrain shaders, configurable MSAA | No compute occlusion, indirect draw path, voxel GI or demonstrated device recreation |
 | Simulation | `src/main.rs`: fixed 1/60-second player steps; `src/player.rs`: custom voxel collision and f32 position | Fixed stepping alone proves neither cross-machine determinism nor a decoupled rendering thread |
 | Persistence | `src/save.rs`: schema/generator version, validated JSON, alternating save slots, 100,000-edit and 16 MiB limits | No region database, ecosystem state, machine state, migration chain, or power-loss durability certification |

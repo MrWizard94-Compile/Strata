@@ -1,4 +1,4 @@
-"""Create a NEW disposable save exercising the native oversized upload path."""
+"""Create a NEW disposable save exercising a dense checkerboard upload."""
 import argparse
 import hashlib
 import json
@@ -30,7 +30,9 @@ manifest = {
     "chunk": [2, 4, -2], "seed": 728491,
     "saved_edits": len(edits), "save_sha256": hashlib.sha256(encoded).hexdigest(),
     "expected_center_triangles": 196608,
-    "expected_center_mesh_payload_bytes_at_vertex_stride_44": 19660800,
+    "expected_center_quads": 98304,
+    "expected_center_mesh_payload_bytes": 786432,
+    "historical_vertex_stride_44_payload_bytes": 19660800,
     "title_camera_eye": [98.0, 162.0, 12.0],
     "title_camera_direction_unnormalized": [-0.3, -0.3, -1.0],
     "target_center": [80.0, 144.0, -48.0],
