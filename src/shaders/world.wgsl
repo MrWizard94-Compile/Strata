@@ -18,6 +18,14 @@ struct Camera {
 @group(0) @binding(1) var material_tiles: texture_2d_array<f32>;
 @group(0) @binding(2) var material_sampler: sampler;
 
+// Historical AO/variation/direction brightness. Kept off the camera uniform so
+// atmosphere parameters can change without rewriting packed-quad data.
+struct TerrainLighting {
+    brightness: array<vec4<f32>, 21>,
+};
+
+@group(0) @binding(3) var<uniform> terrain_lighting: TerrainLighting;
+
 fn linear_color(color: vec3<f32>) -> vec3<f32> {
     return pow(max(color, vec3<f32>(0.0)), vec3<f32>(2.2));
 }
@@ -88,29 +96,101 @@ fn fs_sky(input: SkyVertex) -> @location(0) vec4<f32> {
     return vec4<f32>(color, 1.0);
 }
 
-struct TerrainVertex {
-    @location(0) position: vec3<f32>,
-    @location(1) normal: vec3<f32>,
-    @location(2) color: vec4<f32>,
-    @location(3) texture_layer: u32,
+// Chunk-local greedy quad. Bit layout is PackedQuad in src/world.rs.
+struct QuadInput {
+    @location(0) word0: u32,
+    @location(1) word1: u32,
 };
+
+// Per-draw chunk origin. Camera-relative rendering can subtract an anchor here
+// without rewriting resident quad buffers.
+struct ChunkOrigin {
+    x: i32,
+    y: i32,
+    z: i32,
+    pad: i32,
+};
+
+var<immediate> chunk_origin: ChunkOrigin;
 
 struct TerrainFragment {
     @builtin(position) clip: vec4<f32>,
     @location(0) world: vec3<f32>,
     @location(1) normal: vec3<f32>,
-    @location(2) color: vec4<f32>,
+    @location(2) brightness: f32,
     @location(3) @interpolate(flat) texture_layer: u32,
+    @location(4) @interpolate(flat) water: u32,
 };
 
+fn corner_brightness(ao: u32, variation: u32, direction: u32) -> f32 {
+    let index = ao + variation * 4u + direction * 28u;
+    let packed = terrain_lighting.brightness[index / 4u];
+    let lane = index % 4u;
+    if lane == 0u { return packed.x; }
+    if lane == 1u { return packed.y; }
+    if lane == 2u { return packed.z; }
+    return packed.w;
+}
+
+fn triangle_corner(vertex_index: u32, positive: bool, diagonal_high: bool) -> u32 {
+    // Same four patterns as DecodedQuad::triangle_corners.
+    if positive && diagonal_high {
+        let pattern = array<u32, 6>(0u, 1u, 3u, 1u, 2u, 3u);
+        return pattern[vertex_index];
+    }
+    if positive {
+        let pattern = array<u32, 6>(0u, 1u, 2u, 0u, 2u, 3u);
+        return pattern[vertex_index];
+    }
+    if diagonal_high {
+        let pattern = array<u32, 6>(0u, 3u, 1u, 1u, 3u, 2u);
+        return pattern[vertex_index];
+    }
+    let pattern = array<u32, 6>(0u, 2u, 1u, 0u, 3u, 2u);
+    return pattern[vertex_index];
+}
+
 @vertex
-fn vs_terrain(input: TerrainVertex) -> TerrainFragment {
+fn vs_terrain(input: QuadInput, @builtin(vertex_index) vertex_index: u32) -> TerrainFragment {
+    let x = input.word0 & 63u;
+    let y = (input.word0 >> 6u) & 63u;
+    let z = (input.word0 >> 12u) & 63u;
+    let width = f32(((input.word0 >> 18u) & 31u) + 1u);
+    let height = f32(((input.word0 >> 23u) & 31u) + 1u);
+    let axis = (input.word0 >> 28u) & 3u;
+    let positive = ((input.word0 >> 30u) & 1u) == 1u;
+    let diagonal_high = (input.word0 >> 31u) == 1u;
+    let corner = triangle_corner(vertex_index, positive, diagonal_high);
+    var uv = vec2<f32>(0.0, 0.0);
+    if corner == 1u { uv = vec2<f32>(width, 0.0); }
+    else if corner == 2u { uv = vec2<f32>(width, height); }
+    else if corner == 3u { uv = vec2<f32>(0.0, height); }
+    var local = vec3<f32>(f32(x), f32(y), f32(z));
+    let u_axis = (axis + 1u) % 3u;
+    let v_axis = (axis + 2u) % 3u;
+    if u_axis == 0u { local.x += uv.x; }
+    else if u_axis == 1u { local.y += uv.x; }
+    else { local.z += uv.x; }
+    if v_axis == 0u { local.x += uv.y; }
+    else if v_axis == 1u { local.y += uv.y; }
+    else { local.z += uv.y; }
+    let world = vec3<f32>(f32(chunk_origin.x), f32(chunk_origin.y), f32(chunk_origin.z)) + local;
+    var normal = vec3<f32>(0.0);
+    let sign = select(-1.0, 1.0, positive);
+    if axis == 0u { normal.x = sign; }
+    else if axis == 1u { normal.y = sign; }
+    else { normal.z = sign; }
+    let ao = (input.word1 >> (corner * 2u)) & 3u;
+    let variation = (input.word1 >> 13u) & 7u;
+    var direction = 2u;
+    if axis == 1u { direction = select(0u, 1u, positive); }
     var out: TerrainFragment;
-    out.clip = camera.view_projection * vec4<f32>(input.position, 1.0);
-    out.world = input.position;
-    out.normal = input.normal;
-    out.color = input.color;
-    out.texture_layer = input.texture_layer;
+    out.clip = camera.view_projection * vec4<f32>(world, 1.0);
+    out.world = world;
+    out.normal = normal;
+    out.brightness = corner_brightness(ao, variation, direction);
+    out.texture_layer = (input.word1 >> 8u) & 31u;
+    out.water = (input.word1 >> 16u) & 1u;
     return out;
 }
 
@@ -128,10 +208,10 @@ fn fs_terrain(input: TerrainFragment) -> @location(0) vec4<f32> {
         uv = vec2<f32>(input.world.x, -input.world.y);
     }
     let albedo = textureSample(material_tiles, material_sampler, uv, i32(input.texture_layer)).rgb
-        * input.color.rgb;
+        * input.brightness;
     var color: vec3<f32>;
 
-    if input.color.a < 0.99 {
+    if input.water != 0u {
         let t = camera.eye_time.w;
         let wave_a = dot(input.world.xz, vec2<f32>(0.53, 0.31)) + t * 0.7;
         let wave_b = dot(input.world.xz, vec2<f32>(-0.27, 0.72)) - t * 0.52;

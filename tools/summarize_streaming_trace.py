@@ -10,7 +10,7 @@ parser.add_argument("trace", type=Path)
 args = parser.parse_args()
 rows = [json.loads(line) for line in args.trace.read_text(encoding="utf-8").splitlines()]
 header, end = rows[0], rows[-1]
-assert header["kind"] == "header" and header["schema_version"] == 1
+assert header["kind"] == "header" and header["schema_version"] in (1, 2)
 frames = rows[1:-1]
 assert frames and all(row["kind"] == "frame" for row in frames)
 assert end["kind"] == "end" and end["application_clean_exit"] is True
@@ -27,10 +27,15 @@ for frame in frames:
     stats = frame["uploads"]
     assert stats["meshes"] <= header["upload_max_meshes"]
     assert stats["inspected"] <= 3 * header["workers"] + 1
-    if stats["bytes"] > header["upload_max_bytes"]:
-        assert stats["meshes"] == 1 and stats["oversized"] == 1
+    if header["schema_version"] == 1:
+        if stats["bytes"] > header["upload_max_bytes"]:
+            assert stats["meshes"] == 1 and stats["oversized"] == 1
+        else:
+            assert stats["oversized"] == 0
     else:
-        assert stats["oversized"] == 0
+        assert stats["bytes"] <= header["upload_max_bytes"]
+        assert stats["completed"] <= stats["meshes"]
+        assert isinstance(stats["partial"], bool)
 
 def distribution(samples):
     ordered = sorted(samples)
@@ -51,10 +56,12 @@ result = {
     "screens": sorted({f["screen"] for f in frames}),
     "distinct_camera_positions": len({tuple(f["eye"]) for f in frames}),
     "first_all_desired_chunks_delivered_ms_after_game_start": full,
-    "admitted_meshes_including_empty": sum(f["uploads"]["meshes"] for f in frames),
+    "upload_callbacks": sum(f["uploads"]["meshes"] for f in frames),
+    "completed_mesh_uploads": sum(f["uploads"].get("completed", f["uploads"]["meshes"]) for f in frames),
     "admitted_payload_bytes": sum(f["uploads"]["bytes"] for f in frames),
     "max_payload_bytes_per_redraw": max(f["uploads"]["bytes"] for f in frames),
-    "oversized_admissions": sum(f["uploads"]["oversized"] for f in frames),
+    "oversized_admissions": sum(f["uploads"].get("oversized", 0) for f in frames),
+    "partial_upload_redraws": sum(bool(f["uploads"].get("partial", False)) for f in frames),
     "deferred_redraws": sum(f["uploads"]["deferred"] for f in frames),
     "upload_callback_ms_on_active_redraws": distribution([f["uploads"]["upload_ms"] for f in active]),
     "admission_ms_on_active_redraws": distribution([f["uploads"]["elapsed_ms"] for f in active]),
