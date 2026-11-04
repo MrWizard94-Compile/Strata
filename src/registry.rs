@@ -11,6 +11,7 @@
 use std::{
     collections::{BTreeSet, HashMap},
     fs,
+    io::Read,
     path::{Path, PathBuf},
     sync::{Arc, OnceLock},
 };
@@ -134,11 +135,15 @@ impl BlockId {
         registry().flags(self).placeable
     }
 
+    // The mesh table is what the game reads. This query stays for tests and callers.
+    #[allow(dead_code)]
     pub fn is_replaceable(self) -> bool {
         registry().flags(self).replaceable
     }
 
     /// Linear shader multiply. Builtins are identity white. This is not the hotbar color.
+    /// The mesh table copies the value. This query stays for tests and callers.
+    #[allow(dead_code)]
     pub fn tint(self) -> [f32; 4] {
         registry().flags(self).tint
     }
@@ -175,14 +180,14 @@ impl BlockId {
 ///
 /// `Cutout` is stored for leaves now. Until the cutout pipeline exists, the
 /// mesher culls it like `Opaque`. `Fluid` is the water special case.
+/// The string `translucent` is rejected by the parser and is not a variant.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum RenderClass {
     Opaque = 0,
     Cutout = 1,
     Fluid = 2,
-    Translucent = 3,
-    Invisible = 4,
+    Invisible = 3,
 }
 
 /// One row of the dense flag table. Indexed by [`BlockId::index`].
@@ -306,12 +311,16 @@ impl FaceLists {
 pub struct Registry {
     rows: Vec<BlockFlags>,
     names: Vec<String>,
+    // Read by `name_key`. The running game uses display names; tests check the key.
+    #[allow(dead_code)]
     name_keys: Vec<String>,
     displays: Vec<String>,
     by_name: HashMap<String, BlockId>,
     textures: Vec<String>,
     texture_index: HashMap<String, u32>,
     variants: Vec<FaceLists>,
+    // Read by `texture_rotation`. The mesher does not rotate yet.
+    #[allow(dead_code)]
     rotations: Vec<[TextureRotation; 6]>,
     placeholder: BlockFlags,
     placeholder_variants: FaceLists,
@@ -372,7 +381,13 @@ fn required(registry: &Registry, name: &str) -> BlockId {
 
 /// `STRATA_DATA_DIR` when it is set and not empty. An empty value is ignored.
 pub fn env_data_dir() -> Option<PathBuf> {
-    let value = std::env::var_os("STRATA_DATA_DIR")?;
+    data_dir_override(std::env::var_os("STRATA_DATA_DIR").as_deref())
+}
+
+/// Empty and missing values select the embedded registry. A non-empty value is
+/// the data root, used as given.
+fn data_dir_override(value: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    let value = value?;
     if value.is_empty() {
         None
     } else {
@@ -451,6 +466,8 @@ impl Registry {
             .unwrap_or("strata:missing")
     }
 
+    // Tests and the localization contract. Gameplay reads `display`.
+    #[allow(dead_code)]
     pub fn name_key(&self, id: BlockId) -> &str {
         self.name_keys
             .get(id.index())
@@ -509,6 +526,8 @@ impl Registry {
             .get(face)
     }
 
+    // Tests and the texture owner. The mesher uses variant 0 and does not rotate.
+    #[allow(dead_code)]
     pub fn texture_rotation(&self, id: BlockId, face: BlockFace) -> TextureRotation {
         self.rotations
             .get(id.index())
@@ -672,7 +691,7 @@ fn read_block_directory(dir: &Path) -> Result<Vec<SourceFile>, String> {
             .next()
             .expect("builtin path has a file name");
         let full = dir.join(file_name);
-        let bytes = fs::read(&full).map_err(|error| format!("{}: {error}", full.display()))?;
+        let bytes = read_limited_file(&full)?;
         sources.push(SourceFile {
             logical: (*path).to_string(),
             display: full.display().to_string(),
@@ -741,20 +760,45 @@ fn validate_builtin_set(blocks: &[Parsed]) -> Result<(), String> {
             BUILTIN_FILES.len()
         ));
     }
-    let air = &blocks[0];
-    if air.id != "strata:air" {
-        return Err(format!("{}: strata:air must be registry index 0", air.path));
+    for (index, block) in blocks.iter().enumerate() {
+        let expected = block_id_from_path(BUILTIN_FILES[index])?;
+        if block.id != expected {
+            return Err(format!(
+                "{}: id: expected {expected} at registry index {index}",
+                block.path
+            ));
+        }
     }
+    let air = &blocks[0];
     if air.solid || air.placeable || !air.replaceable || air.render != RenderClass::Invisible {
         return Err(format!(
             "{}: solid: strata:air must be non-solid, non-placeable, replaceable, and invisible",
             air.path
         ));
     }
+    if air.name_key != "block.strata.air" {
+        return Err(format!(
+            "{}: name_key: strata:air must use block.strata.air",
+            air.path
+        ));
+    }
+    let grass = find_block(blocks, "strata:grass")?;
+    if !single_texture(grass, BlockFace::Top, "strata:block/grass_top") {
+        return Err(format!(
+            "{}: textures.top: strata:grass top must be strata:block/grass_top",
+            grass.path
+        ));
+    }
     let water = find_block(blocks, "strata:water")?;
     if water.solid || water.render != RenderClass::Fluid {
         return Err(format!(
             "{}: render: strata:water must be non-solid and fluid",
+            water.path
+        ));
+    }
+    if water.tint != IDENTITY_TINT {
+        return Err(format!(
+            "{}: tint: strata:water tint must be 1.0, 1.0, 1.0, 1.0",
             water.path
         ));
     }
@@ -765,6 +809,13 @@ fn validate_builtin_set(blocks: &[Parsed]) -> Result<(), String> {
             leaves.path
         ));
     }
+    let stone = find_block(blocks, "strata:stone")?;
+    if stone.rotation[BlockFace::North.index()] != TextureRotation::None {
+        return Err(format!(
+            "{}: texture_rotation: strata:stone north face must be \"none\"",
+            stone.path
+        ));
+    }
     let missing = find_block(blocks, "strata:missing")?;
     if !missing.solid || missing.placeable || missing.render != RenderClass::Opaque {
         return Err(format!(
@@ -773,6 +824,14 @@ fn validate_builtin_set(blocks: &[Parsed]) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+fn single_texture(block: &Parsed, face: BlockFace, expected: &str) -> bool {
+    let Some(faces) = &block.faces else {
+        return false;
+    };
+    let names = &faces.names[face.index()];
+    names.len() == 1 && names[0] == expected
 }
 
 fn find_block<'a>(blocks: &'a [Parsed], id: &str) -> Result<&'a Parsed, String> {
@@ -903,6 +962,27 @@ fn map_layers(index: &HashMap<String, u32>, names: &[String], missing_layer: u32
         .iter()
         .map(|name| index.get(name).copied().unwrap_or(missing_layer))
         .collect()
+}
+
+/// Rejects a block file from its metadata length, then reads at most 64 KiB + 1.
+fn read_limited_file(path: &Path) -> Result<Vec<u8>, String> {
+    let display = path.display().to_string();
+    let file = fs::File::open(path).map_err(|error| format!("{display}: {error}"))?;
+    let length = file
+        .metadata()
+        .map_err(|error| format!("{display}: {error}"))?
+        .len();
+    if length > MAX_FILE_BYTES as u64 {
+        return Err(format!("{display}: file exceeds 64 KiB"));
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_FILE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("{display}: {error}"))?;
+    if bytes.len() > MAX_FILE_BYTES {
+        return Err(format!("{display}: file exceeds 64 KiB"));
+    }
+    Ok(bytes)
 }
 
 fn normalize_newlines(bytes: &[u8]) -> Vec<u8> {
@@ -1290,7 +1370,7 @@ pub fn is_block_id(id: &str) -> bool {
 }
 
 /// `namespace:segment(/segment)*`. The namespace uses the block-id rule.
-/// Each segment is `[a-z0-9_.-]+` and is not `.` or `..`.
+/// Each segment is `[a-z0-9_]+`.
 pub fn is_texture_ref(id: &str) -> bool {
     let Some((namespace, path)) = id.split_once(':') else {
         return false;
@@ -1302,16 +1382,10 @@ pub fn is_texture_ref(id: &str) -> bool {
 }
 
 fn is_texture_segment(segment: &str) -> bool {
-    if segment.is_empty() || segment == "." || segment == ".." {
-        return false;
-    }
-    segment.chars().all(|character| {
-        character.is_ascii_lowercase()
-            || character.is_ascii_digit()
-            || character == '_'
-            || character == '.'
-            || character == '-'
-    })
+    !segment.is_empty()
+        && segment.chars().all(|character| {
+            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '_'
+        })
 }
 
 fn is_ident(text: &str) -> bool {
@@ -1362,7 +1436,13 @@ mod tests {
         assert!(!is_block_id("strata:stone.toml"));
         assert!(!is_block_id("mod:foo/bar"));
         assert!(is_texture_ref("strata:block/grass_top"));
-        assert!(is_texture_ref("strata:block/grass_top.alt"));
+        assert!(!is_texture_ref("strata:block/grass_top.alt"));
+        assert!(!is_texture_ref("..."));
+        assert!(!is_texture_ref("x."));
+        assert!(!is_texture_ref("a-b"));
+        assert!(!is_texture_ref("strata:..."));
+        assert!(!is_texture_ref("strata:x."));
+        assert!(!is_texture_ref("strata:a-b"));
         assert!(is_texture_ref("a:b"));
         assert!(!is_texture_ref("strata:block/../grass_top"));
         assert!(!is_texture_ref("strata:block/./grass_top"));
@@ -1679,6 +1759,84 @@ mod tests {
     }
 
     #[test]
+    fn builtin_texture_layer_count_is_pinned_at_18() {
+        let count = assemble(embedded_list()).unwrap().texture_count();
+        assert_eq!(
+            count, 18,
+            "builtin texture layer count is {count}, and the pin is 18. Update this test only when a texture layer is added or removed on purpose."
+        );
+    }
+
+    #[test]
+    fn empty_data_dir_override_selects_the_embedded_registry() {
+        assert_eq!(data_dir_override(None), None);
+        assert_eq!(data_dir_override(Some(std::ffi::OsStr::new(""))), None);
+        assert_eq!(
+            data_dir_override(Some(std::ffi::OsStr::new("packs"))),
+            Some(PathBuf::from("packs"))
+        );
+    }
+
+    #[test]
+    fn grass_top_set_to_snow_is_a_load_error() {
+        let sources = replace_embedded(
+            "grass.toml",
+            "top = \"strata:block/grass_top\"",
+            "top = \"strata:block/snow\"",
+        );
+        let error = assemble(sources).unwrap_err();
+        assert!(error.contains("grass.toml"), "{error}");
+        assert!(error.contains("textures.top"), "{error}");
+    }
+
+    #[test]
+    fn non_white_water_tint_is_a_load_error() {
+        let sources = replace_embedded(
+            "water.toml",
+            "tint = [1.0, 1.0, 1.0, 1.0]",
+            "tint = [0.2, 0.4, 0.9, 1.0]",
+        );
+        let error = assemble(sources).unwrap_err();
+        assert!(error.contains("water.toml"), "{error}");
+        assert!(error.contains("tint"), "{error}");
+    }
+
+    #[test]
+    fn random_stone_rotation_is_a_load_error() {
+        let sources = replace_embedded(
+            "stone.toml",
+            "[textures]",
+            "texture_rotation = \"random\"\n\n[textures]",
+        );
+        let error = assemble(sources).unwrap_err();
+        assert!(error.contains("stone.toml"), "{error}");
+        assert!(error.contains("texture_rotation"), "{error}");
+    }
+
+    #[test]
+    fn oversized_block_file_is_rejected_from_its_length() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("strata-oversize-{nonce}"));
+        let blocks = root.join(BLOCKS_RELATIVE);
+        fs::create_dir_all(&blocks).unwrap();
+        for (path, text) in embedded_sources() {
+            let name = path.rsplit('/').next().unwrap();
+            fs::write(blocks.join(name), text).unwrap();
+        }
+        let stone = blocks.join("stone.toml");
+        let mut big = fs::read(&stone).unwrap();
+        big.resize(MAX_FILE_BYTES + 1, b'\n');
+        fs::write(&stone, big).unwrap();
+        let error = Registry::load_from(Some(&root)).unwrap_err();
+        assert!(error.contains("stone.toml"), "{error}");
+        assert!(error.contains("64 KiB"), "{error}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn texture_layer_cap_is_256() {
         let mut names = BTreeSet::new();
         for index in 0..MAX_TEXTURE_LAYERS {
@@ -1725,9 +1883,11 @@ mod tests {
         assert!(warning.contains("grass.toml"), "{warning}");
         assert!(warning.contains("textures.side"), "{warning}");
         assert!(warning.contains("strata:block/not_a_tile"), "{warning}");
-        let startup = format!("STRATA_START_FAILED {warning}\n");
+        let startup = crate::startup_failure_text(&warning);
+        assert!(startup.starts_with(crate::STRATA_START_FAILED));
         assert!(startup.contains("grass.toml"));
         assert!(startup.contains("textures.side"));
+        assert!(startup.ends_with('\n'));
     }
 
     #[test]

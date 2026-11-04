@@ -79,8 +79,8 @@ pub struct World {
     /// Parallel to [`ORE_RULES`], in the same order, copied from [`Self::worldgen`].
     ore_ids: [BlockId; 4],
     registry: Arc<registry::Registry>,
-    /// Solid bit and render class, plus one layer and tint per id. Built once
-    /// so meshing does not touch the registry lock or copy flag rows.
+    /// Per-id solid, replaceable, render class, layer, and tint. Built once.
+    /// Each mesh copies the flag byte onto the halo and the inner loops read that.
     mesh_lookup: MeshLookup,
 }
 
@@ -228,8 +228,10 @@ impl World {
     }
 
     /// The resolved ids must match the builtin constants. A mismatch means the
-    /// TOML load order drifted from the schema-1 numbers. These checks stay on
-    /// in release builds: schema 1 stores the same numbers.
+    /// load order drifted from the schema-1 numbers. These checks stay on in
+    /// release builds: schema 1 stores the same numbers. Registry data that a
+    /// file can change (grass top, water tint, stone rotation, air's name key)
+    /// is rejected by the loader instead of asserted here.
     fn checked(self) -> Self {
         assert_eq!(self.worldgen.air, AIR);
         assert_eq!(AIR.raw(), 0);
@@ -252,17 +254,11 @@ impl World {
         assert_eq!(self.registry.get("strata:missing"), Some(registry::MISSING));
         assert_eq!(registry::MISSING.raw(), 16);
         assert_eq!(self.registry.name(STONE), "strata:stone");
-        assert_eq!(self.registry.name_key(AIR), "block.strata.air");
         let grass_top = self
             .registry
             .texture_index("strata:block/grass_top")
             .expect("grass top tile");
-        assert_eq!(
-            self.registry.flags(GRASS).layers[registry::BlockFace::Top.index()],
-            grass_top
-        );
         assert_eq!(crate::materials::layer_for(GRASS, [0, 1, 0]), grass_top);
-        assert_eq!(WATER.tint(), [1.0, 1.0, 1.0, 1.0]);
         assert_eq!(WATER.render_class(), RenderClass::Fluid);
         assert_eq!(registry::render_class(LEAVES), RenderClass::Cutout);
         assert_eq!(self.registry.builtin_content_hash().len(), 64);
@@ -271,11 +267,6 @@ impl World {
                 .builtin_content_hash()
                 .chars()
                 .all(|character| character.is_ascii_hexdigit())
-        );
-        assert_eq!(
-            self.registry
-                .texture_rotation(STONE, registry::BlockFace::North),
-            registry::TextureRotation::None
         );
         self
     }
@@ -733,7 +724,7 @@ impl World {
                             let existing = blocks[index];
                             let trunk_over_leaves =
                                 existing == self.worldgen.leaves && block == self.worldgen.wood;
-                            if existing.is_replaceable() || trunk_over_leaves {
+                            if self.mesh_lookup.replaceable(existing) || trunk_over_leaves {
                                 blocks[index] = block;
                             }
                         }
@@ -756,7 +747,7 @@ impl World {
                     continue;
                 }
                 let index = halo_index([x, y, z]);
-                if blocks[index].is_replaceable() {
+                if self.mesh_lookup.replaceable(blocks[index]) {
                     blocks[index] = self.worldgen.snow;
                 }
             }
@@ -897,7 +888,8 @@ impl Face {
     }
 }
 
-/// Dense per-id facts for one mesh. Bit 0 is solid. Bits 1.. store [`RenderClass`].
+/// Dense per-id facts for one mesh. Bit 0 is solid. Bit 1 is replaceable.
+/// Bits 2.. store [`RenderClass`].
 #[derive(Clone)]
 struct MeshLookup {
     flags: Vec<u8>,
@@ -908,16 +900,20 @@ struct MeshLookup {
     fallback_tint: [f32; 4],
 }
 
-fn pack_flags(solid: bool, render: RenderClass) -> u8 {
-    u8::from(solid) | ((render as u8) << 1)
+const FLAG_SOLID: u8 = 1 << 0;
+const FLAG_REPLACEABLE: u8 = 1 << 1;
+
+fn pack_flags(solid: bool, replaceable: bool, render: RenderClass) -> u8 {
+    (u8::from(solid) * FLAG_SOLID)
+        | (u8::from(replaceable) * FLAG_REPLACEABLE)
+        | ((render as u8) << 2)
 }
 
 fn unpack_render(flags: u8) -> RenderClass {
-    match flags >> 1 {
+    match flags >> 2 {
         0 => RenderClass::Opaque,
         1 => RenderClass::Cutout,
         2 => RenderClass::Fluid,
-        3 => RenderClass::Translucent,
         _ => RenderClass::Invisible,
     }
 }
@@ -928,34 +924,24 @@ impl MeshLookup {
         let mut flags = Vec::with_capacity(rows.len());
         let mut layers = Vec::with_capacity(rows.len() * 6);
         let mut tints = Vec::with_capacity(rows.len());
-        for (index, row) in rows.iter().enumerate() {
-            let id = BlockId::from_index(index as u16);
-            flags.push(pack_flags(row.solid, row.render));
+        for row in rows {
+            flags.push(pack_flags(row.solid, row.replaceable, row.render));
             tints.push(row.tint);
-            for face in registry::BlockFace::ALL {
-                let layer = registry
-                    .texture_variants(id, face)
-                    .first()
-                    .copied()
-                    .unwrap_or_else(|| registry.missing_layer());
-                layers.push(layer);
-            }
+            // `BlockFlags.layers` is the first variant of each face, written at freeze.
+            layers.extend_from_slice(&row.layers);
         }
         let unknown = BlockId::from_index(u16::MAX);
         let placeholder = registry.flags(unknown);
-        let mut fallback_layers = [registry.missing_layer(); 6];
-        for face in registry::BlockFace::ALL {
-            fallback_layers[face.index()] = registry
-                .texture_variants(unknown, face)
-                .first()
-                .copied()
-                .unwrap_or(registry.missing_layer());
-        }
+        let fallback_layers = placeholder.layers;
         Self {
             flags,
             layers,
             tints,
-            fallback_flags: pack_flags(placeholder.solid, placeholder.render),
+            fallback_flags: pack_flags(
+                placeholder.solid,
+                placeholder.replaceable,
+                placeholder.render,
+            ),
             fallback_layers,
             fallback_tint: placeholder.tint,
         }
@@ -983,26 +969,32 @@ impl MeshLookup {
             .unwrap_or(self.fallback_tint)
     }
 
-    fn solid(&self, block: Block) -> bool {
-        self.flags_of(block) & 1 == 1
+    fn replaceable(&self, block: Block) -> bool {
+        self.flags_of(block) & FLAG_REPLACEABLE == FLAG_REPLACEABLE
     }
 }
 
 /// Fluid emits only into invisible cells (air). Cutout is culled as opaque
 /// until the cutout pipeline exists, so leaves keep today's solid faces.
-fn face_visible(tables: &MeshLookup, block: Block, neighbor: Block) -> bool {
-    let block_flags = tables.flags_of(block);
-    let neighbor_flags = tables.flags_of(neighbor);
+/// `flags` is one byte per halo cell. The inner loops do not index by block id.
+fn face_visible(flags: &[u8], cell: usize, neighbor: usize) -> bool {
+    let block_flags = flags[cell];
+    let neighbor_flags = flags[neighbor];
     match unpack_render(block_flags) {
         RenderClass::Invisible => false,
         RenderClass::Fluid => unpack_render(neighbor_flags) == RenderClass::Invisible,
-        RenderClass::Cutout | RenderClass::Opaque | RenderClass::Translucent => {
-            block_flags & 1 == 1 && neighbor_flags & 1 == 0
+        RenderClass::Cutout | RenderClass::Opaque => {
+            block_flags & FLAG_SOLID == FLAG_SOLID && neighbor_flags & FLAG_SOLID == 0
         }
     }
 }
 
+fn halo_flags(halo: &[Block], tables: &MeshLookup) -> Vec<u8> {
+    halo.iter().map(|block| tables.flags_of(*block)).collect()
+}
+
 fn mesh_halo(origin: [i32; 3], halo: &[Block], tables: &MeshLookup) -> Mesh {
+    let cell_flags = halo_flags(halo, tables);
     let mut mesh = Mesh::default();
     let side = CHUNK_SIZE as usize;
     let mut mask = vec![None; side * side];
@@ -1017,13 +1009,13 @@ fn mesh_halo(origin: [i32; 3], halo: &[Block], tables: &MeshLookup) -> Mesh {
                         p[axis] = slice;
                         p[u] = i;
                         p[v] = j;
-                        let block = halo[halo_index(p)];
                         let mut outside = p;
                         outside[axis] += sign;
-                        let neighbor = halo[halo_index(outside)];
-                        let visible = face_visible(tables, block, neighbor);
+                        let cell = halo_index(p);
+                        let visible = face_visible(&cell_flags, cell, halo_index(outside));
                         mask[i as usize + j as usize * side] = if visible {
-                            let ao = corner_ao(halo, tables, outside, u, v);
+                            let block = halo[cell];
+                            let ao = corner_ao(&cell_flags, outside, u, v);
                             let world = [origin[0] + p[0], origin[1] + p[1], origin[2] + p[2]];
                             Some(Face {
                                 block,
@@ -1089,13 +1081,7 @@ fn mesh_halo(origin: [i32; 3], halo: &[Block], tables: &MeshLookup) -> Mesh {
     mesh
 }
 
-fn corner_ao(
-    halo: &[Block],
-    tables: &MeshLookup,
-    outside: [i32; 3],
-    u: usize,
-    v: usize,
-) -> [u8; 4] {
+fn corner_ao(flags: &[u8], outside: [i32; 3], u: usize, v: usize) -> [u8; 4] {
     let mut ao = [3; 4];
     for (corner, (du, dv)) in [(-1, -1), (1, -1), (1, 1), (-1, 1)].into_iter().enumerate() {
         let mut side_u = outside;
@@ -1105,9 +1091,9 @@ fn corner_ao(
         side_v[v] += dv;
         diagonal[u] += du;
         diagonal[v] += dv;
-        let a = u8::from(tables.solid(halo[halo_index(side_u)]));
-        let b = u8::from(tables.solid(halo[halo_index(side_v)]));
-        let c = u8::from(tables.solid(halo[halo_index(diagonal)]));
+        let a = u8::from(flags[halo_index(side_u)] & FLAG_SOLID == FLAG_SOLID);
+        let b = u8::from(flags[halo_index(side_v)] & FLAG_SOLID == FLAG_SOLID);
+        let c = u8::from(flags[halo_index(diagonal)] & FLAG_SOLID == FLAG_SOLID);
         ao[corner] = if a == 1 && b == 1 { 0 } else { 3 - a - b - c };
     }
     ao
@@ -1552,15 +1538,28 @@ mod tests {
         // Sample the top of a voxel at [8,8,8], with two adjacent walls.
         halo[halo_index([7, 9, 8])] = STONE;
         halo[halo_index([8, 9, 7])] = STONE;
-        let ao = corner_ao(
-            &halo,
-            &MeshLookup::from_registry(registry::registry()),
-            [8, 9, 8],
-            0,
-            2,
-        );
+        let tables = MeshLookup::from_registry(registry::registry());
+        let ao = corner_ao(&halo_flags(&halo, &tables), [8, 9, 8], 0, 2);
         assert_eq!(ao[0], 0, "two occluding side cells close the corner");
         assert_eq!(ao[2], 3, "opposite open corner receives full ambient light");
+    }
+
+    #[test]
+    fn mesh_vertices_carry_the_block_tint() {
+        let mut tables = MeshLookup::from_registry(registry::registry());
+        let tint = [0.25, 0.5, 0.75, 1.0];
+        tables.tints[WATER.index()] = tint;
+        let mut halo = vec![AIR; HALO_VOLUME];
+        halo[halo_index([8, 8, 8])] = WATER;
+        let mesh = mesh_halo([0; 3], &halo, &tables);
+        assert!(
+            !mesh.vertices.is_empty(),
+            "water beside air must emit faces"
+        );
+        assert!(
+            mesh.vertices.iter().all(|vertex| vertex.tint == tint),
+            "each water vertex must carry the block tint"
+        );
     }
 
     #[test]

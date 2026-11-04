@@ -749,6 +749,19 @@ mod tests {
     }
 
     #[test]
+    fn terrain_shader_multiplies_albedo_by_the_vertex_tint() {
+        let shader = include_str!("shaders/world.wgsl");
+        let fragment = shader
+            .split_once("fn fs_terrain")
+            .expect("terrain fragment shader")
+            .1;
+        assert!(
+            fragment.contains("* input.tint.rgb"),
+            "the terrain fragment shader must multiply albedo by the vertex tint"
+        );
+    }
+
+    #[test]
     fn camera_uniform_and_textured_vertices_match_gpu_layout() {
         assert_eq!(std::mem::size_of::<CameraUniform>(), 272);
         assert_eq!(std::mem::offset_of!(CameraUniform, sky_horizon), 176);
