@@ -2890,6 +2890,8 @@ mod tests {
     fn an_ocean_chunk_keeps_water_out_of_the_opaque_and_cutout_ranges() {
         let world = World::new(728_491);
         let mesh = world.mesh_chunk((-8, 0, -8));
+        // Generator 2 was 1,485 opaque quads. Fifty-six basalt intrusions above
+        // the solid y=0 floor split stone merges. The 46 water quads do not move.
         assert_eq!(
             (
                 mesh.opaque_quads,
@@ -2897,7 +2899,7 @@ mod tests {
                 mesh.translucent_quads,
                 mesh.payload_bytes()
             ),
-            (1485, 0, 46, 12_248)
+            (1_488, 0, 46, 12_272)
         );
         assert_pass_ranges(&mesh);
     }

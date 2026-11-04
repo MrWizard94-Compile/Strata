@@ -81,6 +81,8 @@ Compared with the same generator and the previous face rule (a solid neighbor hi
 
 The extra 2,368 route bytes still fit in one 4 MiB callback. Upload milliseconds were not measured. Leaf holes are 208 of 1,024 texels. The 1-pixel leaf mip alpha is 203. Non-leaf mips stay opaque, including the sRGB black/white average of 188.
 
+Generator 3 keeps that face rule and changes the blocks under it. On seed 728491 the ocean chunk still has no leaves and 46 water quads. Fifty-six basalt intrusions above the solid y=0 floor split stone merges, so the live pin is 1,488 opaque quads and 12,272 bytes. The twelve-chunk route still has no water. Its unedited snow caps (5,088 blocks) cover grass and remove 56 leaf faces that now touch snow; crystal and basalt seams also change opaque merges. The seeded route is 13,416 quads (10,713 opaque, 2,703 cutout, 26,832 triangles, 107,328 bytes, digest `eea13108cbbc62ee`). The edited route is 13,462 quads (10,759 opaque, 2,703 cutout, 26,924 triangles, 107,696 bytes, digest `ce065bae1978a3cb`). Checkerboard and isolated-solid digests stay `9b90a6ba4714f004` and `41be41bea5c6c402`.
+
 `cargo fmt --check`, `cargo test --locked` (94 passed, 0 failed, 1 ignored) and `cargo clippy --locked --all-targets -- -D warnings` passed on this VM. The ignored GPU pipeline test was run here and failed immediately: no wgpu adapter (`supported_backends` Vulkan and GL, `active_backends` empty). Opaque, cutout, and water pipelines were not validated on a GPU. The 2026-10-20 Windows GPU pass and the lavapipe pass recorded for day/night do not cover this shader.
 
 ## Source and artifact verification
