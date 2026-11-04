@@ -1,0 +1,11 @@
+name_key = "block.strata.stone"
+display = "Limestone"
+solid = true
+placeable = true
+replaceable = false
+render = "opaque"
+swatch = [0.51, 0.54, 0.56, 1.0]
+tint = [1.0, 1.0, 1.0, 1.0]
+
+[textures]
+all = "strata:block/limestone"

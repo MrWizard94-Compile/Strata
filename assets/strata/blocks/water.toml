@@ -1,0 +1,11 @@
+name_key = "block.strata.water"
+display = "Water"
+solid = false
+placeable = false
+replaceable = false
+render = "fluid"
+swatch = [0.10, 0.44, 0.53, 0.72]
+tint = [1.0, 1.0, 1.0, 1.0]
+
+[textures]
+all = "strata:block/water"

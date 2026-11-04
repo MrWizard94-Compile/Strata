@@ -1,0 +1,11 @@
+name_key = "block.strata.snow"
+display = "Alpine snow"
+solid = true
+placeable = true
+replaceable = false
+render = "opaque"
+swatch = [0.87, 0.91, 0.91, 1.0]
+tint = [1.0, 1.0, 1.0, 1.0]
+
+[textures]
+all = "strata:block/snow"

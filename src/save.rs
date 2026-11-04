@@ -39,7 +39,7 @@ pub struct Snapshot {
     #[serde(default = "default_time_of_day")]
     time_of_day: f32,
     /// Placeable block ids, slot 0 first. Older saves omit this and use the default bar.
-    #[serde(default = "default_hotbar_ids")]
+    #[serde(default = "serde_default_hotbar_ids")]
     hotbar: [u8; HOTBAR_SLOTS],
     /// Selected hotbar index, `0..HOTBAR_SLOTS`. Older saves omit this and use slot 0.
     #[serde(default)]
@@ -50,8 +50,31 @@ fn default_time_of_day() -> f32 {
     daylight::MORNING
 }
 
-fn default_hotbar_ids() -> [u8; HOTBAR_SLOTS] {
-    interaction::default_hotbar().map(|block| block as u8)
+fn serde_default_hotbar_ids() -> [u8; HOTBAR_SLOTS] {
+    // serde's default hook cannot return `Result`. The builtin bar is schema 1.
+    default_hotbar_ids().expect("builtin hotbar fits schema 1")
+}
+
+fn default_hotbar_ids() -> Result<[u8; HOTBAR_SLOTS], String> {
+    // The default bar is eight schema-1 builtins. Their raw ids are 1, 3, 6, 7,
+    // 4, 9, 10 and 11. An id above 15 returns an error instead of truncating.
+    let bar = interaction::default_hotbar();
+    Ok([
+        schema1_hotbar_id(bar[0])?,
+        schema1_hotbar_id(bar[1])?,
+        schema1_hotbar_id(bar[2])?,
+        schema1_hotbar_id(bar[3])?,
+        schema1_hotbar_id(bar[4])?,
+        schema1_hotbar_id(bar[5])?,
+        schema1_hotbar_id(bar[6])?,
+        schema1_hotbar_id(bar[7])?,
+    ])
+}
+
+fn schema1_hotbar_id(block: Block) -> Result<u8, String> {
+    block
+        .legacy_u8()
+        .ok_or_else(|| format!("Schema 1 cannot store hotbar block {}.", block.raw()))
 }
 
 impl Snapshot {
@@ -230,7 +253,16 @@ impl SaveStore {
             player,
             edits: world.edits(),
             time_of_day,
-            hotbar: hotbar.map(|block| block as u8),
+            hotbar: [
+                schema1_hotbar_id(hotbar[0])?,
+                schema1_hotbar_id(hotbar[1])?,
+                schema1_hotbar_id(hotbar[2])?,
+                schema1_hotbar_id(hotbar[3])?,
+                schema1_hotbar_id(hotbar[4])?,
+                schema1_hotbar_id(hotbar[5])?,
+                schema1_hotbar_id(hotbar[6])?,
+                schema1_hotbar_id(hotbar[7])?,
+            ],
             selected_slot,
         };
         snapshot.validate()?;
@@ -274,6 +306,7 @@ impl SaveStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::world::{COAL_ORE, CRYSTAL, DIRT, GRASS, STONE, WATER};
     use std::sync::atomic::{AtomicUsize, Ordering};
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     fn directory() -> PathBuf {
@@ -309,7 +342,7 @@ mod tests {
         let (mut store, initial) = SaveStore::open(&path).unwrap();
         assert!(initial.is_none());
         let mut world = World::new(42);
-        world.set_block([-3, 90, 2], Block::Crystal);
+        world.set_block([-3, 90, 2], CRYSTAL);
         save_world(
             &mut store,
             &world,
@@ -323,10 +356,23 @@ mod tests {
         let loaded = loaded.unwrap();
         assert_eq!(loaded.seed, 42);
         assert_eq!(loaded.player.eye, player().eye);
-        assert_eq!(loaded.world().block_at(-3, 90, 2), Block::Crystal);
+        assert_eq!(loaded.world().block_at(-3, 90, 2), CRYSTAL);
         assert_eq!(loaded.hotbar(), interaction::default_hotbar());
         assert_eq!(loaded.selected_slot(), 0);
         assert_eq!(loaded.time_of_day(), daylight::MORNING);
+        fs::remove_dir_all(path).unwrap();
+    }
+    #[test]
+    fn schema1_save_rejects_a_hotbar_id_above_15() {
+        let path = directory();
+        let (mut store, _) = SaveStore::open(&path).unwrap();
+        let mut hotbar = interaction::default_hotbar();
+        hotbar[0] = crate::registry::MISSING;
+        let error = store
+            .save(&World::new(1), player(), daylight::MORNING, hotbar, 0)
+            .unwrap_err();
+        assert!(error.contains("Schema 1"), "{error}");
+        assert!(error.contains("16"), "{error}");
         fs::remove_dir_all(path).unwrap();
     }
     #[test]
@@ -342,7 +388,7 @@ mod tests {
             interaction::default_hotbar(),
             0,
         );
-        world.set_block([0, 110, 0], Block::Stone);
+        world.set_block([0, 110, 0], STONE);
         save_world(
             &mut store,
             &world,
@@ -378,7 +424,7 @@ mod tests {
             player: player(),
             edits: vec![],
             time_of_day: daylight::MORNING,
-            hotbar: default_hotbar_ids(),
+            hotbar: default_hotbar_ids().unwrap(),
             selected_slot: 0,
         };
         assert!(snapshot.validate().is_err());
@@ -410,10 +456,10 @@ mod tests {
         assert!(snapshot.validate().is_ok());
         snapshot.hotbar[0] = 255;
         assert!(snapshot.validate().is_err());
-        snapshot.hotbar = default_hotbar_ids();
-        snapshot.hotbar[0] = Block::Water as u8;
+        snapshot.hotbar = default_hotbar_ids().unwrap();
+        snapshot.hotbar[0] = WATER.legacy_u8().unwrap();
         assert!(snapshot.validate().is_err());
-        snapshot.hotbar = default_hotbar_ids();
+        snapshot.hotbar = default_hotbar_ids().unwrap();
         snapshot.selected_slot = HOTBAR_SLOTS as u8;
         assert!(snapshot.validate().is_err());
         snapshot.selected_slot = 0;
@@ -425,10 +471,10 @@ mod tests {
         let path = directory();
         let (mut store, _) = SaveStore::open(&path).unwrap();
         let mut world = World::new(11);
-        world.set_block([2, 40, -4], Block::Stone);
+        world.set_block([2, 40, -4], STONE);
         let mut slots = interaction::default_hotbar();
-        slots[2] = Block::Dirt;
-        slots[7] = Block::CoalOre;
+        slots[2] = DIRT;
+        slots[7] = COAL_ORE;
         save_world(&mut store, &world, player(), 0.75, slots, 6);
         drop(store);
         let (_, loaded) = SaveStore::open(&path).unwrap();
@@ -440,10 +486,10 @@ mod tests {
             daylight::TICKS_PER_DAY * 3 / 4
         );
         assert_eq!(loaded.selected_slot(), 6);
-        assert_eq!(loaded.hotbar()[2], Block::Dirt);
-        assert_eq!(loaded.hotbar()[7], Block::CoalOre);
+        assert_eq!(loaded.hotbar()[2], DIRT);
+        assert_eq!(loaded.hotbar()[7], COAL_ORE);
         assert_eq!(loaded.player.eye, player().eye);
-        assert_eq!(loaded.world().block_at(2, 40, -4), Block::Stone);
+        assert_eq!(loaded.world().block_at(2, 40, -4), STONE);
         let slot = path.join("world-b.json");
         let value: serde_json::Value = serde_json::from_slice(&fs::read(&slot).unwrap()).unwrap();
         assert_eq!(value["schema"], serde_json::json!(SCHEMA_VERSION));
@@ -456,7 +502,7 @@ mod tests {
         let path = directory();
         let (mut store, _) = SaveStore::open(&path).unwrap();
         let mut world = World::new(42);
-        world.set_block([4, 70, -2], Block::Dirt);
+        world.set_block([4, 70, -2], DIRT);
         let mut body = player();
         body.eye = [1.0, 80.0, 2.0];
         body.yaw = 0.2;
@@ -495,7 +541,7 @@ mod tests {
         assert_eq!(loaded.seed, 42);
         assert!(loaded.player.flying);
         assert_eq!(loaded.player.eye, body.eye);
-        assert_eq!(loaded.world().block_at(4, 70, -2), Block::Dirt);
+        assert_eq!(loaded.world().block_at(4, 70, -2), DIRT);
         fs::remove_dir_all(path).unwrap();
     }
 
@@ -614,7 +660,7 @@ mod tests {
         assert!(SaveStore::open(&path).is_err());
         assert_eq!(fs::read(&slot).unwrap(), unknown);
 
-        value["hotbar"][0] = serde_json::json!(Block::Grass as u8);
+        value["hotbar"][0] = serde_json::json!(GRASS.legacy_u8().unwrap());
         value["selected_slot"] = serde_json::json!(HOTBAR_SLOTS);
         let out_of_range = serde_json::to_vec_pretty(&value).unwrap();
         fs::write(&slot, &out_of_range).unwrap();
@@ -634,7 +680,7 @@ mod tests {
         assert!(SaveStore::open(&path).is_err());
         assert_eq!(fs::read(&slot).unwrap(), null_bar);
 
-        value["hotbar"] = serde_json::json!(default_hotbar_ids());
+        value["hotbar"] = serde_json::json!(default_hotbar_ids().unwrap());
         value["selected_slot"] = serde_json::Value::Null;
         let null_slot = serde_json::to_vec_pretty(&value).unwrap();
         fs::write(&slot, &null_slot).unwrap();

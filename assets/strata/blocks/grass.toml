@@ -1,0 +1,13 @@
+name_key = "block.strata.grass"
+display = "Meadow grass"
+solid = true
+placeable = true
+replaceable = false
+render = "opaque"
+swatch = [0.38, 0.58, 0.22, 1.0]
+tint = [1.0, 1.0, 1.0, 1.0]
+
+[textures]
+top = "strata:block/grass_top"
+side = "strata:block/grass_side"
+bottom = "strata:block/soil"

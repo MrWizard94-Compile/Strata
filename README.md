@@ -24,6 +24,8 @@ Or run `./run.ps1` from PowerShell. It builds `--target x86_64-pc-windows-msvc` 
 
 The client supports `--seed <u64>` for a new world and `--save-dir <path>` for a separate world. An existing world retains its stored seed. `--smoke-seconds <1..120>` launches the real native client and exits after the stated duration for graphics acceptance; this does not automate gameplay acceptance.
 
+Block definitions are embedded in the executable. That is the normal path. `--data-dir <data-root>` or the `STRATA_DATA_DIR` environment variable opts into a data folder, resolved as given. Blocks load from `<data-root>/assets/strata/blocks`. The client does not search the working directory for those files. The flag overrides the environment variable. An empty `STRATA_DATA_DIR` is ignored. Files that are not `.toml` are ignored. A startup failure, a bad command-line argument, and a panic are written to `strata-error.txt` beside the executable, because a Windows release build has no console. A panic record includes the message and the source location. A later successful start removes a stale `strata-error.txt`. A texture reference with no authored tile uses the missing checker. That warning is printed and written to `strata-registry-warnings.txt` beside the executable. The file is removed on the next start that has no warnings.
+
 One full day lasts 20 real minutes and advances only while playing. Pausing the game pauses the clock. The time is stored in the world save. A generator 3 file with no time opens at 08:00. Generator 1 and generator 2 worlds are rejected and left unchanged.
 
 | Control | Action |
@@ -60,7 +62,7 @@ Walking eases in and out instead of snapping to full speed. Sprint applies only 
 
 ## Materials and CPU benchmarks
 
-The renderer samples seventeen original **32×32** sRGB material tiles, including grass top/side/underside, timber endgrain, and coal, iron, gold and diamond ore. Tiles repeat per block across merged faces. Six mip levels filter distant surfaces. These are initial art assets, pending full in-world and director review.
+The renderer samples the original **32×32** sRGB material tiles, including grass top/side/underside, timber endgrain, and coal, iron, gold and diamond ore, plus a magenta/black checker for a missing block. Layer order follows the block registry. Tiles repeat per block across merged faces. Six mip levels filter distant surfaces. These are initial art assets, pending full in-world and director review.
 
 `--export-materials <new-directory>` exports the exact runtime tiles as individual PNGs, a contact sheet and a manifest. The directory must not already exist and its parent must exist. Exported edits are not yet hot-reloaded into the game.
 

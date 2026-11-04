@@ -6,6 +6,7 @@ mod interaction;
 mod material_export;
 mod materials;
 mod player;
+mod registry;
 mod renderer;
 mod save;
 mod streaming;
@@ -44,6 +45,8 @@ const PANEL: Color32 = Color32::from_rgba_premultiplied(12, 24, 28, 236);
 struct Options {
     seed: u64,
     save_dir: PathBuf,
+    /// Data root, used as given. Blocks load from `{data_dir}/assets/strata/blocks`.
+    data_dir: Option<PathBuf>,
     smoke_seconds: Option<f32>,
     benchmark_cpu: Option<PathBuf>,
     export_materials: Option<PathBuf>,
@@ -51,15 +54,20 @@ struct Options {
 }
 impl Options {
     fn parse() -> Result<Self, String> {
+        Self::parse_args(std::env::args())
+    }
+
+    fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Self, String> {
         let mut result = Self {
             seed: 728_491,
             save_dir: PathBuf::from("saves/emerald-reach"),
+            data_dir: None,
             smoke_seconds: None,
             benchmark_cpu: None,
             export_materials: None,
             trace_streaming: None,
         };
-        let mut args = std::env::args().skip(1);
+        let mut args = args.into_iter().skip(1);
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--seed" => {
@@ -71,6 +79,10 @@ impl Options {
                 }
                 "--save-dir" => {
                     result.save_dir = PathBuf::from(args.next().ok_or("--save-dir needs a path")?)
+                }
+                "--data-dir" => {
+                    result.data_dir =
+                        Some(PathBuf::from(args.next().ok_or("--data-dir needs a path")?))
                 }
                 "--benchmark-cpu" => {
                     result.benchmark_cpu = Some(PathBuf::from(
@@ -103,7 +115,7 @@ impl Options {
                 }
                 "--help" | "-h" => {
                     return Err(
-                        "STRATA: --seed <u64> --save-dir <directory> --smoke-seconds <1..120> --trace-streaming <new-trace.jsonl>\nCPU-only benchmark: --benchmark-cpu <new-report.json> (fixed dataset, no window or saves)\nMaterial PNG export: --export-materials <new-directory>"
+                        "STRATA: --seed <u64> --save-dir <directory> --data-dir <data-root> --smoke-seconds <1..120> --trace-streaming <new-trace.jsonl>\n--data-dir is optional. It is the data root, used as given, and overrides STRATA_DATA_DIR. Blocks load from <data-root>/assets/strata/blocks. Without it, the embedded registry is used. The working directory is not searched.\nCPU-only benchmark: --benchmark-cpu <new-report.json> (fixed dataset, no window or saves)\nMaterial PNG export: --export-materials <new-directory>"
                             .into(),
                     );
                 }
@@ -1260,22 +1272,98 @@ fn arrow_look_delta(keys: &HashSet<KeyCode>, screen: Screen) -> (f32, f32) {
     )
 }
 
+/// Prefix of `strata-error.txt`. Callers format the body with [`startup_failure_text`].
+pub(crate) const STRATA_START_FAILED: &str = "STRATA_START_FAILED";
+
+pub(crate) fn startup_failure_text(error: &str) -> String {
+    format!("{STRATA_START_FAILED} {error}\n")
+}
+
+/// File body for a panic: the message and the source location.
+pub(crate) fn format_panic_record(message: &str, file: &str, line: u32, column: u32) -> String {
+    startup_failure_text(&panic_location_error(message, file, line, column))
+}
+
+fn panic_location_error(message: &str, file: &str, line: u32, column: u32) -> String {
+    format!("panic at {file}:{line}:{column}: {message}")
+}
+
+fn executable_directory() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
 /// Writes `STRATA_START_FAILED` beside the executable. A Windows GUI-subsystem
 /// build has no console, so this file is the message the player can open.
+fn record_startup_text(directory: &std::path::Path, text: &str) -> std::io::Result<()> {
+    std::fs::write(directory.join("strata-error.txt"), text)
+}
+
 fn record_startup_failure(directory: &std::path::Path, error: &str) -> std::io::Result<()> {
-    std::fs::write(
-        directory.join("strata-error.txt"),
-        format!("STRATA_START_FAILED {error}\n"),
-    )
+    record_startup_text(directory, &startup_failure_text(error))
+}
+
+fn clear_startup_error(directory: &std::path::Path) {
+    let path = directory.join("strata-error.txt");
+    if path.is_file() {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+fn install_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let message = info.payload_as_str().unwrap_or("box of unknown type");
+        let text = match info.location() {
+            Some(location) => {
+                format_panic_record(message, location.file(), location.line(), location.column())
+            }
+            None => startup_failure_text(&format!("panic: {message}")),
+        };
+        eprintln!("{}", text.trim_end());
+        if let Err(write_error) = record_startup_text(&executable_directory(), &text) {
+            eprintln!("STRATA_START_FAILED could not write strata-error.txt: {write_error}");
+        }
+        previous(info);
+    }));
+}
+
+/// Prints data-directory use and writes texture warnings beside the executable.
+/// A Windows release build has no console, so the file is the copy a player can open.
+/// An empty warning list removes a file left by an earlier run.
+fn note_registry_load(registry: &registry::Registry) {
+    if registry.loaded_from_disk() {
+        eprintln!("STRATA_REGISTRY: loaded blocks from the data directory");
+    }
+    let directory = executable_directory();
+    clear_startup_error(&directory);
+    let path = directory.join("strata-registry-warnings.txt");
+    let warnings = registry.load_warnings();
+    if warnings.is_empty() {
+        if path.exists() {
+            let _ = std::fs::remove_file(path);
+        }
+        return;
+    }
+    let mut body = String::new();
+    for warning in warnings {
+        body.push_str("STRATA_REGISTRY_WARN ");
+        body.push_str(warning);
+        body.push('\n');
+    }
+    if let Err(error) = std::fs::write(&path, body) {
+        eprintln!(
+            "STRATA_REGISTRY_WARN could not write {}: {error}",
+            path.display()
+        );
+    }
 }
 
 fn report_startup_failure(error: &str) {
-    eprintln!("STRATA_START_FAILED {error}");
-    let directory = std::env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
-        .unwrap_or_else(|| PathBuf::from("."));
-    if let Err(write_error) = record_startup_failure(&directory, error) {
+    eprintln!("{}", startup_failure_text(error).trim_end());
+    if let Err(write_error) = record_startup_failure(&executable_directory(), error) {
         eprintln!("STRATA_START_FAILED could not write strata-error.txt: {write_error}");
     }
 }
@@ -1301,13 +1389,27 @@ fn apply_debug_hour_skip(
 }
 
 fn main() {
+    install_panic_hook();
     let options = match Options::parse() {
         Ok(o) => o,
         Err(e) => {
-            eprintln!("{e}");
+            report_startup_failure(&e);
             std::process::exit(2);
         }
     };
+    let installed = if options.data_dir.is_some() {
+        registry::install_from(options.data_dir.as_deref())
+    } else {
+        registry::install()
+    };
+    let registry = match installed {
+        Ok(registry) => registry,
+        Err(error) => {
+            report_startup_failure(&error);
+            std::process::exit(1);
+        }
+    };
+    note_registry_load(&registry);
     if let Some(output) = &options.benchmark_cpu {
         match benchmark::run_cpu_benchmark(output) {
             Ok(()) => println!("STRATA_CPU_BENCHMARK report={}", output.display()),
@@ -1512,8 +1614,58 @@ mod tests {
         let text = std::fs::read_to_string(dir.join("strata-error.txt")).unwrap();
         assert_eq!(
             text,
-            "STRATA_START_FAILED no Vulkan or DirectX 12 adapter\n"
+            startup_failure_text("no Vulkan or DirectX 12 adapter")
         );
+        assert!(text.starts_with(STRATA_START_FAILED));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn panic_hook_record_names_the_message_and_the_location() {
+        assert_eq!(
+            format_panic_record("grass top drifted", "src/world.rs", 259, 9),
+            "STRATA_START_FAILED panic at src/world.rs:259:9: grass top drifted\n"
+        );
+    }
+
+    #[test]
+    fn missing_data_dir_argument_is_written_as_a_startup_failure() {
+        let error = match Options::parse_args(["strata".to_string(), "--data-dir".to_string()]) {
+            Ok(_) => panic!("--data-dir without a path must fail"),
+            Err(error) => error,
+        };
+        assert!(error.contains("--data-dir"));
+        let dir = std::env::temp_dir().join(format!(
+            "strata-cli-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        record_startup_failure(&dir, &error).unwrap();
+        let text = std::fs::read_to_string(dir.join("strata-error.txt")).unwrap();
+        assert_eq!(text, startup_failure_text(&error));
+        assert!(text.contains("--data-dir needs a path"), "{text}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_good_start_removes_a_stale_startup_error() {
+        let dir = std::env::temp_dir().join(format!(
+            "strata-clear-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("strata-error.txt");
+        std::fs::write(&path, "STRATA_START_FAILED stale\n").unwrap();
+        clear_startup_error(&dir);
+        assert!(!path.exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

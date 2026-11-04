@@ -1,26 +1,20 @@
 //! Exports the exact runtime material bytes for artist review and asset handoff.
 use crate::materials;
+use crate::registry;
 use std::{fs, io::BufWriter, path::Path};
 
-const NAMES: [&str; 17] = [
-    "grass-top",
-    "grass-side",
-    "soil",
-    "limestone",
-    "sand",
-    "water",
-    "wood-bark",
-    "wood-endgrain",
-    "leaves",
-    "snow",
-    "clay",
-    "crystal",
-    "basalt",
-    "coal-ore",
-    "iron-ore",
-    "gold-ore",
-    "diamond-ore",
-];
+/// File stem for one texture id, in registry layer order.
+///
+/// The namespace stays in the name. `:` and `/` both become `-`, so
+/// `strata:block/grass_top` is `strata-block-grass_top` and the export never
+/// creates a directory for a path segment. Windows file names cannot contain `:`.
+fn layer_names() -> Vec<String> {
+    registry::registry()
+        .textures_sorted()
+        .iter()
+        .map(|id| id.replace([':', '/'], "-"))
+        .collect()
+}
 
 pub fn export_materials(directory: &Path) -> Result<(), String> {
     // A fresh directory makes repeated exports explicit and protects artist edits.
@@ -30,13 +24,14 @@ pub fn export_materials(directory: &Path) -> Result<(), String> {
             directory.display()
         )
     })?;
+    let names = layer_names();
     let pixels = materials::rgba_layers();
     let side = materials::TILE_SIZE as usize;
     let stride = side * side * 4;
-    if NAMES.len() != materials::LAYER_COUNT as usize {
+    if names.len() != materials::layer_count() as usize {
         return Err("Material export names do not match the runtime layer count".into());
     }
-    for (layer, name) in NAMES.iter().enumerate() {
+    for (layer, name) in names.iter().enumerate() {
         write_png(
             &directory.join(format!("{layer:02}-{name}.png")),
             side as u32,
@@ -48,7 +43,7 @@ pub fn export_materials(directory: &Path) -> Result<(), String> {
     let scale = 6;
     let gap = 16;
     let columns = 4;
-    let rows = NAMES.len().div_ceil(columns);
+    let rows = names.len().div_ceil(columns);
     let cell = side * scale + gap;
     let width = columns * cell + gap;
     let height = rows * cell + gap;
@@ -56,7 +51,7 @@ pub fn export_materials(directory: &Path) -> Result<(), String> {
     for pixel in sheet.chunks_exact_mut(4) {
         pixel.copy_from_slice(&[18, 28, 31, 255]);
     }
-    for layer in 0..NAMES.len() {
+    for layer in 0..names.len() {
         for y in 0..side * scale {
             for x in 0..side * scale {
                 let source = layer * stride + ((y / scale) * side + x / scale) * 4;
@@ -78,7 +73,7 @@ pub fn export_materials(directory: &Path) -> Result<(), String> {
         "color_space": "sRGB RGBA8",
         "provenance": "Original deterministic STRATA material algorithms in src/materials.rs; no external source assets",
         "contact_sheet": "four columns, row-major layer order; 6x nearest-neighbour preview",
-        "layers": NAMES,
+        "layers": names,
         "usage": "Exports exact runtime bytes; editing these files does not yet hot-reload the engine."
     });
     fs::write(
@@ -127,9 +122,10 @@ mod tests {
                 .as_nanos(),
         ));
         export_materials(&path).unwrap();
+        let names = layer_names();
         let runtime = materials::rgba_layers();
         let stride = (materials::TILE_SIZE * materials::TILE_SIZE * 4) as usize;
-        for (layer, name) in NAMES.iter().enumerate() {
+        for (layer, name) in names.iter().enumerate() {
             let file = fs::File::open(path.join(format!("{layer:02}-{name}.png"))).unwrap();
             let mut decoder = png::Decoder::new(BufReader::new(file)).read_info().unwrap();
             let mut decoded = vec![0; decoder.output_buffer_size().unwrap()];
@@ -142,7 +138,7 @@ mod tests {
             );
         }
         assert!(export_materials(&path).is_err());
-        assert_eq!(fs::read_dir(&path).unwrap().count(), NAMES.len() + 2);
+        assert_eq!(fs::read_dir(&path).unwrap().count(), names.len() + 2);
         for entry in fs::read_dir(&path).unwrap() {
             fs::remove_file(entry.unwrap().path()).unwrap();
         }

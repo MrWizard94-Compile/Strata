@@ -12,8 +12,13 @@ use crate::{
 };
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
-const VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 4] =
-    wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4, 3 => Uint32];
+const VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![
+    0 => Float32x3,
+    1 => Float32x3,
+    2 => Float32x4,
+    3 => Uint32,
+    4 => Float32x4
+];
 
 pub enum PresentOutcome {
     Presented,
@@ -468,7 +473,7 @@ fn create_material_texture(
         size: wgpu::Extent3d {
             width: materials::TILE_SIZE,
             height: materials::TILE_SIZE,
-            depth_or_array_layers: materials::LAYER_COUNT,
+            depth_or_array_layers: materials::layer_count(),
         },
         mip_level_count: mips.len() as u32,
         sample_count: 1,
@@ -495,7 +500,7 @@ fn create_material_texture(
             wgpu::Extent3d {
                 width: side,
                 height: side,
-                depth_or_array_layers: materials::LAYER_COUNT,
+                depth_or_array_layers: materials::layer_count(),
             },
         );
     }
@@ -744,6 +749,19 @@ mod tests {
     }
 
     #[test]
+    fn terrain_shader_multiplies_albedo_by_the_vertex_tint() {
+        let shader = include_str!("shaders/world.wgsl");
+        let fragment = shader
+            .split_once("fn fs_terrain")
+            .expect("terrain fragment shader")
+            .1;
+        assert!(
+            fragment.contains("* input.tint.rgb"),
+            "the terrain fragment shader must multiply albedo by the vertex tint"
+        );
+    }
+
+    #[test]
     fn camera_uniform_and_textured_vertices_match_gpu_layout() {
         assert_eq!(std::mem::size_of::<CameraUniform>(), 272);
         assert_eq!(std::mem::offset_of!(CameraUniform, sky_horizon), 176);
@@ -752,12 +770,15 @@ mod tests {
         assert_eq!(std::mem::offset_of!(CameraUniform, ambient_ground), 224);
         assert_eq!(std::mem::offset_of!(CameraUniform, ambient_sky), 240);
         assert_eq!(std::mem::offset_of!(CameraUniform, sun_color), 256);
-        assert_eq!(std::mem::size_of::<Vertex>(), 44);
+        assert_eq!(std::mem::size_of::<Vertex>(), 60);
         assert_eq!(std::mem::offset_of!(Vertex, normal), 12);
         assert_eq!(std::mem::offset_of!(Vertex, color), 24);
         assert_eq!(std::mem::offset_of!(Vertex, texture_layer), 40);
+        assert_eq!(std::mem::offset_of!(Vertex, tint), 44);
         assert_eq!(VERTEX_ATTRIBUTES[3].offset, 40);
         assert_eq!(VERTEX_ATTRIBUTES[3].format, wgpu::VertexFormat::Uint32);
+        assert_eq!(VERTEX_ATTRIBUTES[4].offset, 44);
+        assert_eq!(VERTEX_ATTRIBUTES[4].format, wgpu::VertexFormat::Float32x4);
     }
 
     #[test]

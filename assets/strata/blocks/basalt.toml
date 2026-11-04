@@ -1,0 +1,11 @@
+name_key = "block.strata.basalt"
+display = "Basalt"
+solid = true
+placeable = true
+replaceable = false
+render = "opaque"
+swatch = [0.24, 0.28, 0.31, 1.0]
+tint = [1.0, 1.0, 1.0, 1.0]
+
+[textures]
+all = "strata:block/basalt"

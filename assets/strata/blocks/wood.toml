@@ -1,0 +1,13 @@
+name_key = "block.strata.wood"
+display = "Timber"
+solid = true
+placeable = true
+replaceable = false
+render = "opaque"
+swatch = [0.38, 0.24, 0.14, 1.0]
+tint = [1.0, 1.0, 1.0, 1.0]
+
+[textures]
+top = "strata:block/endgrain"
+side = "strata:block/bark"
+bottom = "strata:block/endgrain"

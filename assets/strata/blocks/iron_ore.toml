@@ -1,0 +1,11 @@
+name_key = "block.strata.iron_ore"
+display = "Iron ore"
+solid = true
+placeable = true
+replaceable = false
+render = "opaque"
+swatch = [0.66, 0.48, 0.40, 1.0]
+tint = [1.0, 1.0, 1.0, 1.0]
+
+[textures]
+all = "strata:block/iron_ore"
