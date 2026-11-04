@@ -132,6 +132,14 @@ impl BlockId {
     }
 
     pub fn is_placeable(self) -> bool {
+        // Ids past the frozen registry are world-local placeholders for a mod
+        // block named in a save. Those stay placeable so the player can put
+        // the block back. `strata:missing` is a builtin and stays unplaceable.
+        // `Registry::flags` still reports the template as unplaceable; the
+        // mesher uses that template for solid, texture, and tint.
+        if self.index() >= registry().builtin_count() {
+            return true;
+        }
         registry().flags(self).placeable
     }
 

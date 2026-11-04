@@ -82,6 +82,8 @@ The game stores the world in a folder named `saves/emerald-reach`, inside the fo
 
 A backup should keep both `world-a.json` and `world-b.json`. Do not delete them while the game is open. Opening the same world a second time is refused until the first game closes.
 
+Opening an old world in this version upgrades it the first time the world is saved, including the automatic save about every 30 seconds. Older versions of Strata cannot open the upgraded world. The original file is kept once as `world.v1.bak` in that world folder. To play the original in an older version, close Strata, delete `world-a.json` and `world-b.json`, copy `world.v1.bak` to `world-a.json`, and leave `world.v1.bak` where it is.
+
 This download does not write a log file. The `logs` folder exists only when someone builds from source and starts the game with `run.ps1`.
 
 ## If something goes wrong

@@ -190,8 +190,8 @@ impl Game {
         let (world, player, hotbar, day, has_save) = match loaded {
             Some(snapshot) => {
                 let day = DayClock::from_fraction(snapshot.time_of_day())?;
-                let hotbar = Hotbar::from_saved(snapshot.hotbar(), snapshot.selected_slot());
-                let world = snapshot.world();
+                let (world, hotbar_blocks) = snapshot.materialize()?;
+                let hotbar = Hotbar::from_saved(hotbar_blocks, snapshot.selected_slot());
                 (world, Player::restore(snapshot.player), hotbar, day, true)
             }
             None => {
@@ -415,7 +415,7 @@ impl Game {
                 println!(
                     "STRATA_EDIT action={} position={position:?} material={}",
                     if place { "place" } else { "break" },
-                    block.name()
+                    self.world.display_name(block)
                 );
             }
         }
@@ -829,7 +829,7 @@ impl Game {
             painter.text(
                 Pos2::new(bounds.center().x, bounds.bottom() - 101.0),
                 Align2::CENTER_BOTTOM,
-                self.hotbar.selected_block().name(),
+                self.world.display_name(self.hotbar.selected_block()),
                 FontId::proportional(14.0),
                 IVORY,
             );
@@ -941,7 +941,8 @@ impl Game {
                             RichText::new(format!(
                                 "Slot {}  ·  {}",
                                 self.hotbar.selected() + 1,
-                                self.hotbar.selected_block().name()
+                                self.world
+                                    .display_name(self.hotbar.selected_block())
                             ))
                             .size(18.0)
                             .strong(),

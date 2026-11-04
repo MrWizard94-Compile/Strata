@@ -79,6 +79,11 @@ pub struct World {
     /// Parallel to [`ORE_RULES`], in the same order, copied from [`Self::worldgen`].
     ore_ids: [BlockId; 4],
     registry: Arc<registry::Registry>,
+    /// Loaded name-to-number table. Saves append names; they do not reorder it.
+    palette: Vec<String>,
+    /// Original ids for blocks the frozen registry does not know.
+    placeholders: Vec<String>,
+    placeholder_ids: HashMap<String, BlockId>,
     /// Per-id solid, replaceable, render class, layer, and tint. Built once.
     /// Each mesh copies the flag byte onto the halo and the inner loops read that.
     mesh_lookup: MeshLookup,
@@ -206,6 +211,28 @@ const ORE_RULES: [OreRule; 4] = [
     },
 ];
 
+/// Shown when a palette cannot be stored in the `u16` block table.
+pub(crate) const PALETTE_TOO_LARGE: &str =
+    "World palette has more blocks than this version can store. File preserved.";
+
+/// One saved edit: a block position and its index into the saved palette.
+pub(crate) type PaletteEdit = ([i32; 3], u16);
+
+/// The palette written by a schema-2 save, and the edits that index it.
+pub(crate) type SavedPalette = (Vec<String>, Vec<PaletteEdit>);
+
+/// Schema 1 numbers, in registry order. `strata:missing` is not part of a migrated palette.
+/// This is the only schema-1 name table. Saves read it from here.
+pub(crate) fn legacy_palette() -> Vec<String> {
+    (0..16_u8)
+        .map(|id| {
+            registry::registry()
+                .name(BlockId::from_id(id).expect("0..=15 are builtins"))
+                .to_string()
+        })
+        .collect()
+}
+
 impl World {
     pub fn new(seed: u64) -> Self {
         let registry = registry::registry_handle();
@@ -222,6 +249,9 @@ impl World {
             ],
             worldgen,
             registry,
+            palette: legacy_palette(),
+            placeholders: Vec::new(),
+            placeholder_ids: HashMap::new(),
             mesh_lookup,
         }
         .checked()
@@ -291,21 +321,88 @@ impl World {
         }
     }
 
-    pub fn edits(&self) -> Vec<([i32; 3], u8)> {
-        let mut edits: Vec<_> = self
-            .edits
+    pub fn edits(&self) -> Vec<PaletteEdit> {
+        match self.saved_palette_and_edits() {
+            Ok((_, edits)) => edits,
+            Err(error) => panic!("cannot list edits: {error}"),
+        }
+    }
+
+    /// Palette for the next schema 2 save, then edits as indexes into it.
+    /// The stored palette is not reordered. Names that are not in it yet are appended.
+    pub fn saved_palette_and_edits(&self) -> Result<SavedPalette, String> {
+        let mut palette = self.palette.clone();
+        let mut index_of: HashMap<String, u16> = palette
             .iter()
-            .map(|(&position, &block)| {
-                (
-                    position,
-                    block
-                        .legacy_u8()
-                        .expect("schema 1 edits only store builtin ids 0..=15"),
-                )
-            })
+            .enumerate()
+            .map(|(index, name)| (name.clone(), index as u16))
             .collect();
+        let mut edits = Vec::with_capacity(self.edits.len());
+        for (&position, &block) in &self.edits {
+            let name = self.block_key(block).to_string();
+            let index = if let Some(index) = index_of.get(&name) {
+                *index
+            } else {
+                let index =
+                    u16::try_from(palette.len()).map_err(|_| PALETTE_TOO_LARGE.to_string())?;
+                palette.push(name.clone());
+                index_of.insert(name, index);
+                index
+            };
+            edits.push((position, index));
+        }
         edits.sort_unstable_by_key(|&(position, _)| position);
-        edits
+        Ok((palette, edits))
+    }
+
+    /// English label for a builtin, or the original id string for a placeholder.
+    pub fn display_name(&self, id: Block) -> &str {
+        self.placeholder_name(id)
+            .unwrap_or_else(|| self.registry.display(id))
+    }
+
+    /// Namespaced id for a block, including a placeholder's original string.
+    pub fn block_key(&self, id: Block) -> &str {
+        self.placeholder_name(id)
+            .unwrap_or_else(|| self.registry.name(id))
+    }
+
+    /// Replace the save palette and allocate placeholders for unknown names.
+    /// `names` must already be valid and free of duplicates.
+    pub fn install_palette(&mut self, names: Vec<String>) -> Result<Vec<Block>, String> {
+        let mut ids = Vec::with_capacity(names.len());
+        for name in &names {
+            ids.push(self.intern_block(name)?);
+        }
+        self.palette = names;
+        Ok(ids)
+    }
+
+    pub fn intern_block(&mut self, name: &str) -> Result<Block, String> {
+        if let Some(id) = self.registry.get(name) {
+            return Ok(id);
+        }
+        if let Some(id) = self.placeholder_ids.get(name) {
+            return Ok(*id);
+        }
+        if !registry::is_block_id(name) {
+            return Err(format!("{name}: block id does not match the id regex"));
+        }
+        let index = self
+            .registry
+            .builtin_count()
+            .checked_add(self.placeholders.len())
+            .filter(|index| *index < 65_535)
+            .ok_or_else(|| "block registry refuses the 65536th block".to_string())?;
+        let id = BlockId::from_index(u16::try_from(index).expect("index fits u16"));
+        self.placeholders.push(name.to_string());
+        self.placeholder_ids.insert(name.to_string(), id);
+        Ok(id)
+    }
+
+    fn placeholder_name(&self, id: Block) -> Option<&str> {
+        let index = id.index().checked_sub(self.registry.builtin_count())?;
+        self.placeholders.get(index).map(String::as_str)
     }
 
     /// Highest base-terrain cell, excluding caves, trees, and player edits.
@@ -1506,6 +1603,16 @@ mod tests {
         assert_eq!(snapshot.edits().len(), 3);
         assert_eq!(world.edits()[0].0, [-1, 150, 32]);
         assert_eq!(world.edits()[1].0, [0, 150, 0]);
+    }
+
+    #[test]
+    fn a_palette_that_does_not_fit_in_u16_returns_an_error() {
+        let mut world = World::new(1);
+        world.palette = (0..65_536).map(|index| format!("m:b{index:05}")).collect();
+        world.palette[0] = "strata:air".to_string();
+        world.set_block([0, 80, 0], STONE);
+        let error = world.saved_palette_and_edits().unwrap_err();
+        assert_eq!(error, PALETTE_TOO_LARGE);
     }
 
     #[test]
