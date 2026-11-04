@@ -93,6 +93,7 @@ struct TerrainVertex {
     @location(1) normal: vec3<f32>,
     @location(2) color: vec4<f32>,
     @location(3) texture_layer: u32,
+    @location(4) tint: vec4<f32>,
 };
 
 struct TerrainFragment {
@@ -101,6 +102,7 @@ struct TerrainFragment {
     @location(1) normal: vec3<f32>,
     @location(2) color: vec4<f32>,
     @location(3) @interpolate(flat) texture_layer: u32,
+    @location(4) @interpolate(flat) tint: vec4<f32>,
 };
 
 @vertex
@@ -111,6 +113,7 @@ fn vs_terrain(input: TerrainVertex) -> TerrainFragment {
     out.normal = input.normal;
     out.color = input.color;
     out.texture_layer = input.texture_layer;
+    out.tint = input.tint;
     return out;
 }
 
@@ -128,7 +131,8 @@ fn fs_terrain(input: TerrainFragment) -> @location(0) vec4<f32> {
         uv = vec2<f32>(input.world.x, -input.world.y);
     }
     let albedo = textureSample(material_tiles, material_sampler, uv, i32(input.texture_layer)).rgb
-        * input.color.rgb;
+        * input.color.rgb
+        * input.tint.rgb;
     var color: vec3<f32>;
 
     if input.color.a < 0.99 {

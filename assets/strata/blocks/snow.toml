@@ -4,7 +4,8 @@ solid = true
 placeable = true
 replaceable = false
 render = "opaque"
-tint = [0.87, 0.91, 0.91, 1.0]
+swatch = [0.87, 0.91, 0.91, 1.0]
+tint = [1.0, 1.0, 1.0, 1.0]
 
 [textures]
-all = "strata:snow"
+all = "strata:block/snow"

@@ -4,7 +4,8 @@ solid = true
 placeable = true
 replaceable = false
 render = "opaque"
-tint = [0.66, 0.34, 0.22, 1.0]
+swatch = [0.66, 0.34, 0.22, 1.0]
+tint = [1.0, 1.0, 1.0, 1.0]
 
 [textures]
-all = "strata:clay"
+all = "strata:block/clay"

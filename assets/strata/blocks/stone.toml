@@ -4,7 +4,8 @@ solid = true
 placeable = true
 replaceable = false
 render = "opaque"
-tint = [0.51, 0.54, 0.56, 1.0]
+swatch = [0.51, 0.54, 0.56, 1.0]
+tint = [1.0, 1.0, 1.0, 1.0]
 
 [textures]
-all = "strata:limestone"
+all = "strata:block/limestone"

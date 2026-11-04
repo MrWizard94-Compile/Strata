@@ -19,7 +19,7 @@ The empty chunk still costs about 1.94 ms because the production path samples/ge
 
 Machine: i7-9700, 8 cores/8 logical, 51,409,334,272 RAM bytes, Windows 11 Home 10.0.26300, High performance power plan. GPU is GTX 1660 Ti / driver 32.0.16.1742, but this command does not create a GPU device. Background apps were not isolated; no CPU affinity, thermal normalization or memory-peak capture.
 
-Exact release SHA256: `8987752CF362DBC4CB780B6DDC31AD8D78C54DCCE60ADC632E009E9B971DA8AB`. Reports were taken before the initial Git source commit; sidecars disclose the uncommitted tree and SHA256 every source input instead of pretending a commit identified it. Root built and checked the source immediately before these `-SkipBuild` runs. PNG export and texturing were integrated in this measured build; each vertex is 44 bytes, including its texture layer.
+Exact release SHA256: `8987752CF362DBC4CB780B6DDC31AD8D78C54DCCE60ADC632E009E9B971DA8AB`. Reports were taken before the initial Git source commit; sidecars disclose the uncommitted tree and SHA256 every source input instead of pretending a commit identified it. Root built and checked the source immediately before these `-SkipBuild` runs. PNG export and texturing were integrated in this measured build; each vertex in that build is 44 bytes, including its texture layer. That size is historical. The current terrain vertex is 60 bytes: the same fields plus a linear tint.
 
 This is partial evidence for S2.P1/R01 and PITCH-07. GPU times, frame-time traces during movement/edits, upload/queue latency, peak RAM/VRAM, cold startup distributions, long sessions and equivalent competing-engine comparisons remain open. No full-game performance target is claimed as passed.
 

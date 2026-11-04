@@ -4,31 +4,69 @@
 
 ## Block registry and save schema 2
 
-Builtin blocks load from `assets/strata/blocks/*.toml` through the only TOML parser, in `src/registry.rs`. Runtime ids are `u16`. Ids 0 through 15 match the old schema-1 numbers. `strata:missing` is 16. Worldgen resolves names once in `World::new`. The mesher treats fluid by `RenderClass`, and still culls cutout blocks like opaque ones. Generator version stays 3. The seven golden chunk digests are unchanged.
+Builtin blocks load from `assets/strata/blocks/*.toml` through the only TOML parser, in `src/registry.rs`. The embedded copies are the normal path. `--data-dir <data-root>` or `STRATA_DATA_DIR` opts into that folder, used as given; the working directory is not searched. Non-`.toml` files are ignored and CRLF is accepted. A bad file fails startup, writes `strata-error.txt` beside the executable, and names the file and the key. Grass whose top is not `strata:block/grass_top`, water whose tint is not white, stone whose north texture rotation is not `none`, and air whose name key is not `block.strata.air` are load errors of that kind. A bad command-line argument writes the same file. A panic writes it with the message and the source location. A successful start removes a stale `strata-error.txt`. An empty `STRATA_DATA_DIR` is ignored. A block file over 64 KiB is rejected from its length before the parser reads past that limit. Runtime ids are `u16`. Ids 0 through 15 match the old schema-1 numbers. `strata:missing` is 16. Those order checks run in release builds. Worldgen resolves names once in `World::new`. The mesher treats fluid by `RenderClass`, and still culls cutout blocks like opaque ones. `render = "translucent"` is rejected. Generator version stays 3. The seven golden chunk digests are unchanged.
 
-New saves are schema 2. Each world stores a palette of namespaced ids, and edits store indexes into that palette. Schema 1 loads in memory: the old numbers map onto the builtin names, and `open` does not rewrite the file. An unknown palette or hotbar name becomes a solid placeholder that keeps the original string and is written back. It does not become air or `strata:missing`. Schema 1 ids outside `0..=15` are still rejected.
+New saves are schema 2. Each world stores a palette of namespaced ids, and edits store indexes into that palette. Schema 1 loads in memory: the old numbers map onto the builtin names, and `open` does not rewrite the file. An unknown palette or hotbar name becomes a solid placeholder that keeps the original string and is written back. It does not become air or `strata:missing`. Schema 1 ids outside `0..=15` are still rejected, and a schema 1 hotbar id above 15 returns an error instead of panicking.
 
-Texture layers are assigned at freeze in sorted texture-id order. The seventeen authored tiles keep their pixels. `strata:missing` is a new magenta/black checker, layer 13, not limestone. A packaged executable with no `assets/strata/blocks` directory uses the same TOML embedded in the binary. If that directory exists and a file is wrong, startup fails and names the file and the key.
+Texture references may contain path segments (`strata:block/grass_top`). Each segment is `[a-z0-9_]+`. Layers are assigned at freeze in sorted texture-id order and capped at 256. The seventeen authored tiles keep their pixels. `strata:missing` is the magenta/black checker and sorts last. An unknown reference adds no layer and uses that checker, with a warning that names the file and the key. The game writes that warning to `strata-registry-warnings.txt` beside the executable and removes the file on a later start that has none. Block `tint` is identity white and is a vertex attribute the shader multiplies. Hotbar color is `swatch`. Fluid tint alpha must be 1.0. Water still uses vertex alpha `0.72` as the shader's water signal. The terrain vertex is 60 bytes. Content hashing uses the `sha2` crate. The mesher keeps a dense per-id table on `World`. Each mesh copies the solid bit, the replaceable bit, and the render class into one flag byte per halo cell, and the face and occlusion loops read only that byte. Halo sampling uses the same table for replaceable cells. Freeze does not pack variant lists into one contiguous layer run.
 
-Release chunk generation on this Linux agent, seed `20261021`, the seven golden chunks, 3 untimed warmup passes and 30 timed passes (210 chunks), `cargo test --release --locked`:
+The previous registry round, on a Linux agent, measured release chunk generation for seed `20261021` on the seven golden chunks (3 untimed warmup passes and 30 timed passes, `cargo test --release --locked`):
 
 - Before the registry, one run: **2741.8 µs/chunk**.
-- After, three runs: **2764.4, 2777.1, and 2779.0 µs/chunk**.
+- After that round, three runs: **2764.4, 2777.1, and 2779.0 µs/chunk**.
 
-That is about one percent, inside run-to-run noise. It is not a GTX 1660 Ti measurement and it does not include meshing.
+That was about one percent, inside run-to-run noise. It is not a GTX 1660 Ti measurement and it did not include meshing. That round's Linux check was `cargo test --locked` **133 passed, 0 failed, 1 ignored**.
 
-Linux verification for this change, Rust 1.97.1:
+Windows review round, same seven chunks, seed `20261021`, 3 warmup passes and 30 timed passes, `cargo test --release --locked`, on the GTX 1660 Ti machine (i7-9700). One run each. Milliseconds per chunk:
+
+| Build | Generate | Mesh |
+|---|---:|---:|
+| `origin/development` `61cf20d` | 3.8876 | 5.9869 |
+| This branch before the review edits, `7a2a23f` | 3.9316 | 6.4256 |
+| This branch after the dense mesh table | 3.955 | 6.500 |
+
+The after row is the mean of two back-to-back runs (3.9560 / 6.4972 and 3.9547 / 6.5023). Generation stayed flat. Meshing was about 8.6% above `origin/development` on this machine. QA showed that dropping the tint attribute did not close that gap, so the 60-byte vertex was not the cause. The extra cost was the per-id lookup inside `face_visible` and `corner_ao`. This round copies the solid bit, the replaceable bit, and the render class into a flag byte per halo cell and reads only that byte in those loops. A 4-byte tint and a 48-byte vertex stay deferred to PR #5, which replaces the vertex format. Round 2 timings are in the paragraph below. Freeze still does not pack variant lists into one contiguous layer run.
+
+Round 2, same machine and method (seed `20261021`, seven golden chunks, 3 warmup passes, 30 timed passes, 210 chunk samples, `cargo test --release --locked`). Milliseconds per chunk. The compared runs are the warm-binary window: no compiler was running, and each binary had already been executed. `origin/development` is one run taken immediately after the after-pair. The before row is one run taken immediately after that. The after row is the mean of two back-to-back runs.
+
+| Build | Generate | Mesh |
+|---|---:|---:|
+| `origin/development` `61cf20d` | 3.8403 | 5.8771 |
+| This branch before the flag-byte mesher, `2124b19` | 3.9030 | 6.4392 |
+| This branch after the flag-byte mesher | 3.8974 | 6.0098 |
+
+The after runs were 3.9035 / 6.0364 and 3.8912 / 5.9831. Meshing is 2.3% above `61cf20d` (6.0098 versus 5.8771) and 6.7% below the pre-round branch (6.4392). An earlier pair, taken in the same minute as each binary's release compile, was slower on every build (development 3.8775 / 5.9383, before 3.9547 / 6.4070, after mean 3.9615 / 6.2621) and is not the comparison. A separate split on the warm binaries put `sample_halo` at 3.8371 ms on this branch and 3.8316 ms on development, and `mesh_halo` at 2.1398 ms versus 2.0886 ms.
+
+Windows verification for review round 2, Rust 1.97.1, on this machine:
+
+- `cargo fmt --check`: passed after `cargo fmt`.
+- `cargo test --locked`: **153 passed, 0 failed, 1 ignored**. The ignored test is `native_gpu_validates_all_world_shader_pipelines`. `golden_chunks_match_platform_independent_hashes` passed. The lavapipe GPU test was not re-run.
+- `cargo clippy --locked --all-targets -- -D warnings`: passed.
+- `cargo build --release --locked`: passed.
+- `cargo audit` 0.22.2 loaded 1403 advisories and scanned 369 crates. Exit 0. No vulnerabilities. Two warnings, neither on the `sha2` crates: `ttf-parser` 0.25.1 is unmaintained (`RUSTSEC-2026-0192`) and `clipboard-win` 5.4.1 is yanked. `cargo deny` is not configured, and no deny job was added.
+- Release `strata.exe --smoke-seconds 1` exited 0 and left no `strata-error.txt`. Three temporary `--data-dir` copies exited 1, not 101, and wrote `strata-error.txt` naming `grass.toml` / `textures.top`, `water.toml` / `tint`, and `stone.toml` / `texture_rotation`. `--data-dir` with no path exited 2 and wrote that file. The next good smoke start removed it. Those folders and the error file were removed. The process had exited. The window pixels were not inspected.
+
+Windows verification for review round 1, Rust 1.97.1:
 
 - `cargo fmt --check`: passed.
-- `cargo test --locked`: **138 passed, 0 failed, 1 ignored**. The ignored test is `native_gpu_validates_all_world_shader_pipelines`. It was not re-run for this change. The count includes the registry tests and the schema 2 migration, placeholder, and generator-rejection tests.
+- PR #13's review round 1, `cargo test --locked`: **138 passed, 0 failed, 1 ignored**. The ignored test is `native_gpu_validates_all_world_shader_pipelines`. It was not re-run for this change. The count includes the registry tests and the schema 2 migration, placeholder, and generator-rejection tests.
+- PR #12's review round 1, `cargo test --locked`: **142 passed, 0 failed, 1 ignored**. The ignored test is `native_gpu_validates_all_world_shader_pipelines`. `golden_chunks_match_platform_independent_hashes` passed. The lavapipe GPU test was not re-run.
 - `cargo clippy --locked --all-targets -- -D warnings`: passed.
-- `cargo build --release --locked`: passed on this agent after the commands above.
+- `cargo build --release --locked`: passed.
+- Release `strata.exe --smoke-seconds 1` exited 0 and left no `strata-error.txt`. A `--data-dir` folder with `solid = "yes"` in `stone.toml` exited 1 and wrote `strata-error.txt` naming `stone.toml` and `solid`. That folder and the error file were removed. The process had already exited.
 
-Unverified: windowed play, the lavapipe shader pipeline with the 18-layer array, and the Windows / NVIDIA GTX 1660 Ti acceptance machine.
+Linux verification recorded for the previous registry round, Rust 1.97.1:
+
+- `cargo fmt --check`: passed.
+- `cargo test --locked`: **133 passed, 0 failed, 1 ignored**. The ignored test is `native_gpu_validates_all_world_shader_pipelines`. It was not re-run for that round.
+- `cargo clippy --locked --all-targets -- -D warnings`: passed.
+- `cargo build --release --locked`: passed on that agent after the commands above.
+
+That round left windowed play, the lavapipe shader pipeline, and the Windows / NVIDIA GTX 1660 Ti acceptance machine unverified.
 
 ## Day/night cycle
 
-Playing advances a 20-minute day on the fixed 60 Hz simulation tick. The title, pause menu, settings, and focus loss all go through the same step function and freeze that clock. Schema 1 generator 3 stores `time_of_day` in `[0, 1)` (midnight is 0). A generator 3 file missing that field loads at 08:00. Generator 1 and generator 2 files are rejected and left untouched. Non-finite values, negatives, and exactly 1.0 are rejected and the file is kept. Sun direction, sky, fog, ambient, and sun color are appended camera uniforms. Night clouds and water use the same linear lighting as the terrain. The 44-byte vertex layout is unchanged.
+Playing advances a 20-minute day on the fixed 60 Hz simulation tick. The title, pause menu, settings, and focus loss all go through the same step function and freeze that clock. Schema 1 generator 3 stores `time_of_day` in `[0, 1)` (midnight is 0). A generator 3 file missing that field loads at 08:00. Generator 1 and generator 2 files are rejected and left untouched. Non-finite values, negatives, and exactly 1.0 are rejected and the file is kept. Sun direction, sky, fog, ambient, and sun color are appended camera uniforms. Night clouds and water use the same linear lighting as the terrain. This checkpoint left the vertex at 44 bytes. The registry change after it stores linear tint in the vertex, so the current layout is 60 bytes.
 
 Linux verification for this change, Rust 1.97.1:
 
@@ -76,7 +114,7 @@ The canonical local project is `C:\WPAI\Software\Rust Based Voxel`, an independe
 - `cargo build --release --locked`: passed.
 - All three PowerShell entry points parsed; CPU benchmark, native launcher and streaming-trace wrapper ran. The launcher retains diagnostics; benchmark reports and exports preserve existing destinations.
 
-The original 40-byte vertex assertion failed when adding the texture-layer field intentionally changed the contract to 44 bytes. The test now verifies size, normal/color/layer offsets and GPU attribute format. Geometry-area and intended-behavior assertions were not weakened.
+The original 40-byte vertex assertion failed when adding the texture-layer field intentionally changed the contract to 44 bytes. A later registry change appended linear tint, so the current vertex is 60 bytes. The test verifies size, normal/color/layer/tint offsets and GPU attribute format. Geometry-area and intended-behavior assertions were not weakened.
 
 ## Walking controller
 
@@ -132,6 +170,10 @@ GitHub run [39545873483](https://github.com/MrWizard94-Compile/Strata/actions/ru
 
 Playable build run [39550868602](https://github.com/MrWizard94-Compile/Strata/actions/runs/39550868602) on `12e81fe` is the dry-run after that rebase. It was a branch push, not a tag, so it built and uploaded artifacts and did not create a Release. Package windows-x86_64 and Package linux-x86_64 succeeded. Windows `cargo test --locked` reported `82 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out`, including `golden_chunks_match_platform_independent_hashes`, `held_arrow_turns_on_each_simulation_tick`, and `startup_failure_is_written_beside_the_chosen_directory`. Linux's unfiltered suite reported the same 82 passed, 1 ignored, and 0 filtered out, then passed the ignored GPU test on lavapipe (`1 passed; 82 filtered out`). `package-windows.ps1` found dumpbin, rejected Visual C++ redistributable imports, required subsystem 2, launched the unzipped exe, and hashed `strata-windows-x86_64.zip` as `c4d87423e1cea773262a481fa2051e482317b46d09f829924ee4a2096c698a77`. `strata-linux-x86_64.zip` hashed as `60756fe6c62eaf516c9589fb629e4836086c2de0081e0d64ff79741a9feafd0c`. Write checksums kept both zip files intact (`skip-decompress: true`), `sha256sum -c` printed OK for each, and uploaded `SHA256SUMS.txt`. Publish GitHub Release was skipped. Artifact names from that run: `strata-windows-x86_64.zip`, `strata-windows-x86_64.zip.sha256`, `strata-linux-x86_64.zip`, `strata-linux-x86_64.zip.sha256`, and `SHA256SUMS.txt`. The Windows launch was still `--help` and `--export-materials`, not a displayed window and not play on the GTX 1660 Ti. Source checks on the same commit are run [39550872382](https://github.com/MrWizard94-Compile/Strata/actions/runs/39550872382): Windows source checks and Linux source checks both succeeded. The branch-only push trigger used for that proof was removed afterward; `workflow_dispatch` input `dry_run` remains for a later manual run from `development`.
 
+2026-10-28. Two packages of the same compiled sources did not match. Playable build [39550868602](https://github.com/MrWizard94-Compile/Strata/actions/runs/39550868602) on `12e81fe` hashed `strata-windows-x86_64.zip` as `c4d87423e1cea773262a481fa2051e482317b46d09f829924ee4a2096c698a77`. Windows source checks [39552406342](https://github.com/MrWizard94-Compile/Strata/actions/runs/39552406342) on `2b4dd2e` hashed it as `cf0faf30487391268984abbd7cd8c4fc7677a43e54b2c4064c2a62efcb631c4f`. Those commits differ only in `release.yml` and this file, not in crate sources. The source-check zip was not uploaded, so the two archives were not byte-compared. The retained `c4d87423` zip was. Its `strata.exe` COFF TimeDateStamp is `1792561988` (2026-10-21 05:53:08 UTC), the same instant as that job's package step, and the same value is repeated in the three debug-directory entries. The CodeView record is an RSDS GUID (`7309dcbc4c47a948939b2018e37f32e9`) whose PDB name is already the relative `strata.pdb`. The zip entry for `strata.exe` is timestamped 2026-10-21 05:53:08 and `PLAYING.md` is timestamped 2026-10-21 05:40:28, with Unix extra fields holding those clocks. The exe also contains absolute `C:\Users\runneradmin\.cargo\...` panic paths and one `D:\a\Strata\Strata\target\...` path. `/rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/...` was already stable. Player zips are now written with commit-time DOS timestamps, fixed modes, and no extra fields. Release builds set `SOURCE_DATE_EPOCH` from the commit, remap the workspace, Cargo home, and rustup prefixes, and pass `/Brepro` on MSVC. The playable-build workflow deletes `target`, builds and zips again, and fails if the hashes differ. That check is not a pull-request check. `Windows source checks` and `Linux source checks` keep those names. Playable build [40721186135](https://github.com/MrWizard94-Compile/Strata/actions/runs/40721186135) on tag `v0.0.0-test.1` packaged both zips, passed `sha256sum -c`, and then `gh release create --verify-tag` failed with `fatal: not a git repository` because the publish job does not check out the repo. `gh` is now given `GH_REPO` and `--repo`. A tag name containing `-` is created with `--prerelease`. That publish path has not been run again; it still needs one approved test tag.
+
+Playable build [41781964621](https://github.com/MrWizard94-Compile/Strata/actions/runs/41781964621) is a `workflow_dispatch` dry run of `16ef6c9e359ff1fe3d1b98b94da8e77e7bf03384`. Package windows-x86_64, Package linux-x86_64, and Write checksums succeeded. On Windows, Validate and package Windows zip and Rebuild and compare the Windows zip succeeded. On Linux, Package Unix zip and Rebuild and compare the Linux zip succeeded. Publish GitHub Release was skipped. That run is evidence for `16ef6c9` only. This branch then merged `origin/development` (walking) and the review fixes, so those later commits were not the tree that run built. The publish path has still not created a Release. It needs one test tag after merge, approved by Rob. Three package limits remain: the runner Python and zlib are not pinned, zip timestamps are UTC, and a rustflag added only in `.cargo/config.toml` is dropped because `repro_build.py` sets `CARGO_ENCODED_RUSTFLAGS` and repeats only `+crt-static` for the Windows target.
+
 Local Linux verification before rebasing onto `188b322`: with `VK_DRIVER_FILES` pointed only at `lvp_icd.json`, the ignored GPU test passed. `cargo fmt --check`, `cargo test --locked` (55 passed, 1 ignored), `cargo clippy --locked --all-targets -- -D warnings`, and `cargo build --release --locked` passed. After the review fixes on the rebased tree, those commands passed again and `cargo test --locked` reported 82 passed, 1 ignored. That local release binary links `libc`, `libm`, and `libgcc_s` and records `GLIBC_2.39` because this machine is Ubuntu 24.04. The Linux zip above is built on the Ubuntu 22.04 runner instead, so its glibc floor is that image's. The GitHub runs are separate results from these local checks.
 
 ## Ownership and next work
@@ -156,7 +198,7 @@ This is scored against the full requested result. FAIL rows prevent a production
 | 8 | PASS | Declared toolchain and library graph respected |
 | 9 | FAIL | Coherent source checkpoint; production installation/update/recovery package incomplete |
 | 10 | PASS | Hardware/storage considered; authority and user data preserved |
-| 11 | FAIL | Locked local build/hashes; Windows CI added, independent result and release reproducibility remain separate gates |
+| 11 | FAIL | Locked local build and Windows CI exist. Playable build 41781964621 on `16ef6c9` matched the Windows and Linux zip rebuilds; publish was skipped. Later commits on this branch were not part of that run. Source checks still build once. Interactive acceptance on the GTX 1660 Ti remains open. |
 | 12 | FAIL | Original material provenance; full dependency/license/advisory/name review open |
 | 13 | PASS | Bounded specialist ownership and root integration recorded |
 | 14 | PASS | Commands, provenance, review artifacts, limits and next actions recorded |

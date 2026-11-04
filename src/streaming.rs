@@ -386,6 +386,7 @@ mod tests {
                 normal: [0.0, 1.0, 0.0],
                 color: [1.0; 4],
                 texture_layer: 0,
+                tint: [1.0; 4],
             };
             vertices
         ];

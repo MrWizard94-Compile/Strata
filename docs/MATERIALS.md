@@ -6,32 +6,32 @@ This is the source material set for the director's explicit 32×32 texture requi
 
 ## Array contract
 
-`TILE_SIZE = 32`. `layer_count()` is the number of texture ids in the frozen block registry (18 for the builtin set). `rgba_layers()` packs layer → row → column → RGBA. Each layer is 4,096 bytes. RGB values are full sRGB albedo; alpha is always 255. Upload with an sRGB RGBA8 texture-array format. Vertex RGB remains lighting. Linear block tint is data for a later shader multiply and is not baked into these tiles.
+`TILE_SIZE = 32`. `layer_count()` is the number of texture ids in the frozen block registry (18 for the builtin set). `rgba_layers()` packs layer → row → column → RGBA. Each layer is 4,096 bytes. RGB values are full sRGB albedo; alpha is always 255. Upload with an sRGB RGBA8 texture-array format. Vertex RGB remains lighting. Linear block tint is a separate vertex attribute. The shader multiplies albedo by it. Builtin tints are identity white, so these tiles are not recolored. The hotbar uses `swatch`, not this multiply. The array is capped at 256 layers. A texture reference with no authored tile resolves to the single `strata:missing` layer and does not add another.
 
-`layer_for(BlockId, [nx,ny,nz])` reads the registry face list. The first variant is the layer the mesher uses. Layer numbers are assigned at freeze in sorted texture-id order. They are not written in the block TOML. The grain salt for the seventeen authored tiles still uses the historical authoring index, so those pixels are unchanged.
+`layer_for(BlockId, [nx,ny,nz])` reads the registry face list. The first variant is the layer the mesher uses. An unknown block or an empty face list uses `strata:missing`. Layer numbers are assigned at freeze in sorted texture-id order. They are not written in the block TOML. The grain salt for the seventeen authored tiles still uses the historical authoring index, so those pixels are unchanged. Authored block tiles use a `strata:block/...` reference. The checker stays `strata:missing`, so it sorts after every `strata:block/` id.
 
 | Layer | Texture id | Authored pixel structure |
 |---|---|---|
-| 0 | `strata:bark` | Vertical bark grooves, raised ridges and an elongated knot |
-| 1 | `strata:basalt` | Offset angular column joints, cool raised edges and sparse mineral inclusions |
-| 2 | `strata:clay` | Terracotta sediment layers, fine slanted drying cracks and ochre rims |
-| 3 | `strata:coal_ore` | Limestone host with a wrapped cluster of dark coal specks |
-| 4 | `strata:crystal` | Cyan mineral seams, pale facet edges and blue-grey host rock |
-| 5 | `strata:diamond_ore` | Limestone host with a wrapped cluster of pale cyan specks |
-| 6 | `strata:endgrain` | Offset concentric growth rings with a radial split |
-| 7 | `strata:gold_ore` | Limestone host with a wrapped cluster of warm gold specks |
-| 8 | `strata:grass_side` | Irregular sod thickness, hanging root strokes and exposed earth; row zero is the top of the block |
-| 9 | `strata:grass_top` | Olive meadow bed, sixteen clustered three-blade tufts, dark roots and warm blade tips |
-| 10 | `strata:iron_ore` | Limestone host with a wrapped cluster of rust-colored specks |
-| 11 | `strata:leaves` | Staggered pointed leaf clusters, individual veins and dark interstices |
-| 12 | `strata:limestone` | Limestone sediment bands, short joints and a pale curved mineral inclusion |
-| 13 | `strata:missing` | 4-pixel magenta (`#FF00FF`) and black checker. Not a limestone stand-in |
-| 14 | `strata:sand` | Wind-ripple ridges with alternating lit/dark edges and sparse pale grains |
-| 15 | `strata:snow` | Broad pale facets, cool shallow depressions and isolated highlights |
-| 16 | `strata:soil` | Offset soil clods, shaded creases, warm raised edges and occasional pale pebbles |
-| 17 | `strata:water` | Low-contrast teal wavelets and crossing darker striae; animation/reflection remain renderer effects |
+| 0 | `strata:block/bark` | Vertical bark grooves, raised ridges and an elongated knot |
+| 1 | `strata:block/basalt` | Offset angular column joints, cool raised edges and sparse mineral inclusions |
+| 2 | `strata:block/clay` | Terracotta sediment layers, fine slanted drying cracks and ochre rims |
+| 3 | `strata:block/coal_ore` | Limestone host with a wrapped cluster of dark coal specks |
+| 4 | `strata:block/crystal` | Cyan mineral seams, pale facet edges and blue-grey host rock |
+| 5 | `strata:block/diamond_ore` | Limestone host with a wrapped cluster of pale cyan specks |
+| 6 | `strata:block/endgrain` | Offset concentric growth rings with a radial split |
+| 7 | `strata:block/gold_ore` | Limestone host with a wrapped cluster of warm gold specks |
+| 8 | `strata:block/grass_side` | Irregular sod thickness, hanging root strokes and exposed earth; row zero is the top of the block |
+| 9 | `strata:block/grass_top` | Olive meadow bed, sixteen clustered three-blade tufts, dark roots and warm blade tips |
+| 10 | `strata:block/iron_ore` | Limestone host with a wrapped cluster of rust-colored specks |
+| 11 | `strata:block/leaves` | Staggered pointed leaf clusters, individual veins and dark interstices |
+| 12 | `strata:block/limestone` | Limestone sediment bands, short joints and a pale curved mineral inclusion |
+| 13 | `strata:block/sand` | Wind-ripple ridges with alternating lit/dark edges and sparse pale grains |
+| 14 | `strata:block/snow` | Broad pale facets, cool shallow depressions and isolated highlights |
+| 15 | `strata:block/soil` | Offset soil clods, shaded creases, warm raised edges and occasional pale pebbles |
+| 16 | `strata:block/water` | Low-contrast teal wavelets and crossing darker striae; animation/reflection remain renderer effects |
+| 17 | `strata:missing` | 4-pixel magenta (`#FF00FF`) and black checker. Not a limestone stand-in |
 
-Air is never rendered; its defensive mapping is `strata:limestone` (layer 12). Grass uses the soil layer on its underside, and both timber ends use the same endgrain layer. Ore tiles reuse the limestone host and add one mineral cluster each, so they stay distinct from stone and from each other without a second albedo path.
+Air is never rendered; its defensive mapping is `strata:missing`. Grass uses the soil layer on its underside, and both timber ends use the same endgrain layer. Ore tiles reuse the limestone host and add one mineral cluster each, so they stay distinct from stone and from each other without a second albedo path.
 
 ## Rendering conventions
 
@@ -47,7 +47,7 @@ The palette uses restrained greens, warm earth, cool limestone/basalt and bright
 
 The renderer uses nearest magnification to retain readable pixels and linear minification/mipmap filtering to reduce distant shimmer. Renderer integration and visual acceptance are separate checks: inspect all six face orientations, grass-side direction, repeated large greedy faces, shared chunk boundaries, and distance transitions in the actual client.
 
-`strata.exe --export-materials <new-directory>` writes one exact 32×32 PNG per registry layer, a 6× nearest-neighbour contact sheet and a layer/provenance manifest. The builtin export is 18 tiles. The parent directory must exist. Existing export directories are rejected, preserving artist edits. This is an export path; file edits do not yet hot-reload into the engine. A consumer test decodes every PNG and compares it byte-for-byte with the runtime source.
+`strata.exe --export-materials <new-directory>` writes one exact 32×32 PNG per registry layer, a 6× nearest-neighbour contact sheet and a layer/provenance manifest. The file stem keeps the namespace and maps `:` and `/` to `-`, so a name never creates a nested folder (`00-strata-block-bark.png`, `17-strata-missing.png`). The builtin export is 18 tiles. The parent directory must exist. Existing export directories are rejected, preserving artist edits. This is an export path; file edits do not yet hot-reload into the engine. A consumer test decodes every PNG and compares it byte-for-byte with the runtime source.
 
 ## Verification
 

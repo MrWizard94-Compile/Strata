@@ -3,9 +3,11 @@ name: Playable build
 # Manual runs upload downloadable zips as workflow artifacts (kept 30 days).
 # A push of a v* tag also publishes those zips on a GitHub Release unless
 # workflow_dispatch sets dry_run. The Windows zip is the primary artifact.
-# This workflow does not run on pull requests. The publish job is the only
+# This workflow does not run on pull requests. Each package job builds and
+# zips twice and fails if the hashes differ. The publish job is the only
 # job that can write repository contents, and only when the ref is a version
-# tag and dry_run is not set.
+# tag and dry_run is not set. That job does not check out the repository;
+# gh is given the repo explicitly. A tag name containing "-" is a prerelease.
 #
 # Another platform is another `package.strategy.matrix.include` row:
 #   family: windows   uses package-windows.ps1
@@ -26,18 +28,23 @@ on:
 permissions:
   contents: read
 
+# A tag publish must run to completion. gh release create records the release
+# before the asset upload finishes, so cancelling that job leaves a release
+# every later run refuses to replace. Branch and manual runs of one ref may
+# still cancel an older run. Tag refs never do.
 concurrency:
   group: playable-build-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
   package:
     name: Package ${{ matrix.label }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: 60
+    # Checkout needs contents: read. Same-run artifact upload uses the Actions
+    # runtime token (upload-artifact v4+), so this job has no actions: write.
     permissions:
       contents: read
-      actions: write
     defaults:
       run:
         shell: ${{ matrix.shell }}
@@ -73,7 +80,7 @@ jobs:
         if: matrix.shaders == true
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers libvulkan1 zip
+          sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers libvulkan1
           icd="$(find /usr/share/vulkan/icd.d -name 'lvp_icd*.json' -print -quit)"
           if [ -z "$icd" ]; then
             echo 'lavapipe ICD was not installed'
@@ -119,11 +126,11 @@ jobs:
 
       - name: Locked release build
         if: matrix.family == 'windows'
-        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+        run: python tools/repro_build.py --target x86_64-pc-windows-msvc
 
       - name: Locked release build
         if: matrix.family == 'unix'
-        run: cargo build --release --locked
+        run: python3 tools/repro_build.py
 
       - name: Validate and package Windows zip
         if: matrix.family == 'windows'
@@ -138,16 +145,16 @@ jobs:
             echo 'A unix matrix row needs binary_kind, for example: ELF 64-bit'
             exit 1
           fi
-          if ! command -v zip >/dev/null 2>&1 || ! command -v file >/dev/null 2>&1; then
+          if ! command -v file >/dev/null 2>&1; then
             sudo apt-get update
-            sudo apt-get install -y --no-install-recommends zip file
+            sudo apt-get install -y --no-install-recommends file
           fi
           mkdir -p dist
           cp "target/release/${{ matrix.binary }}" "dist/${{ matrix.binary }}"
           chmod 755 "dist/${{ matrix.binary }}"
           cp PLAYING.md dist/PLAYING.md
           file "dist/${{ matrix.binary }}" | grep -q "$kind"
-          zip -j '${{ matrix.zip }}' "dist/${{ matrix.binary }}" dist/PLAYING.md
+          python3 tools/player_zip.py package --player linux --binary "dist/${{ matrix.binary }}" --output '${{ matrix.zip }}'
           rm -rf unpack
           mkdir unpack
           python3 -m zipfile -e '${{ matrix.zip }}' unpack
@@ -177,6 +184,29 @@ jobs:
           test -f unpack/materials/manifest.json
           sha256sum '${{ matrix.zip }}' | tee '${{ matrix.zip }}.sha256'
 
+      # Delete target and build again so the second zip cannot reuse the first
+      # objects. This stays off pull requests. The required check names
+      # Windows source checks and Linux source checks are unchanged.
+      - name: Rebuild and compare the Windows zip
+        if: matrix.family == 'windows'
+        run: |
+          Remove-Item -LiteralPath target -Recurse -Force
+          python tools/repro_build.py --target x86_64-pc-windows-msvc
+          python tools/player_zip.py package --player windows --binary target\x86_64-pc-windows-msvc\release\strata.exe --output strata-windows-x86_64-rebuild.zip
+          python tools/player_zip.py compare ${{ matrix.zip }} strata-windows-x86_64-rebuild.zip
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Remove-Item -LiteralPath strata-windows-x86_64-rebuild.zip -Force
+
+      - name: Rebuild and compare the Linux zip
+        if: matrix.family == 'unix'
+        run: |
+          set -eu
+          rm -rf target
+          python3 tools/repro_build.py
+          python3 tools/player_zip.py package --player linux --binary target/release/strata --output strata-linux-x86_64-rebuild.zip
+          python3 tools/player_zip.py compare '${{ matrix.zip }}' strata-linux-x86_64-rebuild.zip
+          rm -f strata-linux-x86_64-rebuild.zip
+
       - name: Upload zip
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -198,8 +228,9 @@ jobs:
     needs: package
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    permissions:
-      actions: write
+    # Same-run download and upload use the Actions runtime token. This job
+    # does not check out the repo and does not call gh.
+    permissions: {}
     steps:
       # A player zip is itself a .zip. Without this, download-artifact
       # unpacks it and the checksum job cannot see the file that was uploaded.
@@ -241,8 +272,9 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v') && inputs.dry_run != true
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # contents: write is only for gh release create. Same-run artifact
+    # download does not need actions: read.
     permissions:
-      actions: read
       contents: write
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -253,6 +285,9 @@ jobs:
       - name: Check checksums and publish
         env:
           GH_TOKEN: ${{ github.token }}
+          # BaseRepo reads GH_REPO. --repo is also required: without it, gh
+          # still runs local git for tag info and fails with "not a git repository".
+          GH_REPO: ${{ github.repository }}
         run: |
           set -eu
           find dist -type f -print
@@ -270,8 +305,18 @@ jobs:
             done
           } > SHA256SUMS.txt
           sha256sum -c SHA256SUMS.txt
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+          # Print gh's own output. "release not found" is the absent-release
+          # message from `gh release view` (exit 1). Any other failure stops
+          # the job instead of being treated as a missing release.
+          view_status=0
+          view_output="$(gh release view "$GITHUB_REF_NAME" --repo "$GH_REPO" 2>&1)" || view_status=$?
+          printf '%s\n' "$view_output"
+          if [ "$view_status" -eq 0 ]; then
             echo "Release $GITHUB_REF_NAME already exists. Refusing to replace it."
+            exit 1
+          fi
+          if [ "$view_status" -ne 1 ] || [ "$view_output" != "release not found" ]; then
+            echo "gh release view failed with status $view_status."
             exit 1
           fi
           cat > release-notes.md <<'EOF'
@@ -287,9 +332,9 @@ jobs:
           ## Provenance
           - Source commit: SOURCE_SHA
           - Workflow run: RUN_URL
-          - Build: cargo build --release --locked. Windows uses --target x86_64-pc-windows-msvc. Toolchain: rust-toolchain.toml (Rust 1.97.1).
+          - Build: cargo build --release --locked, with SOURCE_DATE_EPOCH set from the commit time and source paths remapped. Windows uses --target x86_64-pc-windows-msvc and links with /Brepro. Toolchain: rust-toolchain.toml (Rust 1.97.1).
           - The Windows executable is a release build. The windows_subsystem attribute is windows unless debug assertions are on, so this build does not open a console. Its C runtime is linked statically via .cargo/config.toml for that target only. A startup failure is written to strata-error.txt beside the exe.
-          - One checksum proves the identity of that uploaded file. It does not prove a second clean build would hash the same.
+          - The workflow compiles and zips this commit twice and uploads the zip only when those hashes match. A later runner image, toolchain, or MSVC update can still change the hash.
 
           ## Saves and rollback
           Worlds stay on the player's computer in saves/emerald-reach and are not inside the zip. Replacing the program does not delete or migrate them. Keep both world-a.json and world-b.json when copying a backup. To go back, download an older release and leave the saves folder in place.
@@ -323,8 +368,15 @@ jobs:
             release_files+=("$(basename "$extra")")
           done
           release_files+=(SHA256SUMS.txt)
+          # v1.2.3 is a release. v0.0.0-test.1 contains a hyphen and is a prerelease.
+          prerelease_args=()
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            prerelease_args+=(--prerelease)
+          fi
           gh release create "$GITHUB_REF_NAME" \
+            --repo "$GH_REPO" \
             --verify-tag \
             --title "STRATA $GITHUB_REF_NAME" \
             --notes-file release-notes.md \
+            "${prerelease_args[@]}" \
             "${release_files[@]}"
