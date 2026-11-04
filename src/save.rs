@@ -615,7 +615,7 @@ mod tests {
         fs::remove_dir_all(path).unwrap();
     }
     #[test]
-    fn schema1_save_rejects_a_hotbar_id_above_15() {
+    fn schema2_save_rejects_an_unplaceable_builtin_on_the_hotbar() {
         let path = directory();
         let (mut store, _) = SaveStore::open(&path).unwrap();
         let mut hotbar = interaction::default_hotbar();
@@ -623,8 +623,29 @@ mod tests {
         let error = store
             .save(&World::new(1), player(), daylight::MORNING, hotbar, 0)
             .unwrap_err();
-        assert!(error.contains("Schema 1"), "{error}");
-        assert!(error.contains("16"), "{error}");
+        assert!(
+            error.contains("cannot be placed") && error.contains("File preserved."),
+            "{error}"
+        );
+        assert!(!path.join("world-a.json").exists());
+        assert!(!path.join("world-b.json").exists());
+        fs::remove_dir_all(path).unwrap();
+    }
+    #[test]
+    fn schema1_hotbar_id_above_15_is_rejected_and_the_file_is_preserved() {
+        let path = directory();
+        fs::create_dir_all(&path).unwrap();
+        let body = br#"{"schema":1,"generator":3,"generation":1,"seed":7,"player":{"eye":[0.0,80.0,0.0],"yaw":0.0,"pitch":0.0,"flying":false},"hotbar":[16,1,3,6,7,4,9,10],"edits":[]}"#;
+        fs::write(path.join("world-a.json"), body).unwrap();
+        let error = match SaveStore::open(&path) {
+            Err(error) => error,
+            Ok(_) => panic!("schema 1 hotbar id 16 was accepted"),
+        };
+        assert!(
+            error.contains("unknown hotbar") && error.contains("File preserved."),
+            "{error}"
+        );
+        assert_eq!(fs::read(path.join("world-a.json")).unwrap(), body);
         fs::remove_dir_all(path).unwrap();
     }
     #[test]
