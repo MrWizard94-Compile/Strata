@@ -20,7 +20,7 @@ cargo build --release --locked --target x86_64-pc-windows-msvc
 
 `.cargo/config.toml` links the C runtime statically for `x86_64-pc-windows-msvc` only.
 
-Or run `./run.ps1` from PowerShell. The script builds when necessary, sets the working directory and records startup/runtime diagnostics under `logs/`. Saves live in `saves/emerald-reach`; retain both `world-a.json` and `world-b.json` when backing up. An OS lock rejects a second client opening the same world and releases on process exit; the empty `world.lock` marker can remain.
+Or run `./run.ps1` from PowerShell. It builds `--target x86_64-pc-windows-msvc` and launches `target\x86_64-pc-windows-msvc\release\strata.exe`, the same target CI and the player zip use. The script sets the working directory and records startup/runtime diagnostics under `logs/`. Saves live in `saves/emerald-reach`; retain both `world-a.json` and `world-b.json` when backing up. An OS lock rejects a second client opening the same world and releases on process exit; the empty `world.lock` marker can remain.
 
 The client supports `--seed <u64>` for a new world and `--save-dir <path>` for a separate world. An existing world retains its stored seed. `--smoke-seconds <1..120>` launches the real native client and exits after the stated duration for graphics acceptance; this does not automate gameplay acceptance.
 
@@ -83,9 +83,56 @@ Source is private/unpublished project work. No general redistribution license ha
 
 `./trace-streaming.ps1 -TracePath evidence/new-trace.jsonl -SmokeSeconds 30` builds and records a native run with exact source/binary/hardware provenance. It starts on the title scene. See [STREAMING.md](docs/STREAMING.md) for admission limits, reproducible stress fixtures, observed costs and measurement limits.
 
-The [source-check workflow](.github/workflows/ci.yml) runs on every pull request into `development`, on pushes to that branch, and on `v*` tags. It does not run again for a push of a pull-request branch. Windows and Linux both run the same unfiltered `cargo test --locked` command, with no test name, `--lib`, or `--skip`. Windows then runs strict clippy and `cargo build --release --locked --target x86_64-pc-windows-msvc`. That target is the one `.cargo/config.toml` builds with a static C runtime. The zip is made from `target\x86_64-pc-windows-msvc\release\strata.exe`. That job then checks the exe is a Windows GUI program, imports no Visual C++ redistributable DLL, launches the unzipped `strata.exe` (help text and a material export, with no window), and checks the zip contains only that exe and `PLAYING.md`. Linux runs format, test, clippy, and a release build, and runs the ignored GPU test against lavapipe. Neither job is interactive play on the acceptance machine.
+The [source-check workflow](.github/workflows/ci.yml) runs on every pull request into `development`, on pushes to that branch, and on `v*` tags. It does not run again for a push of a pull-request branch. Windows and Linux both run the same unfiltered `cargo test --locked` command, with no test name, `--lib`, or `--skip`. Both also run `python -m unittest tools/test_player_zip.py tools/test_repro_build.py` (Linux invokes `python3`). Windows then runs strict clippy and the reproducible build below. Linux runs format, test, clippy, the ignored GPU test against lavapipe, and `python3 tools/repro_build.py`. Neither job is interactive play on the acceptance machine.
 
-The [playable-build workflow](.github/workflows/release.yml) runs when someone starts it by hand, and when a `v*` tag is pushed. The primary file is `strata-windows-x86_64.zip` (the release exe, static C runtime, and `PLAYING.md`). `strata-linux-x86_64.zip` is the extra Linux build: that release binary plus `PLAYING.md`. A manual run keeps those files for 30 days. Set **dry_run** on that manual run to upload the zips and `SHA256SUMS.txt` without creating a Release. A version tag without dry_run attaches them to a GitHub Release, with the Windows zip first. Another platform is an extra matrix row in that workflow; none is enabled until it has been built. There is no Mac package. See [PLAYING.md](PLAYING.md).
+Player zips are built with `tools/repro_build.py`, then `package-windows.ps1` or `tools/player_zip.py`. The `cargo build` commands earlier in this file are the local development build. They do not set the player-zip environment.
+
+`tools/repro_build.py` sets `SOURCE_DATE_EPOCH` from the commit time, `CARGO_INCREMENTAL=0`, and `CARGO_ENCODED_RUSTFLAGS`. Those flags remap the workspace, Cargo home, and rustup paths to stable labels. On `x86_64-pc-windows-msvc` they also pass `+crt-static` and `/Brepro`. The script then refuses the binary if an absolute workspace, Cargo, or rustup path is still inside it. `tools/player_zip.py` writes the archive: entry names sorted as ASCII, UTC DOS timestamps from that epoch (even-second resolution), fixed Unix modes, and no extra fields.
+
+Windows zip, from the repository root:
+
+```powershell
+python tools/repro_build.py --target x86_64-pc-windows-msvc
+./package-windows.ps1 -Executable target\x86_64-pc-windows-msvc\release\strata.exe -ZipName strata-windows-x86_64.zip
+```
+
+`package-windows.ps1` checks that the exe is a Windows GUI program, imports no Visual C++ redistributable DLL, and launches the unzipped `strata.exe` for help text and a material export, with no window. The zip contains only that exe and `PLAYING.md`.
+
+Linux zip, on a machine that can build the Linux binary:
+
+```sh
+python3 tools/repro_build.py
+python3 tools/player_zip.py package --player linux --binary target/release/strata --output strata-linux-x86_64.zip
+```
+
+That zip contains only `strata` and `PLAYING.md`. The playable-build workflow builds the Linux file on Ubuntu 22.04.
+
+The [playable-build workflow](.github/workflows/release.yml) runs when someone starts it by hand, and when a `v*` tag is pushed. It does not run on pull requests. Each package job runs the reproducible build, zips, deletes `target`, builds and zips again, and fails if the two hashes differ. The primary file is `strata-windows-x86_64.zip` (the release exe, static C runtime, and `PLAYING.md`). `strata-linux-x86_64.zip` is the extra Linux build. A manual run keeps those files for 30 days. Set **dry_run** on that manual run to upload the zips and `SHA256SUMS.txt` without creating a Release. A version tag without dry_run attaches them to a GitHub Release, with the Windows zip first. The publish job does not check out the source; it tells `gh` which repository to use. A tag whose name contains a hyphen, such as `v0.0.0-test.1`, is published as a prerelease. Another platform is an extra matrix row in that workflow; none is enabled until it has been built. There is no Mac package. See [PLAYING.md](PLAYING.md).
+
+Three limits remain on those zips. The GitHub runner's Python and zlib are not pinned, so the deflate bytes can change when that image changes. Zip timestamps are UTC, not the runner's local clock. `CARGO_ENCODED_RUSTFLAGS` replaces `.cargo/config.toml`, and `repro_build.py` repeats only `+crt-static` for the Windows target, so a rustflag added only in that config file is dropped until the script repeats it.
+
+## Check a downloaded zip
+
+Use `SHA256SUMS.txt` from the same Release or workflow run as the zip. On Windows, in that folder:
+
+```powershell
+Get-FileHash .\strata-windows-x86_64.zip -Algorithm SHA256
+Get-Content .\SHA256SUMS.txt
+```
+
+The `Hash` value and the line ending in `strata-windows-x86_64.zip` are the same digest. Letter case does not matter.
+
+On Linux, in a folder that contains every zip named in the file:
+
+```sh
+sha256sum -c SHA256SUMS.txt
+```
+
+Each checked line prints `OK`. To check only the Linux zip:
+
+```sh
+grep 'strata-linux-x86_64.zip$' SHA256SUMS.txt | sha256sum -c -
+```
 
 ## Stopping a broken change
 

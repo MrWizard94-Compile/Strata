@@ -12,7 +12,7 @@ $strataPreviousSource = [Environment]::GetEnvironmentVariable('STRATA_SOURCE_REV
 Push-Location -LiteralPath $PSScriptRoot
 try {
     if (-not $SkipBuild) {
-        cargo build --release --locked
+        cargo build --release --locked --target x86_64-pc-windows-msvc
         if ($LASTEXITCODE -ne 0) { throw 'Release build failed; trace not run.' }
     }
     $strataOutput = if ([IO.Path]::IsPathRooted($TracePath)) {
@@ -38,7 +38,7 @@ try {
         compiler = (rustc --version | Out-String).Trim()
         git_commit = $strataCommit
         working_tree_changes = @(git status --porcelain)
-        binary_sha256 = (Get-FileHash -LiteralPath 'target/release/strata.exe' -Algorithm SHA256).Hash
+        binary_sha256 = (Get-FileHash -LiteralPath 'target/x86_64-pc-windows-msvc/release/strata.exe' -Algorithm SHA256).Hash
         source_inputs = $strataHashes
         hardware = [ordered]@{
             cpu = (Get-CimInstance Win32_Processor | Select-Object Name, NumberOfCores, NumberOfLogicalProcessors)
