@@ -4,17 +4,37 @@
 
 ## Day/night cycle
 
-Playing advances a 20-minute day on the fixed 60 Hz simulation tick. The title, pause menu, settings, and focus loss all go through the same step function and freeze that clock. Schema 1 generator 2 stores `time_of_day` in `[0, 1)` (midnight is 0). A generator 2 save without the field loads at 08:00. Generator 1 files are rejected and left untouched. Non-finite values, negatives, and exactly 1.0 are rejected and the file is kept. Sun direction, sky, fog, ambient, and sun color are appended camera uniforms. Night clouds and water use the same linear lighting as the terrain. The 44-byte vertex layout is unchanged.
+Playing advances a 20-minute day on the fixed 60 Hz simulation tick. The title, pause menu, settings, and focus loss all go through the same step function and freeze that clock. Schema 1 generator 3 stores `time_of_day` in `[0, 1)` (midnight is 0). A generator 3 file missing that field loads at 08:00. Generator 1 and generator 2 files are rejected and left untouched. Non-finite values, negatives, and exactly 1.0 are rejected and the file is kept. Sun direction, sky, fog, ambient, and sun color are appended camera uniforms. Night clouds and water use the same linear lighting as the terrain. The 44-byte vertex layout is unchanged.
 
 Linux verification for this change, Rust 1.97.1:
 
 - `cargo fmt --check`: passed.
-- `cargo test --locked`: **80 passed, 0 failed, 1 ignored** after rebasing onto generator 2 (`8af9548`). The generator 2 checkpoint below remains 65.
+- `cargo test --locked`: **80 passed, 0 failed, 1 ignored** on the day/night change after it was rebased onto `8af9548`. That commit still used save generator 2. This count is that checkpoint, not the current suite.
 - `cargo test --locked native_gpu_validates_all_world_shader_pipelines -- --ignored --nocapture`: **passed** on Mesa lavapipe (software Vulkan from mesa-vulkan-drivers 25.2.8). That is shader-pipeline and material-upload validation, not a GTX 1660 Ti and not a windowed playthrough.
 - `cargo clippy --locked --all-targets -- -D warnings`: passed.
 - `cargo build --release --locked`: passed.
 
 Unverified: interactive dawn, noon, dusk, and night appearance, mouse play, and the Windows / NVIDIA GTX 1660 Ti acceptance machine.
+
+## Interaction polish
+
+Holding break or place edits on the press, then again after `EDIT_REPEAT_TICKS` (15 simulation ticks, `EDIT_REPEAT_SECONDS` = 0.25 s). Repeat advances inside the same fixed 60 Hz simulation tick as the day clock and the player. A frame can catch up at most `FRAME_HITCH_CAP_SECONDS` (0.1 s), so a hitch cannot burst edits. A frame that drains zero ticks leaves the hold armed, which is what a monitor above the tick rate does on most frames. The hold is cleared when the mouse button is released and when simulation is suspended: pause, title, settings, focus loss, or the material picker. Resuming does not fire a stale repeat. The outline and both edit actions share `REACH_BLOCKS` (5), including a target whose near face is exactly five blocks along −X. Placement still refuses the player's body. Editable height remains -30 through 158, with the same messages.
+
+The hotbar has eight slots. The default is meadow grass, limestone, timber, canopy, river sand, terracotta, lumen crystal, and basalt. Press E to open a material grid of every placeable block from the registry (`Block::all` filtered by `is_placeable`). Air and water are omitted, so a new solid block shows up without a separate list. Coal, iron, gold, and diamond ore appear in that grid. Ore blocks in the material picker are a deliberate, approved choice. 1–8 and the wheel select a slot; a click fills that slot. Esc or E closes the grid and releases the mouse while it is open. While the picker is open it freezes the day clock and the player. F4 still reaches the game while the picker is open, so the debug hour skip is not swallowed.
+
+Schema 1 is one `PlayerSave` plus one world save (`Snapshot`). `time_of_day`, `hotbar`, and `selected_slot` are optional under `deny_unknown_fields`. A save that omits all three loads 08:00, the default bar, and slot 0. Unknown ids, non-placeable ids, a slot outside 0–7, JSON null for those fields, and a generator newer than `GENERATOR_VERSION` are rejected without rewriting the file. Loadable fixtures are produced by `SaveStore::save` and checked against the live schema and generator constants.
+
+Linux verification for this change, Rust 1.97.1, on day/night `188b322`:
+
+- `cargo fmt --check`: passed.
+- `cargo test --locked`: **99 passed, 0 failed, 1 ignored** after rebasing onto CI `4bbd3c6`. Hold-to-repeat and held-arrow turning both go through `advance_play_frame` at 144 Hz, 60 Hz, and a capped hitch.
+- `cargo test --locked native_gpu_validates_all_world_shader_pipelines -- --ignored --nocapture`: **passed** with the Vulkan loader pointed at Mesa lavapipe (`libvulkan_lvp.so`). That is shader-pipeline and material-upload validation, not a GTX 1660 Ti and not a windowed playthrough.
+- `cargo clippy --locked --all-targets -- -D warnings`: passed.
+- `cargo build --release --locked`: passed.
+
+Unverified: windowed play of hold-to-repeat, the material picker, and the Windows / NVIDIA GTX 1660 Ti acceptance machine. This environment cannot create a game window surface.
+
+This note does not replace the native evidence below. Windowed play of the new controls was not run on the Windows acceptance machine.
 
 The canonical local project is `C:\WPAI\Software\Rust Based Voxel`, an independent Git root. `origin` now points to `https://github.com/MrWizard94-Compile/Strata.git`; fetch succeeded. The repository is public. The director subsequently authorized committing and pushing all project changes. Source checkpoints and a Windows CI workflow are being delivered on development; this is not a production release.
 
@@ -69,13 +89,13 @@ The runtime samples PNGs from `assets/<namespace>/textures/block/`, embedded wit
 
 ## Source and artifact verification
 
-- Deterministic generator 2 terrain is integrated: plains, forest, desert, ocean, and beach, with sea-level water, caves, grid-anchored trees, and coal, iron, gold, and diamond. Sparse edits, greedy meshing, DDA targeting, walking/jump/flight, body collision, bounded streaming and versioned two-slot saves are integrated. Generator 1 saves are rejected and left untouched.
+- Deterministic generator 3 terrain is integrated: plains, forest, desert, ocean, and beach, with sea-level water, caves, grid-anchored trees, and coal, iron, gold, and diamond. Cold grass wears a snow cap. Cool grass from surface height 41 up wears one too; on seed 20261021 that is about the top 3.4% of a 231,361-column sample, and the warm height-46 peaks stay bare. Shallow beaches and seabeds have clay patches. Deep caves contain rare crystal clusters, and basalt forms the y < 1 floor plus occasional intrusions from y 1 through 8. Sparse edits, greedy meshing, DDA targeting, walking/jump/flight, body collision, bounded streaming and versioned two-slot saves are integrated. The save terrain version is 3. Generator 1 and generator 2 files are rejected and left untouched. A generator 3 file missing time of day loads at 08:00.
 - Seventeen original 32×32 sRGB tiles, face-specific grass/timber layers, repeating merged faces, six linear-light mip levels and PNG export are integrated. The exported contact sheet was inspected. Tests decode all seventeen PNGs and compare them byte-for-byte with runtime pixels.
 - Eighteen streaming regressions cover stale revisions, bounded queues, byte/time/count admission, deferred work, duplicate work, halo invalidation, unload and shutdown. A dirty-resident eviction leak was corrected.
-- Spawn/fall recovery checks a planted trunk and player construction. Seed 396 at column `(64, -64)` is not a generator 2 trunk site, so that regression plants the wood. Seed `20261021` grows a natural trunk at `(-321, -354)`, ground 35, five blocks tall; that test uses no edits. Unsafe flight-to-walk transitions are rejected with player feedback.
+- Spawn/fall recovery checks a planted trunk and player construction. Seed 396 at column `(64, -64)` is not a natural trunk column, so that regression plants the wood. Seed `20261021` grows a natural trunk at `(-321, -354)`, ground 35, five blocks tall; that test uses no edits. Unsafe flight-to-walk transitions are rejected with player feedback.
 - Presentation counters now exclude skipped acquisitions. Skipped/unfocused rendering is throttled. Controlled renderer failures attempt to save the CPU world before exit; this is not panic/power-loss recovery.
 - `cargo fmt --check`: passed.
-- `cargo test --locked`: **65 passed, 0 failed, 1 explicit GPU skip** on 2026-10-21 after generator 2. The ignored test is the native GPU pipeline check.
+- `cargo test --locked`: **103 passed, 0 failed, 1 ignored** after generator 3 was rebased onto `4afa708` (hotbar, PR #6). The ignored test is the native GPU pipeline check. The 55, 65, 66, 80, 84, and 99 counts described older trees. The 99 count was the hotbar branch before this terrain rebase.
 - `cargo test --locked native_gpu_validates_all_world_shader_pipelines -- --ignored --nocapture`: **1 passed**, including material mip upload validation on the native GPU.
 - `cargo clippy --locked --all-targets -- -D warnings`: passed without warnings.
 - `cargo build --release --locked`: passed.
@@ -85,7 +105,7 @@ The original 40-byte vertex assertion failed when adding the texture-layer field
 
 ## Native evidence and limits
 
-The runs in this section are the 2026-10-20 checkpoint. They predate generator 2. The retained seed 728491 save is a generator 1 file: current code rejects it and leaves the bytes in place. Those runs are not evidence that the current generator loads that world.
+The runs in this section are the 2026-10-20 checkpoint. They predate the current terrain. The retained seed 728491 save is a generator 1 file: current code rejects it and leaves the bytes in place. Those runs are not evidence that the current generator loads that world.
 
 Earlier actual-window testing entered the world, visibly broke `[63,46,-67]`, placed grass there, saved and closed. A subsequent font-enabled build showed readable menu text; missing menu-arrow glyphs were then removed. The retained test save records seed 728491, that edit, and player eye `[64.5,46.60417,-63.5]`.
 
@@ -116,6 +136,16 @@ Verified hardware: i7-9700, 8 cores/8 logical; 51,409,334,272 RAM bytes; GTX 166
 Rust/Cargo 1.97.1, MSVC target; wgpu 30.0.1, winit 0.30.13, egui 0.37.0 with default fonts, glam 0.34.1, bytemuck 1.25.2, pollster 1.0.1 and png 0.18.1; full graph in Cargo.lock.
 
 Historical CPU-baseline executable SHA256: `8987752CF362DBC4CB780B6DDC31AD8D78C54DCCE60ADC632E009E9B971DA8AB`.
+
+## Pull-request checks and playable packages
+
+2026-10-21. Pull requests into `development` run Windows and Linux source checks. Both jobs run unfiltered `cargo test --locked` (no test-name filter and no OS gate). The Linux job also runs `native_gpu_validates_all_world_shader_pipelines` on lavapipe; that is the only `#[ignore]`d test, and it is the only test the Windows job does not run. The Windows job builds `x86_64-pc-windows-msvc` with the static C runtime from `.cargo/config.toml`, then `package-windows.ps1` checks subsystem 2 (no console window), rejects Visual C++ redistributable imports, unzips a package that must contain only `strata.exe` and `PLAYING.md`, and launches that exe for `--help` and `--export-materials`. A startup failure writes `strata-error.txt` beside the exe. A separate workflow uploads that Windows zip first and a Linux zip as well. The Linux package is built on Ubuntu 22.04, must contain only `strata` and `PLAYING.md` with the executable bit stored in the zip, and that binary is launched for the same two commands. Neither launch opens a window. macOS is not a matrix row. Branch protection and the Actions write permission for releases are owner settings; the workflow files do not apply them.
+
+GitHub run [39545873483](https://github.com/MrWizard94-Compile/Strata/actions/runs/39545873483) on `860c4e8` completed with both jobs successful. Windows `cargo test --locked` reported `55 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out`. The ignored test was `native_gpu_validates_all_world_shader_pipelines`. Linux's unfiltered suite reported the same 55 passed, 1 ignored, and 0 filtered out, then passed that GPU test on lavapipe. `package-windows.ps1` on that runner found no Visual C++ redistributable import (dumpbin listed kernel32, user32, gdi32, ntdll, shlwapi, oleaut32, ole32, shell32, dwmapi, advapi32, api-ms-win-core-synch-l1-2-0, opengl32, dxgi, setupapi, bcryptprimitives, imm32, and uxtheme), launched the unzipped exe, and hashed `strata-windows-x86_64.zip` as `e91ad1e7b912a6d0a14dd92d816fdd5373612a1001ee66029160ece01b23847a`. That launch was `--help` and `--export-materials`, not a displayed window and not play on the GTX 1660 Ti. That count and zip hash are from before `development` `188b322` (day/night and generator 2).
+
+Playable build run [39550868602](https://github.com/MrWizard94-Compile/Strata/actions/runs/39550868602) on `12e81fe` is the dry-run after that rebase. It was a branch push, not a tag, so it built and uploaded artifacts and did not create a Release. Package windows-x86_64 and Package linux-x86_64 succeeded. Windows `cargo test --locked` reported `82 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out`, including `golden_chunks_match_platform_independent_hashes`, `held_arrow_turns_on_each_simulation_tick`, and `startup_failure_is_written_beside_the_chosen_directory`. Linux's unfiltered suite reported the same 82 passed, 1 ignored, and 0 filtered out, then passed the ignored GPU test on lavapipe (`1 passed; 82 filtered out`). `package-windows.ps1` found dumpbin, rejected Visual C++ redistributable imports, required subsystem 2, launched the unzipped exe, and hashed `strata-windows-x86_64.zip` as `c4d87423e1cea773262a481fa2051e482317b46d09f829924ee4a2096c698a77`. `strata-linux-x86_64.zip` hashed as `60756fe6c62eaf516c9589fb629e4836086c2de0081e0d64ff79741a9feafd0c`. Write checksums kept both zip files intact (`skip-decompress: true`), `sha256sum -c` printed OK for each, and uploaded `SHA256SUMS.txt`. Publish GitHub Release was skipped. Artifact names from that run: `strata-windows-x86_64.zip`, `strata-windows-x86_64.zip.sha256`, `strata-linux-x86_64.zip`, `strata-linux-x86_64.zip.sha256`, and `SHA256SUMS.txt`. The Windows launch was still `--help` and `--export-materials`, not a displayed window and not play on the GTX 1660 Ti. Source checks on the same commit are run [39550872382](https://github.com/MrWizard94-Compile/Strata/actions/runs/39550872382): Windows source checks and Linux source checks both succeeded. The branch-only push trigger used for that proof was removed afterward; `workflow_dispatch` input `dry_run` remains for a later manual run from `development`.
+
+Local Linux verification before rebasing onto `188b322`: with `VK_DRIVER_FILES` pointed only at `lvp_icd.json`, the ignored GPU test passed. `cargo fmt --check`, `cargo test --locked` (55 passed, 1 ignored), `cargo clippy --locked --all-targets -- -D warnings`, and `cargo build --release --locked` passed. After the review fixes on the rebased tree, those commands passed again and `cargo test --locked` reported 82 passed, 1 ignored. That local release binary links `libc`, `libm`, and `libgcc_s` and records `GLIBC_2.39` because this machine is Ubuntu 24.04. The Linux zip above is built on the Ubuntu 22.04 runner instead, so its glibc floor is that image's. The GitHub runs are separate results from these local checks.
 
 ## Ownership and next work
 
