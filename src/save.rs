@@ -1,7 +1,7 @@
 use crate::daylight::{self, validate_time_of_day};
 use crate::interaction::{self, HOTBAR_SLOTS};
-use crate::registry::{self, BlockId};
-use crate::world::{Block, GENERATOR_VERSION, World};
+use crate::registry;
+use crate::world::{AIR, Block, GENERATOR_VERSION, World};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
@@ -126,13 +126,7 @@ fn default_mods() -> Vec<ModRecord> {
 }
 
 fn legacy_names() -> Vec<String> {
-    (0..16_u8)
-        .map(|id| {
-            registry::registry()
-                .name(BlockId::from_id(id).expect("0..=15 are builtins"))
-                .to_string()
-        })
-        .collect()
+    crate::world::legacy_palette()
 }
 
 impl Schema1File {
@@ -173,7 +167,9 @@ impl Schema1File {
                 || Block::from_id(*id).is_none()
                 || !seen.insert(*position)
             {
-                return Err("World contains an invalid or duplicate block edit.".into());
+                return Err(
+                    "World contains an invalid or duplicate block edit. File preserved.".into(),
+                );
             }
         }
         Ok(())
@@ -232,7 +228,9 @@ impl Schema2File {
                 || usize::from(*index) >= self.palette.len()
                 || !seen.insert(*position)
             {
-                return Err("World contains an invalid or duplicate block edit.".into());
+                return Err(
+                    "World contains an invalid or duplicate block edit. File preserved.".into(),
+                );
             }
         }
         validate_mods(&self.mods)?;
@@ -277,6 +275,12 @@ fn validate_slot(slot: u8) -> Result<(), String> {
     }
 }
 
+/// Unknown names still need a block id above the frozen builtins. `intern_block`
+/// refuses once builtins plus placeholders reach 65,535.
+fn max_palette_placeholders() -> usize {
+    65_535usize.saturating_sub(registry::registry().builtin_count())
+}
+
 fn validate_palette(palette: &[String]) -> Result<(), String> {
     if palette.is_empty() || palette.len() > 65_535 {
         return Err("World palette has an invalid length. File preserved.".into());
@@ -284,12 +288,20 @@ fn validate_palette(palette: &[String]) -> Result<(), String> {
     if palette[0] != "strata:air" {
         return Err("World palette must start with strata:air. File preserved.".into());
     }
+    let registry = registry::registry();
     let mut seen = HashSet::with_capacity(palette.len());
+    let mut unknown = 0usize;
     for name in palette {
         if !registry::is_block_id(name) || !seen.insert(name) {
             return Err(
                 "World palette contains an invalid or duplicate block id. File preserved.".into(),
             );
+        }
+        if registry.get(name).is_none() {
+            unknown += 1;
+            if unknown > max_palette_placeholders() {
+                return Err(crate::world::PALETTE_TOO_LARGE.into());
+            }
         }
     }
     Ok(())
@@ -354,35 +366,52 @@ fn is_content_hash(text: &str) -> bool {
 }
 
 impl Snapshot {
-    pub fn world(&self) -> World {
-        self.materialize().0
+    #[cfg(test)]
+    pub fn world(&self) -> Result<World, String> {
+        self.materialize().map(|(world, _)| world)
     }
 
     pub fn time_of_day(&self) -> f32 {
         self.time_of_day
     }
 
-    pub fn hotbar(&self) -> [Block; HOTBAR_SLOTS] {
-        self.materialize().1
+    #[cfg(test)]
+    pub fn hotbar(&self) -> Result<[Block; HOTBAR_SLOTS], String> {
+        self.materialize().map(|(_, hotbar)| hotbar)
     }
 
     pub fn selected_slot(&self) -> usize {
         self.selected_slot as usize
     }
 
-    fn materialize(&self) -> (World, [Block; HOTBAR_SLOTS]) {
+    pub(crate) fn materialize(&self) -> Result<(World, [Block; HOTBAR_SLOTS]), String> {
         let mut world = World::new(self.seed);
         let ids = world
             .install_palette(self.palette.clone())
-            .expect("palette was validated");
+            .map_err(clean_intern_error)?;
         for (position, index) in &self.edits {
-            world.set_block(*position, ids[usize::from(*index)]);
+            let Some(block) = ids.get(usize::from(*index)).copied() else {
+                return Err(
+                    "World contains an invalid or duplicate block edit. File preserved.".into(),
+                );
+            };
+            world.set_block(*position, block);
         }
-        let hotbar = self
-            .hotbar_names
-            .clone()
-            .map(|name| world.intern_block(&name).expect("hotbar was validated"));
-        (world, hotbar)
+        let mut hotbar = [AIR; HOTBAR_SLOTS];
+        for (slot, name) in self.hotbar_names.iter().enumerate() {
+            hotbar[slot] = world.intern_block(name).map_err(clean_intern_error)?;
+        }
+        Ok((world, hotbar))
+    }
+}
+
+fn clean_intern_error(error: String) -> String {
+    if error == "block registry refuses the 65536th block" {
+        crate::world::PALETTE_TOO_LARGE.to_string()
+    } else if error.ends_with("File preserved.") {
+        error
+    } else {
+        format!("{error} File preserved.")
     }
 }
 
@@ -390,6 +419,9 @@ pub struct SaveStore {
     directory: PathBuf,
     generation: u64,
     mods: Vec<ModRecord>,
+    /// Exact bytes of the schema-1 file that was loaded. Cleared after `world.v1.bak`
+    /// is written, or when that file already exists. `None` for schema 2 and new worlds.
+    schema1_original: Option<Vec<u8>>,
     // OS lock releases on close/crash; the on-disk marker need not be deleted.
     _lock: File,
 }
@@ -408,6 +440,7 @@ impl SaveStore {
             format!("Cannot lock world. Another STRATA client may have it open: {e}")
         })?;
         let mut newest: Option<Snapshot> = None;
+        let mut schema1_original: Option<Vec<u8>> = None;
         for name in ["world-a.json", "world-b.json"] {
             let path = directory.join(name);
             match File::open(&path) {
@@ -422,11 +455,12 @@ impl SaveStore {
                             path.display()
                         ));
                     }
-                    let snapshot = decode_save(&path, &data)?;
+                    let (snapshot, schema) = decode_save(&path, &data)?;
                     if newest
                         .as_ref()
                         .is_none_or(|old| snapshot.generation > old.generation)
                     {
+                        schema1_original = if schema == 1 { Some(data) } else { None };
                         newest = Some(snapshot);
                     }
                 }
@@ -444,6 +478,7 @@ impl SaveStore {
                 directory: directory.to_owned(),
                 generation,
                 mods,
+                schema1_original,
                 _lock: lock,
             },
             newest,
@@ -462,7 +497,9 @@ impl SaveStore {
             .generation
             .checked_add(1)
             .ok_or("World generation counter exhausted")?;
-        let (palette, edits) = world.saved_palette_and_edits();
+        let (palette, edits) = world.saved_palette_and_edits()?;
+        // The record describes the content that is writing this file.
+        let mods = default_mods();
         let file = Schema2File {
             schema: SCHEMA_VERSION,
             generator: GENERATOR_VERSION,
@@ -474,13 +511,14 @@ impl SaveStore {
             hotbar: hotbar.map(|block| world.block_key(block).to_string()),
             palette,
             edits,
-            mods: self.mods.clone(),
+            mods,
         };
         file.validate()?;
         let bytes = serde_json::to_vec(&file).map_err(|e| format!("Cannot encode world: {e}"))?;
         if bytes.len() as u64 > MAX_BYTES {
             return Err("Encoded world exceeds save size limit".into());
         }
+        self.write_schema1_backup()?;
         fs::create_dir_all(&self.directory)
             .map_err(|e| format!("Cannot create save directory: {e}"))?;
         let name = if generation.is_multiple_of(2) {
@@ -510,11 +548,40 @@ impl SaveStore {
         fs::rename(&temporary, &target)
             .map_err(|e| format!("Cannot commit save; previous slot retained: {e}"))?;
         self.generation = generation;
+        self.mods = default_mods();
+        Ok(())
+    }
+
+    /// One-time copy of the loaded schema-1 bytes. An existing backup is left alone.
+    /// A failure leaves the obligation in place and must stop the schema-2 write.
+    fn write_schema1_backup(&mut self) -> Result<(), String> {
+        let Some(original) = self.schema1_original.as_deref() else {
+            return Ok(());
+        };
+        let target = self.directory.join("world.v1.bak");
+        if target.exists() {
+            self.schema1_original = None;
+            return Ok(());
+        }
+        let temporary = self.directory.join("world.v1.bak.pending");
+        let mut staged = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&temporary)
+            .map_err(|e| format!("Cannot stage world.v1.bak: {e}"))?;
+        staged
+            .write_all(original)
+            .and_then(|()| staged.sync_all())
+            .map_err(|e| format!("Cannot flush world.v1.bak: {e}"))?;
+        drop(staged);
+        fs::rename(&temporary, &target).map_err(|e| format!("Cannot commit world.v1.bak: {e}"))?;
+        self.schema1_original = None;
         Ok(())
     }
 }
 
-fn decode_save(path: &Path, bytes: &[u8]) -> Result<Snapshot, String> {
+fn decode_save(path: &Path, bytes: &[u8]) -> Result<(Snapshot, u32), String> {
     let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|error| {
         format!(
             "Cannot decode {}: {error}. File preserved; restore a backup to continue.",
@@ -540,7 +607,7 @@ fn decode_save(path: &Path, bytes: &[u8]) -> Result<Snapshot, String> {
                 )
             })?;
             file.validate()?;
-            Ok(file.into_snapshot())
+            Ok((file.into_snapshot(), 1))
         }
         Some(2) => {
             let file: Schema2File = serde_json::from_value(value).map_err(|error| {
@@ -550,7 +617,7 @@ fn decode_save(path: &Path, bytes: &[u8]) -> Result<Snapshot, String> {
                 )
             })?;
             file.validate()?;
-            Ok(file.into_snapshot())
+            Ok((file.into_snapshot(), 2))
         }
         _ => Err(DIFFERENT_VERSION.into()),
     }
@@ -558,7 +625,7 @@ fn decode_save(path: &Path, bytes: &[u8]) -> Result<Snapshot, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::world::{AIR, COAL_ORE, CRYSTAL, DIRT, GRASS, STONE, WATER};
+    use crate::world::{AIR, COAL_ORE, CRYSTAL, DIAMOND_ORE, DIRT, GRASS, STONE, WATER};
     use std::sync::atomic::{AtomicUsize, Ordering};
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     fn directory() -> PathBuf {
@@ -608,8 +675,8 @@ mod tests {
         let loaded = loaded.unwrap();
         assert_eq!(loaded.seed, 42);
         assert_eq!(loaded.player.eye, player().eye);
-        assert_eq!(loaded.world().block_at(-3, 90, 2), CRYSTAL);
-        assert_eq!(loaded.hotbar(), interaction::default_hotbar());
+        assert_eq!(loaded.world().unwrap().block_at(-3, 90, 2), CRYSTAL);
+        assert_eq!(loaded.hotbar().unwrap(), interaction::default_hotbar());
         assert_eq!(loaded.selected_slot(), 0);
         assert_eq!(loaded.time_of_day(), daylight::MORNING);
         fs::remove_dir_all(path).unwrap();
@@ -759,10 +826,10 @@ mod tests {
             daylight::TICKS_PER_DAY * 3 / 4
         );
         assert_eq!(loaded.selected_slot(), 6);
-        assert_eq!(loaded.hotbar()[2], DIRT);
-        assert_eq!(loaded.hotbar()[7], COAL_ORE);
+        assert_eq!(loaded.hotbar().unwrap()[2], DIRT);
+        assert_eq!(loaded.hotbar().unwrap()[7], COAL_ORE);
         assert_eq!(loaded.player.eye, player().eye);
-        assert_eq!(loaded.world().block_at(2, 40, -4), STONE);
+        assert_eq!(loaded.world().unwrap().block_at(2, 40, -4), STONE);
         let slot = path.join("world-b.json");
         let value: serde_json::Value = serde_json::from_slice(&fs::read(&slot).unwrap()).unwrap();
         assert_eq!(value["schema"], serde_json::json!(SCHEMA_VERSION));
@@ -785,12 +852,12 @@ mod tests {
                 .tick(),
             daylight::DayClock::morning().tick()
         );
-        assert_eq!(loaded.hotbar(), interaction::default_hotbar());
+        assert_eq!(loaded.hotbar().unwrap(), interaction::default_hotbar());
         assert_eq!(loaded.selected_slot(), 0);
         assert_eq!(loaded.seed, 42);
         assert!(loaded.player.flying);
         assert_eq!(loaded.player.eye, [1.0, 80.0, 2.0]);
-        assert_eq!(loaded.world().block_at(4, 70, -2), DIRT);
+        assert_eq!(loaded.world().unwrap().block_at(4, 70, -2), DIRT);
         assert_eq!(fs::read(path.join("world-a.json")).unwrap(), body);
         fs::remove_dir_all(path).unwrap();
     }
@@ -1036,8 +1103,8 @@ mod tests {
         fs::write(path.join("world-a.json"), body).unwrap();
         let (_, loaded) = SaveStore::open(&path).unwrap();
         let loaded = loaded.unwrap();
-        assert_eq!(loaded.world().block_at(1, 2, 3), STONE);
-        assert_eq!(loaded.world().block_key(STONE), "strata:stone");
+        assert_eq!(loaded.world().unwrap().block_at(1, 2, 3), STONE);
+        assert_eq!(loaded.world().unwrap().block_key(STONE), "strata:stone");
         assert_eq!(fs::read(path.join("world-a.json")).unwrap(), body);
         assert!(!path.join("world-b.json").exists());
         assert!(!path.join("world-a.json.pending").exists());
@@ -1055,14 +1122,14 @@ mod tests {
         fs::write(path.join("world-a.json"), &body).unwrap();
         let (mut store, loaded) = SaveStore::open(&path).unwrap();
         let loaded = loaded.unwrap();
-        let world = loaded.world();
+        let world = loaded.world().unwrap();
         let block = world.block_at(4, 80, 5);
         assert_ne!(block, AIR);
         assert_ne!(block, STONE);
         assert!(block.is_solid());
         assert_eq!(world.block_key(block), "example:gone");
         assert_eq!(world.display_name(block), "example:gone");
-        let hotbar = loaded.hotbar();
+        let hotbar = loaded.hotbar().unwrap();
         assert_eq!(world.block_key(hotbar[7]), "example:gone");
         assert!(hotbar[7].is_placeable());
         assert!(!crate::registry::MISSING.is_placeable());
@@ -1097,7 +1164,10 @@ mod tests {
         let (_, again) = SaveStore::open(&path).unwrap();
         let again = again.unwrap();
         assert_eq!(
-            again.world().block_key(again.world().block_at(4, 80, 5)),
+            again
+                .world()
+                .unwrap()
+                .block_key(again.world().unwrap().block_at(4, 80, 5)),
             "example:gone"
         );
         fs::remove_dir_all(path).unwrap();
@@ -1163,7 +1233,7 @@ mod tests {
     }
 
     #[test]
-    fn a_well_formed_strata_hash_mismatch_still_loads() {
+    fn a_hash_mismatch_still_loads_and_the_next_save_records_this_build() {
         let path = directory();
         fs::create_dir_all(&path).unwrap();
         let body = format!(
@@ -1175,10 +1245,10 @@ mod tests {
         let loaded = loaded.unwrap();
         save_world(
             &mut store,
-            &loaded.world(),
+            &loaded.world().unwrap(),
             loaded.player.clone(),
             loaded.time_of_day(),
-            loaded.hotbar(),
+            loaded.hotbar().unwrap(),
             0,
         );
         drop(store);
@@ -1194,7 +1264,532 @@ mod tests {
             })
             .expect("rewritten save");
         let saved = fs::read_to_string(saved).unwrap();
-        assert!(saved.contains(&"ab".repeat(32)), "{saved}");
+        let value: serde_json::Value = serde_json::from_str(&saved).unwrap();
+        assert_eq!(
+            value["mods"][0]["id"],
+            serde_json::json!("strata"),
+            "{saved}"
+        );
+        assert_eq!(
+            value["mods"][0]["version"],
+            serde_json::json!(env!("CARGO_PKG_VERSION")),
+            "{saved}"
+        );
+        assert_eq!(
+            value["mods"][0]["hash"],
+            serde_json::json!(registry::registry().builtin_content_hash()),
+            "{saved}"
+        );
+        assert!(!saved.contains(&"ab".repeat(32)), "{saved}");
         fs::remove_dir_all(path).unwrap();
+    }
+
+    fn schema1_bytes(generation: u64) -> Vec<u8> {
+        format!(
+            r#"{{"schema":1,"generator":3,"generation":{generation},"seed":7,"player":{{"eye":[0.0,80.0,0.0],"yaw":0.0,"pitch":0.0,"flying":false}},"edits":[[[1,2,3],3]]}}"#
+        )
+        .into_bytes()
+    }
+
+    fn refuse_open(path: &Path) -> String {
+        match SaveStore::open(path) {
+            Err(error) => error,
+            Ok(_) => panic!("open succeeded for {}", path.display()),
+        }
+    }
+
+    fn hotbar_json() -> serde_json::Value {
+        serde_json::json!([
+            "strata:grass",
+            "strata:stone",
+            "strata:wood",
+            "strata:leaves",
+            "strata:sand",
+            "strata:clay",
+            "strata:crystal",
+            "strata:basalt"
+        ])
+    }
+
+    fn schema2_document(palette: Vec<String>, edits: serde_json::Value) -> Vec<u8> {
+        let value = serde_json::json!({
+            "schema": 2,
+            "generator": 3,
+            "generation": 1,
+            "seed": 7,
+            "player": {"eye": [0.0, 80.0, 0.0], "yaw": 0.0, "pitch": 0.0, "flying": false},
+            "time_of_day": 0.0,
+            "selected_slot": 0,
+            "hotbar": hotbar_json(),
+            "palette": palette,
+            "edits": edits,
+            "mods": [{"id": "strata", "version": "0.1.0", "hash": "ab".repeat(32)}]
+        });
+        serde_json::to_vec(&value).unwrap()
+    }
+
+    fn palette_with_unknowns(unknown: usize) -> Vec<String> {
+        let mut names = Vec::with_capacity(unknown + 1);
+        names.push("strata:air".to_string());
+        for index in 0..unknown {
+            names.push(format!("m:b{index:05}"));
+        }
+        names
+    }
+
+    #[test]
+    fn schema1_in_its_parity_slot_is_backed_up_once_before_the_second_save() {
+        let path = directory();
+        fs::create_dir_all(&path).unwrap();
+        let original = schema1_bytes(2);
+        fs::write(path.join("world-a.json"), &original).unwrap();
+        let (mut store, _) = SaveStore::open(&path).unwrap();
+        save_world(
+            &mut store,
+            &World::new(7),
+            player(),
+            daylight::MORNING,
+            interaction::default_hotbar(),
+            0,
+        );
+        save_world(
+            &mut store,
+            &World::new(7),
+            player(),
+            daylight::MORNING,
+            interaction::default_hotbar(),
+            0,
+        );
+        assert_eq!(fs::read(path.join("world.v1.bak")).unwrap(), original);
+        let upgraded: serde_json::Value =
+            serde_json::from_slice(&fs::read(path.join("world-a.json")).unwrap()).unwrap();
+        assert_eq!(upgraded["schema"], 2);
+        let other: serde_json::Value =
+            serde_json::from_slice(&fs::read(path.join("world-b.json")).unwrap()).unwrap();
+        assert_eq!(other["schema"], 2);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn schema1_in_the_wrong_parity_slot_is_backed_up_before_the_first_save() {
+        let path = directory();
+        fs::create_dir_all(&path).unwrap();
+        let original = schema1_bytes(5);
+        fs::write(path.join("world-a.json"), &original).unwrap();
+        let (mut store, _) = SaveStore::open(&path).unwrap();
+        save_world(
+            &mut store,
+            &World::new(7),
+            player(),
+            daylight::MORNING,
+            interaction::default_hotbar(),
+            0,
+        );
+        assert_eq!(fs::read(path.join("world.v1.bak")).unwrap(), original);
+        let replaced: serde_json::Value =
+            serde_json::from_slice(&fs::read(path.join("world-a.json")).unwrap()).unwrap();
+        assert_eq!(replaced["schema"], 2);
+        assert_eq!(replaced["generation"], 6);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn repeated_saves_and_a_reopen_leave_the_schema1_backup_unchanged() {
+        let path = directory();
+        fs::create_dir_all(&path).unwrap();
+        let original = schema1_bytes(2);
+        fs::write(path.join("world-a.json"), &original).unwrap();
+        let (mut store, _) = SaveStore::open(&path).unwrap();
+        save_world(
+            &mut store,
+            &World::new(7),
+            player(),
+            daylight::MORNING,
+            interaction::default_hotbar(),
+            0,
+        );
+        let backup = path.join("world.v1.bak");
+        let modified = fs::metadata(&backup).unwrap().modified().unwrap();
+        for _ in 0..6 {
+            save_world(
+                &mut store,
+                &World::new(7),
+                player(),
+                daylight::MORNING,
+                interaction::default_hotbar(),
+                0,
+            );
+        }
+        drop(store);
+        let (mut store, _) = SaveStore::open(&path).unwrap();
+        save_world(
+            &mut store,
+            &World::new(7),
+            player(),
+            daylight::MORNING,
+            interaction::default_hotbar(),
+            0,
+        );
+        drop(store);
+        assert_eq!(fs::read(&backup).unwrap(), original);
+        assert_eq!(fs::metadata(&backup).unwrap().modified().unwrap(), modified);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn a_fresh_world_and_a_schema2_world_do_not_create_a_backup() {
+        let fresh = directory();
+        let (mut store, initial) = SaveStore::open(&fresh).unwrap();
+        assert!(initial.is_none());
+        save_world(
+            &mut store,
+            &World::new(3),
+            player(),
+            daylight::MORNING,
+            interaction::default_hotbar(),
+            0,
+        );
+        assert!(!fresh.join("world.v1.bak").exists());
+        drop(store);
+        fs::remove_dir_all(fresh).unwrap();
+
+        let path = directory();
+        fs::create_dir_all(&path).unwrap();
+        let body = schema2_document(palette_with_unknowns(0), serde_json::json!([]));
+        fs::write(path.join("world-a.json"), body).unwrap();
+        let (mut store, _) = SaveStore::open(&path).unwrap();
+        save_world(
+            &mut store,
+            &World::new(7),
+            player(),
+            daylight::MORNING,
+            interaction::default_hotbar(),
+            0,
+        );
+        assert!(!path.join("world.v1.bak").exists());
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn an_existing_schema1_backup_is_left_unchanged() {
+        let path = directory();
+        fs::create_dir_all(&path).unwrap();
+        let original = schema1_bytes(5);
+        fs::write(path.join("world-a.json"), &original).unwrap();
+        fs::write(path.join("world.v1.bak"), b"keep-me").unwrap();
+        let modified = fs::metadata(path.join("world.v1.bak"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        let (mut store, _) = SaveStore::open(&path).unwrap();
+        save_world(
+            &mut store,
+            &World::new(7),
+            player(),
+            daylight::MORNING,
+            interaction::default_hotbar(),
+            0,
+        );
+        assert_eq!(fs::read(path.join("world.v1.bak")).unwrap(), b"keep-me");
+        assert_eq!(
+            fs::metadata(path.join("world.v1.bak"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            modified
+        );
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn a_failed_schema1_backup_blocks_the_schema2_write_until_the_next_save() {
+        let path = directory();
+        fs::create_dir_all(&path).unwrap();
+        let original = schema1_bytes(2);
+        fs::write(path.join("world-a.json"), &original).unwrap();
+        let (mut store, _) = SaveStore::open(&path).unwrap();
+        fs::create_dir_all(path.join("world.v1.bak.pending")).unwrap();
+        let error = store
+            .save(
+                &World::new(7),
+                player(),
+                daylight::MORNING,
+                interaction::default_hotbar(),
+                0,
+            )
+            .unwrap_err();
+        assert!(error.contains("world.v1.bak"), "{error}");
+        assert_eq!(fs::read(path.join("world-a.json")).unwrap(), original);
+        assert!(!path.join("world-b.json").exists());
+        assert!(!path.join("world.v1.bak").exists());
+        fs::remove_dir_all(path.join("world.v1.bak.pending")).unwrap();
+        save_world(
+            &mut store,
+            &World::new(7),
+            player(),
+            daylight::MORNING,
+            interaction::default_hotbar(),
+            0,
+        );
+        assert_eq!(fs::read(path.join("world.v1.bak")).unwrap(), original);
+        assert!(path.join("world-b.json").exists());
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn copying_the_schema1_backup_back_loads_the_original_world() {
+        let path = directory();
+        fs::create_dir_all(&path).unwrap();
+        let original = schema1_bytes(2);
+        fs::write(path.join("world-a.json"), &original).unwrap();
+        let (_, loaded) = SaveStore::open(&path).unwrap();
+        let loaded = loaded.unwrap();
+        assert_eq!(loaded.world().unwrap().block_at(1, 2, 3), STONE);
+        drop(loaded);
+        let (mut store, _) = SaveStore::open(&path).unwrap();
+        save_world(
+            &mut store,
+            &World::new(7),
+            player(),
+            daylight::MORNING,
+            interaction::default_hotbar(),
+            0,
+        );
+        save_world(
+            &mut store,
+            &World::new(7),
+            player(),
+            daylight::MORNING,
+            interaction::default_hotbar(),
+            0,
+        );
+        drop(store);
+        fs::remove_file(path.join("world-a.json")).unwrap();
+        fs::remove_file(path.join("world-b.json")).unwrap();
+        fs::copy(path.join("world.v1.bak"), path.join("world-a.json")).unwrap();
+        let (_, restored) = SaveStore::open(&path).unwrap();
+        let restored = restored.unwrap();
+        assert_eq!(restored.seed, 7);
+        assert_eq!(restored.world().unwrap().block_at(1, 2, 3), STONE);
+        assert_eq!(restored.player.eye, [0.0, 80.0, 0.0]);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn palette_size_follows_the_builtin_count_and_oversized_files_stay_put() {
+        let builtin = registry::registry().builtin_count();
+        let max_unknown = 65_535 - builtin;
+        let largest_names = 1 + max_unknown;
+        assert!(
+            largest_names < 65_520,
+            "builtins={builtin} largest={largest_names}"
+        );
+        let path = directory();
+        fs::create_dir_all(&path).unwrap();
+        let body = schema2_document(palette_with_unknowns(max_unknown), serde_json::json!([]));
+        fs::write(path.join("world-a.json"), &body).unwrap();
+        let (_, loaded) = SaveStore::open(&path).unwrap();
+        let _world = loaded.unwrap().world().unwrap();
+        assert_eq!(fs::read(path.join("world-a.json")).unwrap(), body);
+        fs::remove_dir_all(&path).unwrap();
+
+        for names in [largest_names + 1, 65_520, 65_535] {
+            let unknown = names - 1;
+            let rejected = directory();
+            fs::create_dir_all(&rejected).unwrap();
+            let body = schema2_document(palette_with_unknowns(unknown), serde_json::json!([]));
+            fs::write(rejected.join("world-a.json"), &body).unwrap();
+            let error = refuse_open(&rejected);
+            assert!(
+                error.contains(crate::world::PALETTE_TOO_LARGE),
+                "names={names} builtins={builtin} error={error}"
+            );
+            assert_eq!(fs::read(rejected.join("world-a.json")).unwrap(), body);
+            fs::remove_dir_all(rejected).unwrap();
+        }
+    }
+
+    #[test]
+    fn materialize_returns_the_palette_error_instead_of_panicking() {
+        let names = palette_with_unknowns(65_535);
+        let snapshot = Snapshot {
+            generation: 1,
+            seed: 7,
+            player: player(),
+            edits: Vec::new(),
+            time_of_day: 0.0,
+            hotbar_names: std::array::from_fn(|_| "strata:grass".to_string()),
+            selected_slot: 0,
+            palette: names,
+            mods: default_mods(),
+        };
+        let error = match snapshot.materialize() {
+            Err(error) => error,
+            Ok(_) => panic!("oversized palette materialized"),
+        };
+        assert_eq!(error, crate::world::PALETTE_TOO_LARGE);
+    }
+
+    #[test]
+    fn palette_order_is_independent_of_builtin_order() {
+        let names = vec![
+            "strata:air".to_string(),
+            "strata:diamond_ore".to_string(),
+            "strata:stone".to_string(),
+            "strata:water".to_string(),
+            "example:x".to_string(),
+        ];
+        // y=200 is above the generator's air ceiling, so terrain cannot imitate the edit.
+        let edits = serde_json::json!([
+            [[1, 200, 1], 1],
+            [[2, 200, 2], 2],
+            [[3, 200, 3], 3],
+            [[4, 200, 4], 4]
+        ]);
+        let path = directory();
+        fs::create_dir_all(&path).unwrap();
+        fs::write(
+            path.join("world-a.json"),
+            schema2_document(names.clone(), edits),
+        )
+        .unwrap();
+        let (mut store, loaded) = SaveStore::open(&path).unwrap();
+        let loaded = loaded.unwrap();
+        let world = loaded.world().unwrap();
+        assert_eq!(world.block_at(1, 200, 1), DIAMOND_ORE);
+        assert_eq!(world.block_at(2, 200, 2), STONE);
+        assert_eq!(world.block_at(3, 200, 3), WATER);
+        assert_eq!(world.block_key(world.block_at(4, 200, 4)), "example:x");
+        assert!(world.block_at(4, 200, 4).is_solid());
+        assert_ne!(world.block_at(4, 200, 4), AIR);
+        save_world(
+            &mut store,
+            &world,
+            loaded.player.clone(),
+            loaded.time_of_day(),
+            loaded.hotbar().unwrap(),
+            0,
+        );
+        drop(store);
+        let saved = fs::read_dir(&path)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .find(|file| {
+                file.extension().is_some_and(|ext| ext == "json")
+                    && serde_json::from_slice::<serde_json::Value>(&fs::read(file).unwrap())
+                        .ok()
+                        .is_some_and(|value| value["generation"] == 2)
+            })
+            .expect("resave");
+        let value: serde_json::Value = serde_json::from_slice(&fs::read(saved).unwrap()).unwrap();
+        let saved_names: Vec<String> = value["palette"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|name| name.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(saved_names, names);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn unknown_schema_values_keep_the_different_version_message_and_the_bytes() {
+        let samples = [
+            ("3", Some(serde_json::json!(3))),
+            ("99", Some(serde_json::json!(99))),
+            ("0", Some(serde_json::json!(0))),
+            ("string", Some(serde_json::json!("2"))),
+            ("null", Some(serde_json::Value::Null)),
+            ("float", Some(serde_json::json!(2.0))),
+            ("missing", None),
+        ];
+        for (label, schema) in samples {
+            let path = directory();
+            fs::create_dir_all(&path).unwrap();
+            let mut value = serde_json::json!({
+                "schema": 1,
+                "generator": 3,
+                "generation": 1,
+                "seed": 7,
+                "player": {"eye": [0.0, 80.0, 0.0], "yaw": 0.0, "pitch": 0.0, "flying": false},
+                "edits": []
+            });
+            match schema {
+                Some(schema) => value["schema"] = schema,
+                None => {
+                    value.as_object_mut().unwrap().remove("schema");
+                }
+            }
+            let body = serde_json::to_vec(&value).unwrap();
+            fs::write(path.join("world-a.json"), &body).unwrap();
+            let error = refuse_open(&path);
+            assert_eq!(error, DIFFERENT_VERSION, "{label}");
+            assert_eq!(
+                fs::read(path.join("world-a.json")).unwrap(),
+                body,
+                "{label}"
+            );
+            fs::remove_dir_all(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn duplicate_palette_names_are_rejected_and_the_file_is_untouched() {
+        let path = directory();
+        fs::create_dir_all(&path).unwrap();
+        let body = schema2_document(
+            vec![
+                "strata:air".to_string(),
+                "strata:stone".to_string(),
+                "strata:stone".to_string(),
+            ],
+            serde_json::json!([]),
+        );
+        fs::write(path.join("world-a.json"), &body).unwrap();
+        let error = refuse_open(&path);
+        assert!(
+            error.contains("invalid or duplicate block id") && error.contains("File preserved."),
+            "{error}"
+        );
+        assert_eq!(fs::read(path.join("world-a.json")).unwrap(), body);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn an_edit_index_past_the_palette_is_rejected_and_the_file_is_untouched() {
+        let path = directory();
+        fs::create_dir_all(&path).unwrap();
+        let body = schema2_document(
+            vec!["strata:air".to_string()],
+            serde_json::json!([[[1, 2, 3], 1]]),
+        );
+        fs::write(path.join("world-a.json"), &body).unwrap();
+        let error = refuse_open(&path);
+        assert!(
+            error.contains("invalid or duplicate block edit") && error.contains("File preserved."),
+            "{error}"
+        );
+        assert_eq!(fs::read(path.join("world-a.json")).unwrap(), body);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn schema1_names_come_from_the_registry_palette() {
+        let from_registry: Vec<String> = (0..16_u8)
+            .map(|id| {
+                registry::registry()
+                    .name(Block::from_id(id).unwrap())
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(crate::world::legacy_palette(), from_registry);
+        assert_eq!(legacy_names(), crate::world::legacy_palette());
+        assert_eq!(from_registry[0], "strata:air");
+        assert_eq!(from_registry[3], "strata:stone");
+        assert_eq!(from_registry.len(), 16);
+        assert!(!from_registry.iter().any(|name| name == "strata:missing"));
+        let (palette, _) = World::new(1).saved_palette_and_edits().unwrap();
+        assert_eq!(palette, legacy_names());
     }
 }

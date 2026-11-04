@@ -190,8 +190,8 @@ impl Game {
         let (world, player, hotbar, day, has_save) = match loaded {
             Some(snapshot) => {
                 let day = DayClock::from_fraction(snapshot.time_of_day())?;
-                let hotbar = Hotbar::from_saved(snapshot.hotbar(), snapshot.selected_slot());
-                let world = snapshot.world();
+                let (world, hotbar_blocks) = snapshot.materialize()?;
+                let hotbar = Hotbar::from_saved(hotbar_blocks, snapshot.selected_slot());
                 (world, Player::restore(snapshot.player), hotbar, day, true)
             }
             None => {

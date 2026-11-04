@@ -211,29 +211,26 @@ const ORE_RULES: [OreRule; 4] = [
     },
 ];
 
-/// Schema 1 numbers, in order. `strata:missing` is not part of a migrated palette.
-fn legacy_palette() -> Vec<String> {
-    [
-        "strata:air",
-        "strata:grass",
-        "strata:dirt",
-        "strata:stone",
-        "strata:sand",
-        "strata:water",
-        "strata:wood",
-        "strata:leaves",
-        "strata:snow",
-        "strata:clay",
-        "strata:crystal",
-        "strata:basalt",
-        "strata:coal_ore",
-        "strata:iron_ore",
-        "strata:gold_ore",
-        "strata:diamond_ore",
-    ]
-    .into_iter()
-    .map(str::to_string)
-    .collect()
+/// Shown when a palette cannot be stored in the `u16` block table.
+pub(crate) const PALETTE_TOO_LARGE: &str =
+    "World palette has more blocks than this version can store. File preserved.";
+
+/// One saved edit: a block position and its index into the saved palette.
+pub(crate) type PaletteEdit = ([i32; 3], u16);
+
+/// The palette written by a schema-2 save, and the edits that index it.
+pub(crate) type SavedPalette = (Vec<String>, Vec<PaletteEdit>);
+
+/// Schema 1 numbers, in registry order. `strata:missing` is not part of a migrated palette.
+/// This is the only schema-1 name table. Saves read it from here.
+pub(crate) fn legacy_palette() -> Vec<String> {
+    (0..16_u8)
+        .map(|id| {
+            registry::registry()
+                .name(BlockId::from_id(id).expect("0..=15 are builtins"))
+                .to_string()
+        })
+        .collect()
 }
 
 impl World {
@@ -324,13 +321,16 @@ impl World {
         }
     }
 
-    pub fn edits(&self) -> Vec<([i32; 3], u16)> {
-        self.saved_palette_and_edits().1
+    pub fn edits(&self) -> Vec<PaletteEdit> {
+        match self.saved_palette_and_edits() {
+            Ok((_, edits)) => edits,
+            Err(error) => panic!("cannot list edits: {error}"),
+        }
     }
 
     /// Palette for the next schema 2 save, then edits as indexes into it.
     /// The stored palette is not reordered. Names that are not in it yet are appended.
-    pub fn saved_palette_and_edits(&self) -> (Vec<String>, Vec<([i32; 3], u16)>) {
+    pub fn saved_palette_and_edits(&self) -> Result<SavedPalette, String> {
         let mut palette = self.palette.clone();
         let mut index_of: HashMap<String, u16> = palette
             .iter()
@@ -343,7 +343,8 @@ impl World {
             let index = if let Some(index) = index_of.get(&name) {
                 *index
             } else {
-                let index = u16::try_from(palette.len()).expect("palette stays within u16");
+                let index =
+                    u16::try_from(palette.len()).map_err(|_| PALETTE_TOO_LARGE.to_string())?;
                 palette.push(name.clone());
                 index_of.insert(name, index);
                 index
@@ -351,7 +352,7 @@ impl World {
             edits.push((position, index));
         }
         edits.sort_unstable_by_key(|&(position, _)| position);
-        (palette, edits)
+        Ok((palette, edits))
     }
 
     /// English label for a builtin, or the original id string for a placeholder.
@@ -1602,6 +1603,16 @@ mod tests {
         assert_eq!(snapshot.edits().len(), 3);
         assert_eq!(world.edits()[0].0, [-1, 150, 32]);
         assert_eq!(world.edits()[1].0, [0, 150, 0]);
+    }
+
+    #[test]
+    fn a_palette_that_does_not_fit_in_u16_returns_an_error() {
+        let mut world = World::new(1);
+        world.palette = (0..65_536).map(|index| format!("m:b{index:05}")).collect();
+        world.palette[0] = "strata:air".to_string();
+        world.set_block([0, 80, 0], STONE);
+        let error = world.saved_palette_and_edits().unwrap_err();
+        assert_eq!(error, PALETTE_TOO_LARGE);
     }
 
     #[test]
