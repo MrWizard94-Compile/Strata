@@ -28,6 +28,7 @@ const DIAMOND_ORE: u32 = 16;
 /// Axis-aligned block face to texture-array layer. Grass side v=0 is its top
 /// edge; wood grain runs along increasing v. Air is never meshed and falls back
 /// to limestone instead of an invalid layer.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn layer_for(block: Block, normal: [i32; 3]) -> u32 {
     match block {
         Block::Grass if normal[1] > 0 => GRASS_TOP,
@@ -67,37 +68,57 @@ pub fn rgba_layers() -> Vec<u8> {
 
 /// Complete 32,16,8,4,2,1 mip chain, each level containing every packed layer.
 /// RGB is decoded from sRGB, averaged in linear light, then encoded to sRGB.
-/// Alpha stays opaque. No layer ever contributes to another layer's mip.
+/// Opaque texels average evenly. Cutout texels weight that average by coverage
+/// and store the coverage in alpha, so a distant leaf stays partly open.
+/// No layer ever contributes to another layer's mip.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn mip_chain() -> Vec<Vec<u8>> {
-    let mut levels = vec![rgba_layers()];
-    let mut size = TILE_SIZE;
-    while size > 1 {
-        let next = downsample(levels.last().expect("base level exists"), size);
+    mip_chain_from(&rgba_layers(), TILE_SIZE, LAYER_COUNT)
+}
+
+/// Mip chain for an already packed layer array. `size` is the base edge.
+/// The level count is `log2(size) + 1`, down to 1 pixel. The average is the
+/// same coverage-weighted linear-light filter as the procedural tiles.
+pub fn mip_chain_from(base: &[u8], size: u32, layers: u32) -> Vec<Vec<u8>> {
+    assert_eq!(base.len(), (size * size * layers * 4) as usize);
+    let mut levels = vec![base.to_vec()];
+    let mut current = size;
+    while current > 1 {
+        let next = downsample(levels.last().expect("base level exists"), current, layers);
         levels.push(next);
-        size /= 2;
+        current /= 2;
     }
     levels
 }
 
-fn downsample(source: &[u8], size: u32) -> Vec<u8> {
+fn downsample(source: &[u8], size: u32, layers: u32) -> Vec<u8> {
     let next = size / 2;
-    let mut destination = vec![255; (next * next * LAYER_COUNT * 4) as usize];
-    for layer in 0..LAYER_COUNT {
+    let mut destination = vec![0; (next * next * layers * 4) as usize];
+    for layer in 0..layers {
         for y in 0..next {
             for x in 0..next {
                 let target = ((layer * next * next + y * next + x) * 4) as usize;
-                for channel in 0..3 {
-                    let mut sum = 0.0;
-                    for dy in 0..2 {
-                        for dx in 0..2 {
-                            let source_index =
-                                ((layer * size * size + (y * 2 + dy) * size + x * 2 + dx) * 4)
-                                    as usize;
-                            sum += srgb_to_linear(source[source_index + channel]);
+                let mut weight = 0.0;
+                let mut sums = [0.0; 3];
+                let mut coverage = 0.0;
+                for dy in 0..2 {
+                    for dx in 0..2 {
+                        let source_index =
+                            ((layer * size * size + (y * 2 + dy) * size + x * 2 + dx) * 4) as usize;
+                        let alpha = f64::from(source[source_index + 3]) / 255.0;
+                        coverage += alpha;
+                        weight += alpha;
+                        for (channel, sum) in sums.iter_mut().enumerate() {
+                            *sum += srgb_to_linear(source[source_index + channel]) * alpha;
                         }
                     }
-                    destination[target + channel] = linear_to_srgb(sum * 0.25);
                 }
+                if weight > 0.0 {
+                    for (channel, sum) in sums.iter().enumerate() {
+                        destination[target + channel] = linear_to_srgb(sum / weight);
+                    }
+                }
+                destination[target + 3] = (coverage * 0.25 * 255.0).round() as u8;
             }
         }
     }
@@ -126,28 +147,28 @@ fn pixel(layer: u32, x: i32, y: i32) -> [u8; 4] {
     let x = x.rem_euclid(TILE_SIZE as i32);
     let y = y.rem_euclid(TILE_SIZE as i32);
     let grain = (hash(x, y, layer + 17) % 7) as i16 - 3;
-    let color = match layer {
-        GRASS_TOP => meadow(x, y),
-        GRASS_SIDE => grass_side(x, y),
-        SOIL => soil(x, y),
-        LIMESTONE => limestone(x, y),
-        SAND => sand(x, y),
-        WATER => water(x, y),
-        BARK => bark(x, y),
-        ENDGRAIN => endgrain(x, y),
+    let (color, alpha) = match layer {
+        GRASS_TOP => (meadow(x, y), 255),
+        GRASS_SIDE => (grass_side(x, y), 255),
+        SOIL => (soil(x, y), 255),
+        LIMESTONE => (limestone(x, y), 255),
+        SAND => (sand(x, y), 255),
+        WATER => (water(x, y), 255),
+        BARK => (bark(x, y), 255),
+        ENDGRAIN => (endgrain(x, y), 255),
         LEAVES => leaves(x, y),
-        SNOW => snow(x, y),
-        CLAY => clay(x, y),
-        CRYSTAL => crystal(x, y),
-        BASALT => basalt(x, y),
-        COAL_ORE => ore(x, y, [32, 32, 34], 13),
-        IRON_ORE => ore(x, y, [176, 96, 64], 29),
-        GOLD_ORE => ore(x, y, [228, 184, 62], 47),
-        DIAMOND_ORE => ore(x, y, [86, 228, 214], 61),
+        SNOW => (snow(x, y), 255),
+        CLAY => (clay(x, y), 255),
+        CRYSTAL => (crystal(x, y), 255),
+        BASALT => (basalt(x, y), 255),
+        COAL_ORE => (ore(x, y, [32, 32, 34], 13), 255),
+        IRON_ORE => (ore(x, y, [176, 96, 64], 29), 255),
+        GOLD_ORE => (ore(x, y, [228, 184, 62], 47), 255),
+        DIAMOND_ORE => (ore(x, y, [86, 228, 214], 61), 255),
         _ => unreachable!("all generated layer IDs are defined"),
     };
     let color = shade(color, grain);
-    [color[0], color[1], color[2], 255]
+    [color[0], color[1], color[2], alpha]
 }
 
 fn meadow(x: i32, y: i32) -> [u8; 3] {
@@ -296,11 +317,11 @@ fn endgrain(x: i32, y: i32) -> [u8; 3] {
     }
 }
 
-fn leaves(x: i32, y: i32) -> [u8; 3] {
+fn leaves(x: i32, y: i32) -> ([u8; 3], u8) {
     let row = y.div_euclid(8);
     let local_x = (x + (row & 1) * 4).rem_euclid(8) - 3;
     let local_y = y.rem_euclid(8) - 3;
-    if local_x.abs() + local_y.abs() > 4 {
+    let rgb = if local_x.abs() + local_y.abs() > 4 {
         [34, 76, 43]
     } else if local_x == 0 && local_y <= 3 {
         [118, 153, 73]
@@ -310,7 +331,15 @@ fn leaves(x: i32, y: i32) -> [u8; 3] {
         [50, 99, 49]
     } else {
         [68, 117, 55]
-    }
+    };
+    // Corners of each staggered 8×8 leaf are open. Coverage stays high enough
+    // that the 1-pixel mip remains above the shader's 0.5 discard.
+    let alpha = if local_x.abs() + local_y.abs() >= 6 {
+        0
+    } else {
+        255
+    };
+    (rgb, alpha)
 }
 
 fn snow(x: i32, y: i32) -> [u8; 3] {
@@ -429,7 +458,22 @@ mod tests {
         let first = rgba_layers();
         assert_eq!(first.len(), (32 * 32 * LAYER_COUNT * 4) as usize);
         assert_eq!(first, rgba_layers());
-        assert!(first.chunks_exact(4).all(|rgba| rgba[3] == 255));
+        let layer_bytes = (TILE_SIZE * TILE_SIZE * 4) as usize;
+        for (layer, bytes) in first.chunks_exact(layer_bytes).enumerate() {
+            if layer as u32 == LEAVES {
+                let holes = bytes.chunks_exact(4).filter(|rgba| rgba[3] == 0).count();
+                assert_eq!(holes, 208);
+                assert_eq!(
+                    bytes.chunks_exact(4).filter(|rgba| rgba[3] == 255).count(),
+                    1024 - 208
+                );
+            } else {
+                assert!(
+                    bytes.chunks_exact(4).all(|rgba| rgba[3] == 255),
+                    "layer {layer} stays opaque"
+                );
+            }
+        }
     }
 
     #[test]
@@ -524,8 +568,21 @@ mod tests {
         for (level, pixels) in levels.iter().enumerate() {
             let size = TILE_SIZE >> level;
             assert_eq!(pixels.len(), (size * size * LAYER_COUNT * 4) as usize);
-            assert!(pixels.chunks_exact(4).all(|rgba| rgba[3] == 255));
+            for layer in 0..LAYER_COUNT {
+                for texel in 0..size * size {
+                    let alpha = pixels[((layer * size * size + texel) * 4 + 3) as usize];
+                    if layer == LEAVES {
+                        continue;
+                    }
+                    assert_eq!(alpha, 255, "layer {layer} mip {level} stays opaque");
+                }
+            }
         }
+        let leaf_mip = &levels[5][(LEAVES * 4) as usize..(LEAVES * 4 + 4) as usize];
+        assert_eq!(
+            leaf_mip[3], 203,
+            "1px leaf coverage is 816/1024, which rounds to 203 and stays above discard"
+        );
         assert_eq!(levels, mip_chain());
     }
 
@@ -538,7 +595,7 @@ mod tests {
                 pixels[offset..offset + 4].copy_from_slice(&[37 + layer as u8, 113, 209, 255]);
             }
         }
-        let filtered = downsample(&pixels, 2);
+        let filtered = downsample(&pixels, 2, LAYER_COUNT);
         for (layer, pixel) in filtered.chunks_exact(4).enumerate() {
             assert_eq!(pixel, [37 + layer as u8, 113, 209, 255]);
         }
@@ -546,6 +603,45 @@ mod tests {
             let value = if pixel < 2 { 0 } else { 255 };
             bytes.copy_from_slice(&[value, value, value, 255]);
         }
-        assert_eq!(&downsample(&pixels, 2)[..4], &[188, 188, 188, 255]);
+        assert_eq!(
+            &downsample(&pixels, 2, LAYER_COUNT)[..4],
+            &[188, 188, 188, 255]
+        );
+    }
+
+    #[test]
+    #[ignore = "rewrites the shipped block PNGs from the procedural generator"]
+    fn write_shipped_block_pngs() {
+        let names = [
+            "grass-top.png",
+            "grass-side.png",
+            "soil.png",
+            "limestone.png",
+            "sand.png",
+            "water.png",
+            "wood-bark.png",
+            "wood-endgrain.png",
+            "leaves.png",
+            "snow.png",
+            "clay.png",
+            "crystal.png",
+            "basalt.png",
+            "coal-ore.png",
+            "iron-ore.png",
+            "gold-ore.png",
+            "diamond-ore.png",
+        ];
+        let pixels = rgba_layers();
+        let stride = (TILE_SIZE * TILE_SIZE * 4) as usize;
+        let directory = std::path::Path::new("assets/strata/textures/block");
+        std::fs::create_dir_all(directory).unwrap();
+        for (index, name) in names.iter().enumerate() {
+            let png = crate::texture_pack::encode_png(
+                &pixels[index * stride..(index + 1) * stride],
+                TILE_SIZE,
+            )
+            .unwrap();
+            std::fs::write(directory.join(name), png).unwrap();
+        }
     }
 }

@@ -44,7 +44,8 @@ pub fn export_materials(directory: &Path) -> Result<(), String> {
             &pixels[layer * stride..(layer + 1) * stride],
         )?;
     }
-    // A nearest-neighbour contact sheet uses the same bytes, with no retouching.
+    // A nearest-neighbour contact sheet. Per-layer PNGs stay exact; the sheet
+    // composites coverage so cutout holes show against the backdrop.
     let scale = 6;
     let gap = 16;
     let columns = 4;
@@ -63,7 +64,16 @@ pub fn export_materials(directory: &Path) -> Result<(), String> {
                 let target_x = gap + (layer % columns) * cell + x;
                 let target_y = gap + (layer / columns) * cell + y;
                 let target = (target_y * width + target_x) * 4;
-                sheet[target..target + 4].copy_from_slice(&pixels[source..source + 4]);
+                // Per-layer files stay exact. The sheet composites coverage over the
+                // backdrop so leaf holes remain visible in the preview.
+                let coverage = u32::from(pixels[source + 3]);
+                let backdrop = [18_u32, 28, 31];
+                for channel in 0..3 {
+                    let authored = u32::from(pixels[source + channel]);
+                    sheet[target + channel] =
+                        ((authored * coverage + backdrop[channel] * (255 - coverage)) / 255) as u8;
+                }
+                sheet[target + 3] = 255;
             }
         }
     }
@@ -77,7 +87,7 @@ pub fn export_materials(directory: &Path) -> Result<(), String> {
         "tile_size": materials::TILE_SIZE,
         "color_space": "sRGB RGBA8",
         "provenance": "Original deterministic STRATA material algorithms in src/materials.rs; no external source assets",
-        "contact_sheet": "four columns, row-major layer order; 6x nearest-neighbour preview",
+        "contact_sheet": "four columns, row-major layer order; 6x nearest-neighbour preview; leaf holes composited over the backdrop. Per-layer PNGs stay exact.",
         "layers": NAMES,
         "usage": "Exports exact runtime bytes; editing these files does not yet hot-reload the engine."
     });
