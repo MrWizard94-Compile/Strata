@@ -1,0 +1,10 @@
+name_key = "block.strata.leaves"
+display = "Canopy"
+solid = true
+placeable = true
+replaceable = false
+render = "cutout"
+tint = [0.22, 0.43, 0.22, 1.0]
+
+[textures]
+all = "strata:leaves"

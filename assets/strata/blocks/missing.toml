@@ -1,0 +1,10 @@
+name_key = "block.strata.missing"
+display = "Missing block"
+solid = true
+placeable = false
+replaceable = false
+render = "opaque"
+tint = [0.85, 0.15, 0.45, 1.0]
+
+[textures]
+all = "strata:missing"

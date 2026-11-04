@@ -5,7 +5,9 @@
 //! block to the registry makes it appear in the picker without another edit.
 
 use crate::daylight;
-use crate::world::{Block, RayHit, World};
+use crate::world::{
+    AIR, BASALT, Block, CLAY, CRYSTAL, GRASS, LEAVES, RayHit, SAND, STONE, WOOD, World,
+};
 
 /// Eye-to-face distance, in blocks, for the outline and for break/place.
 pub const REACH_BLOCKS: f32 = 5.0;
@@ -117,16 +119,7 @@ impl EditRepeat {
 
 /// Materials offered to a new player. Older saves that omit a hotbar use this too.
 pub fn default_hotbar() -> [Block; HOTBAR_SLOTS] {
-    [
-        Block::Grass,
-        Block::Stone,
-        Block::Wood,
-        Block::Leaves,
-        Block::Sand,
-        Block::Clay,
-        Block::Crystal,
-        Block::Basalt,
-    ]
+    [GRASS, STONE, WOOD, LEAVES, SAND, CLAY, CRYSTAL, BASALT]
 }
 
 /// Placeable blocks in save-id order. This is the picker catalog.
@@ -254,17 +247,14 @@ pub fn plan_edit(query: &EditQuery<'_>, body_blocks: impl Fn([i32; 3]) -> bool) 
     if query.place && !query.material.is_placeable() {
         return EditOutcome::Rejected("That material cannot be placed.");
     }
-    let block = if query.place {
-        query.material
-    } else {
-        Block::Air
-    };
+    let block = if query.place { query.material } else { AIR };
     EditOutcome::Applied { position, block }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::world::{COAL_ORE, DIAMOND_ORE, DIRT, GOLD_ORE, IRON_ORE, SNOW, WATER};
 
     fn query<'a>(
         world: &'a World,
@@ -414,30 +404,30 @@ mod tests {
     fn reach_limit_gates_the_outline_and_both_edit_actions() {
         let eye = [0.5, 150.5, 0.5];
         let mut near = World::new(1);
-        near.set_block([5, 150, 0], Block::Stone);
+        near.set_block([5, 150, 0], STONE);
         assert_eq!(
             outline_target(&near, eye, [1.0, 0.0, 0.0]),
             Some([5, 150, 0])
         );
         assert_eq!(
-            plan_edit(&query(&near, eye, false, Block::Dirt, 0), |_| false),
+            plan_edit(&query(&near, eye, false, DIRT, 0), |_| false),
             EditOutcome::Applied {
                 position: [5, 150, 0],
-                block: Block::Air,
+                block: AIR,
             }
         );
 
         let mut far = World::new(1);
-        far.set_block([6, 150, 0], Block::Stone);
+        far.set_block([6, 150, 0], STONE);
         assert_eq!(outline_target(&far, eye, [1.0, 0.0, 0.0]), None);
         assert_eq!(
-            plan_edit(&query(&far, eye, true, Block::Dirt, 0), |_| false),
+            plan_edit(&query(&far, eye, true, DIRT, 0), |_| false),
             EditOutcome::Miss
         );
 
         // Near face is exactly REACH_BLOCKS away and still counts.
         let mut edge = World::new(1);
-        edge.set_block([6, 150, 0], Block::Stone);
+        edge.set_block([6, 150, 0], STONE);
         let edge_eye = [1.0, 150.5, 0.5];
         assert_eq!(
             outline_target(&edge, edge_eye, [1.0, 0.0, 0.0]),
@@ -447,7 +437,7 @@ mod tests {
         // The same boundary looking along −X: block −5 occupies [−5, −4),
         // so the near face is 5 blocks from an eye at x = 1.
         let mut west = World::new(1);
-        west.set_block([-5, 150, 0], Block::Stone);
+        west.set_block([-5, 150, 0], STONE);
         let west_eye = [1.0, 150.5, 0.5];
         let west_dir = [-1.0, 0.0, 0.0];
         assert_eq!(
@@ -459,14 +449,14 @@ mod tests {
             eye: west_eye,
             direction: west_dir,
             place: false,
-            material: Block::Dirt,
+            material: DIRT,
             edit_count: 0,
         };
         assert_eq!(
             plan_edit(&break_west, |_| false),
             EditOutcome::Applied {
                 position: [-5, 150, 0],
-                block: Block::Air,
+                block: AIR,
             }
         );
         let mut place_west = break_west;
@@ -475,11 +465,11 @@ mod tests {
             plan_edit(&place_west, |_| false),
             EditOutcome::Applied {
                 position: [-4, 150, 0],
-                block: Block::Dirt,
+                block: DIRT,
             }
         );
         let mut beyond = World::new(1);
-        beyond.set_block([-6, 150, 0], Block::Stone);
+        beyond.set_block([-6, 150, 0], STONE);
         assert_eq!(outline_target(&beyond, west_eye, west_dir), None);
         assert_eq!(
             plan_edit(
@@ -488,7 +478,7 @@ mod tests {
                     eye: west_eye,
                     direction: west_dir,
                     place: true,
-                    material: Block::Dirt,
+                    material: DIRT,
                     edit_count: 0,
                 },
                 |_| false
@@ -500,36 +490,30 @@ mod tests {
     #[test]
     fn placement_keeps_the_body_check_and_vertical_bounds() {
         let mut world = World::new(1);
-        world.set_block([2, 150, 0], Block::Stone);
+        world.set_block([2, 150, 0], STONE);
         let eye = [0.5, 150.5, 0.5];
         assert_eq!(
-            plan_edit(&query(&world, eye, true, Block::Dirt, 0), |position| {
+            plan_edit(&query(&world, eye, true, DIRT, 0), |position| {
                 position == [1, 150, 0]
             }),
             EditOutcome::Rejected(BODY_MESSAGE)
         );
         assert_eq!(
-            plan_edit(&query(&world, eye, true, Block::Dirt, 0), |_| false),
+            plan_edit(&query(&world, eye, true, DIRT, 0), |_| false),
             EditOutcome::Applied {
                 position: [1, 150, 0],
-                block: Block::Dirt,
+                block: DIRT,
             }
         );
         assert_eq!(
-            plan_edit(&query(&world, eye, true, Block::Water, 0), |_| false),
+            plan_edit(&query(&world, eye, true, WATER, 0), |_| false),
             EditOutcome::Rejected("That material cannot be placed.")
         );
 
-        world.set_block([2, MAX_EDIT_Y, 0], Block::Stone);
+        world.set_block([2, MAX_EDIT_Y, 0], STONE);
         assert!(matches!(
             plan_edit(
-                &query(
-                    &world,
-                    [0.5, MAX_EDIT_Y as f32 + 0.5, 0.5],
-                    false,
-                    Block::Dirt,
-                    0
-                ),
+                &query(&world, [0.5, MAX_EDIT_Y as f32 + 0.5, 0.5], false, DIRT, 0),
                 |_| false
             ),
             EditOutcome::Applied {
@@ -537,23 +521,23 @@ mod tests {
                 ..
             }
         ));
-        world.set_block([2, MAX_EDIT_Y + 1, 0], Block::Stone);
+        world.set_block([2, MAX_EDIT_Y + 1, 0], STONE);
         assert_eq!(
             plan_edit(
                 &query(
                     &world,
                     [0.5, (MAX_EDIT_Y + 1) as f32 + 0.5, 0.5],
                     false,
-                    Block::Dirt,
+                    DIRT,
                     0
                 ),
                 |_| false
             ),
             EditOutcome::Rejected(HEIGHT_MESSAGE)
         );
-        world.set_block([2, MIN_EDIT_Y - 1, 0], Block::Stone);
+        world.set_block([2, MIN_EDIT_Y - 1, 0], STONE);
         for x in 0..2 {
-            world.set_block([x, MIN_EDIT_Y - 1, 0], Block::Air);
+            world.set_block([x, MIN_EDIT_Y - 1, 0], AIR);
         }
         assert_eq!(
             plan_edit(
@@ -561,7 +545,7 @@ mod tests {
                     &world,
                     [0.5, (MIN_EDIT_Y - 1) as f32 + 0.5, 0.5],
                     true,
-                    Block::Dirt,
+                    DIRT,
                     0
                 ),
                 |_| false
@@ -569,10 +553,9 @@ mod tests {
             EditOutcome::Rejected(HEIGHT_MESSAGE)
         );
         assert_eq!(
-            plan_edit(
-                &query(&world, eye, false, Block::Dirt, MAX_STORED_EDITS),
-                |_| false
-            ),
+            plan_edit(&query(&world, eye, false, DIRT, MAX_STORED_EDITS), |_| {
+                false
+            }),
             EditOutcome::Rejected(LIMIT_MESSAGE)
         );
     }
@@ -585,17 +568,20 @@ mod tests {
             listed, expected,
             "the picker must follow the registry, including blocks added later"
         );
-        assert!(expected.contains(&Block::Dirt));
-        assert!(expected.contains(&Block::Snow));
-        assert!(expected.contains(&Block::CoalOre));
-        assert!(expected.contains(&Block::IronOre));
-        assert!(expected.contains(&Block::GoldOre));
-        assert!(expected.contains(&Block::DiamondOre));
+        assert!(expected.contains(&DIRT));
+        assert!(expected.contains(&SNOW));
+        assert!(expected.contains(&COAL_ORE));
+        assert!(expected.contains(&IRON_ORE));
+        assert!(expected.contains(&GOLD_ORE));
+        assert!(expected.contains(&DIAMOND_ORE));
         assert!(expected.len() > HOTBAR_SLOTS);
         assert!(expected.iter().all(|block| block.is_placeable()));
-        assert!(!listed.contains(&Block::Air));
-        assert!(!listed.contains(&Block::Water));
-        let ids: Vec<u8> = listed.iter().map(|block| *block as u8).collect();
+        assert!(!listed.contains(&AIR));
+        assert!(!listed.contains(&WATER));
+        let ids: Vec<u8> = listed
+            .iter()
+            .map(|block| block.legacy_u8().expect("placeable builtins fit schema 1"))
+            .collect();
         let mut sorted = ids.clone();
         sorted.sort_unstable();
         sorted.dedup();
@@ -611,17 +597,17 @@ mod tests {
         hotbar.scroll(1);
         assert_eq!(hotbar.selected(), 5);
         let before = hotbar.slots();
-        assert!(hotbar.assign(Block::Snow));
-        assert_eq!(hotbar.slots()[5], Block::Snow);
-        assert_eq!(hotbar.selected_block(), Block::Snow);
+        assert!(hotbar.assign(SNOW));
+        assert_eq!(hotbar.slots()[5], SNOW);
+        assert_eq!(hotbar.selected_block(), SNOW);
         for (index, slot) in hotbar.slots().into_iter().enumerate() {
             if index != 5 {
                 assert_eq!(slot, before[index]);
             }
         }
-        assert!(!hotbar.assign(Block::Water));
-        assert!(!hotbar.assign(Block::Air));
-        assert_eq!(hotbar.slots()[5], Block::Snow);
+        assert!(!hotbar.assign(WATER));
+        assert!(!hotbar.assign(AIR));
+        assert_eq!(hotbar.slots()[5], SNOW);
         hotbar.select(HOTBAR_SLOTS);
         assert_eq!(hotbar.selected(), 5);
         hotbar.scroll(-6);

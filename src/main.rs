@@ -6,6 +6,7 @@ mod interaction;
 mod material_export;
 mod materials;
 mod player;
+mod registry;
 mod renderer;
 mod save;
 mod streaming;
@@ -1301,6 +1302,10 @@ fn apply_debug_hour_skip(
 }
 
 fn main() {
+    if let Err(error) = registry::install() {
+        eprintln!("STRATA block registry: {error}");
+        std::process::exit(1);
+    }
     let options = match Options::parse() {
         Ok(o) => o,
         Err(e) => {

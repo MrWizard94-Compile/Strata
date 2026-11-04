@@ -1,7 +1,7 @@
 //! Reproducible, single-threaded CPU measurements of the production world mesher.
 //! Dataset creation, mesh inspection, destruction, and report I/O are not timed.
 
-use crate::world::{Block, CHUNK_SIZE, ChunkKey, Mesh, Vertex, World};
+use crate::world::{AIR, BASALT, CHUNK_SIZE, ChunkKey, Mesh, STONE, Vertex, WOOD, World};
 use serde::Serialize;
 use std::{
     fs::{self, OpenOptions},
@@ -198,15 +198,15 @@ fn scenarios() -> Vec<Scenario> {
         for y in -1..=CHUNK_SIZE {
             for x in -1..=CHUNK_SIZE {
                 let position = [x, HIGH_CHUNK.1 * CHUNK_SIZE + y, z];
-                enclosed.set_block(position, Block::Stone);
+                enclosed.set_block(position, STONE);
                 if (x + y + z).rem_euclid(2) == 0 {
-                    checkerboard.set_block(position, Block::Stone);
+                    checkerboard.set_block(position, STONE);
                 }
                 if [x, y, z]
                     .iter()
                     .all(|&value| (0..CHUNK_SIZE).contains(&value))
                 {
-                    isolated.set_block(position, Block::Stone);
+                    isolated.set_block(position, STONE);
                 }
             }
         }
@@ -219,13 +219,13 @@ fn scenarios() -> Vec<Scenario> {
     for z in -68..=-60 {
         for x in 48..=79 {
             for y in ground - 8..=ground + 3 {
-                edited.set_block([x, y, z], Block::Air);
+                edited.set_block([x, y, z], AIR);
             }
-            edited.set_block([x, ground - 9, z], Block::Basalt);
+            edited.set_block([x, ground - 9, z], BASALT);
         }
     }
     for x in 56..=72 {
-        edited.set_block([x, ground + 4, -64], Block::Wood);
+        edited.set_block([x, ground + 4, -64], WOOD);
     }
 
     vec![

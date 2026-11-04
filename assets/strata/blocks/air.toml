@@ -1,0 +1,7 @@
+name_key = "block.strata.air"
+display = "Air"
+solid = false
+placeable = false
+replaceable = true
+render = "invisible"
+tint = [0.0, 0.0, 0.0, 0.0]

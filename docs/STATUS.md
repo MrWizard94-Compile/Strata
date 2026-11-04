@@ -2,6 +2,28 @@
 
 2026-10-21. **Goal active.** STRATA has a native editable-world foundation, original 32×32 materials and reproducible CPU meshing evidence. The requested production and studio grade survival/combat/building/exploration game and Microsoft pitch remain incomplete. The 2026-10-20 counts below remain that checkpoint. Day/night evidence is the next section.
 
+## Block registry (schema 1 still)
+
+Builtin blocks load from `assets/strata/blocks/*.toml` through the only TOML parser, in `src/registry.rs`. Runtime ids are `u16`. Ids 0 through 15 match the old schema-1 numbers. `strata:missing` is 16. Worldgen resolves names once in `World::new`. The mesher treats fluid by `RenderClass`, and still culls cutout blocks like opaque ones. Saves are still schema 1: edits and the hotbar are those numeric ids. Generator version stays 3. The seven golden chunk digests are unchanged.
+
+Texture layers are assigned at freeze in sorted texture-id order. The seventeen authored tiles keep their pixels. `strata:missing` is a new magenta/black checker, layer 13, not limestone. A packaged executable with no `assets/strata/blocks` directory uses the same TOML embedded in the binary. If that directory exists and a file is wrong, startup fails and names the file and the key.
+
+Release chunk generation on this Linux agent, seed `20261021`, the seven golden chunks, 3 untimed warmup passes and 30 timed passes (210 chunks), `cargo test --release --locked`:
+
+- Before the registry, one run: **2741.8 µs/chunk**.
+- After, three runs: **2764.4, 2777.1, and 2779.0 µs/chunk**.
+
+That is about one percent, inside run-to-run noise. It is not a GTX 1660 Ti measurement and it does not include meshing.
+
+Linux verification for this change, Rust 1.97.1:
+
+- `cargo fmt --check`: passed.
+- `cargo test --locked`: **133 passed, 0 failed, 1 ignored**. The ignored test is `native_gpu_validates_all_world_shader_pipelines`. It was not re-run for this change.
+- `cargo clippy --locked --all-targets -- -D warnings`: passed.
+- `cargo build --release --locked`: passed on this agent after the commands above.
+
+Unverified: windowed play, the lavapipe shader pipeline with the 18-layer array, and the Windows / NVIDIA GTX 1660 Ti acceptance machine.
+
 ## Day/night cycle
 
 Playing advances a 20-minute day on the fixed 60 Hz simulation tick. The title, pause menu, settings, and focus loss all go through the same step function and freeze that clock. Schema 1 generator 3 stores `time_of_day` in `[0, 1)` (midnight is 0). A generator 3 file missing that field loads at 08:00. Generator 1 and generator 2 files are rejected and left untouched. Non-finite values, negatives, and exactly 1.0 are rejected and the file is kept. Sun direction, sky, fog, ambient, and sun color are appended camera uniforms. Night clouds and water use the same linear lighting as the terrain. The 44-byte vertex layout is unchanged.

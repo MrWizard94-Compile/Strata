@@ -1,0 +1,10 @@
+name_key = "block.strata.dirt"
+display = "Earth"
+solid = true
+placeable = true
+replaceable = false
+render = "opaque"
+tint = [0.39, 0.26, 0.16, 1.0]
+
+[textures]
+all = "strata:soil"

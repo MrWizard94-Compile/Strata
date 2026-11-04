@@ -1,0 +1,10 @@
+name_key = "block.strata.coal_ore"
+display = "Coal ore"
+solid = true
+placeable = true
+replaceable = false
+render = "opaque"
+tint = [0.16, 0.16, 0.17, 1.0]
+
+[textures]
+all = "strata:coal_ore"

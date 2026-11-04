@@ -1,0 +1,10 @@
+name_key = "block.strata.sand"
+display = "River sand"
+solid = true
+placeable = true
+replaceable = false
+render = "opaque"
+tint = [0.80, 0.72, 0.48, 1.0]
+
+[textures]
+all = "strata:sand"

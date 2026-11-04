@@ -60,7 +60,7 @@ Walking eases in and out instead of snapping to full speed. Sprint applies only 
 
 ## Materials and CPU benchmarks
 
-The renderer samples seventeen original **32×32** sRGB material tiles, including grass top/side/underside, timber endgrain, and coal, iron, gold and diamond ore. Tiles repeat per block across merged faces. Six mip levels filter distant surfaces. These are initial art assets, pending full in-world and director review.
+The renderer samples the original **32×32** sRGB material tiles, including grass top/side/underside, timber endgrain, and coal, iron, gold and diamond ore, plus a magenta/black checker for a missing block. Layer order follows the block registry. Tiles repeat per block across merged faces. Six mip levels filter distant surfaces. These are initial art assets, pending full in-world and director review.
 
 `--export-materials <new-directory>` exports the exact runtime tiles as individual PNGs, a contact sheet and a manifest. The directory must not already exist and its parent must exist. Exported edits are not yet hot-reloaded into the game.
 

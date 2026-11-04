@@ -1,0 +1,10 @@
+name_key = "block.strata.crystal"
+display = "Lumen crystal"
+solid = true
+placeable = true
+replaceable = false
+render = "opaque"
+tint = [0.28, 0.86, 0.89, 1.0]
+
+[textures]
+all = "strata:crystal"

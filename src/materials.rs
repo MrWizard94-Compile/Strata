@@ -1,12 +1,14 @@
 //! Original 32-pixel material albedo tiles authored as deterministic pixel rules.
-//! Layers are RGBA8 sRGB, opaque, and independent of world seed. No asset files,
-//! image downloads, random generator, clock, or external dependency are involved.
+//! Layers are RGBA8 sRGB and independent of world seed. Block definitions name
+//! these tiles; this module still paints them. No image download or external
+//! art dependency is involved. `strata:missing` is an eighteenth checker.
 
-use crate::world::Block;
+use crate::registry::{self, BlockId};
 
 pub const TILE_SIZE: u32 = 32;
-pub const LAYER_COUNT: u32 = 17;
 
+/// Historical authoring index. Grain salt uses this so the original seventeen
+/// tiles stay byte-identical after GPU layers are numbered in sorted id order.
 const GRASS_TOP: u32 = 0;
 const GRASS_SIDE: u32 = 1;
 const SOIL: u32 = 2;
@@ -25,44 +27,75 @@ const IRON_ORE: u32 = 14;
 const GOLD_ORE: u32 = 15;
 const DIAMOND_ORE: u32 = 16;
 
-/// Axis-aligned block face to texture-array layer. Grass side v=0 is its top
-/// edge; wood grain runs along increasing v. Air is never meshed and falls back
-/// to limestone instead of an invalid layer.
-pub fn layer_for(block: Block, normal: [i32; 3]) -> u32 {
-    match block {
-        Block::Grass if normal[1] > 0 => GRASS_TOP,
-        Block::Grass if normal[1] < 0 => SOIL,
-        Block::Grass => GRASS_SIDE,
-        Block::Dirt => SOIL,
-        Block::Stone | Block::Air => LIMESTONE,
-        Block::Sand => SAND,
-        Block::Water => WATER,
-        Block::Wood if normal[1] != 0 => ENDGRAIN,
-        Block::Wood => BARK,
-        Block::Leaves => LEAVES,
-        Block::Snow => SNOW,
-        Block::Clay => CLAY,
-        Block::Crystal => CRYSTAL,
-        Block::Basalt => BASALT,
-        Block::CoalOre => COAL_ORE,
-        Block::IronOre => IRON_ORE,
-        Block::GoldOre => GOLD_ORE,
-        Block::DiamondOre => DIAMOND_ORE,
-    }
+/// Layers in the texture array. The count is assigned when the registry freezes.
+pub fn layer_count() -> u32 {
+    registry::registry().texture_count()
+}
+
+/// Axis-aligned block face to texture-array layer. The index comes from the
+/// registry, not from this file's authoring order. Grass side v=0 is its top
+/// edge; wood grain runs along increasing v. Air is never meshed; its defensive
+/// layer is limestone, stored on the invisible row.
+pub fn layer_for(block: BlockId, normal: [i32; 3]) -> u32 {
+    let face = registry::BlockFace::from_normal(normal);
+    registry::registry()
+        .texture_variants(block, face)
+        .first()
+        .copied()
+        .unwrap_or(0)
 }
 
 /// Packed array order is layer, row, column, RGBA. Each layer has 4096 bytes.
-/// These are full albedo colors, not multipliers for Block::color().
+/// These are full albedo colors. Linear tint is multiplied in the shader later;
+/// it is not baked into these tiles.
 pub fn rgba_layers() -> Vec<u8> {
-    let mut bytes = Vec::with_capacity((TILE_SIZE * TILE_SIZE * LAYER_COUNT * 4) as usize);
-    for layer in 0..LAYER_COUNT {
+    let registry = registry::registry();
+    let count = registry.texture_count();
+    let mut bytes = Vec::with_capacity((TILE_SIZE * TILE_SIZE * count * 4) as usize);
+    for layer in 0..count {
+        let texture = registry.texture_id(layer).to_string();
         for y in 0..TILE_SIZE {
             for x in 0..TILE_SIZE {
-                bytes.extend_from_slice(&pixel(layer, x as i32, y as i32));
+                bytes.extend_from_slice(&pixel_for_texture(&texture, x as i32, y as i32));
             }
         }
     }
     bytes
+}
+
+fn pixel_for_texture(texture: &str, x: i32, y: i32) -> [u8; 4] {
+    let authoring = match texture {
+        "strata:grass_top" => GRASS_TOP,
+        "strata:grass_side" => GRASS_SIDE,
+        "strata:soil" => SOIL,
+        "strata:limestone" => LIMESTONE,
+        "strata:sand" => SAND,
+        "strata:water" => WATER,
+        "strata:bark" => BARK,
+        "strata:endgrain" => ENDGRAIN,
+        "strata:leaves" => LEAVES,
+        "strata:snow" => SNOW,
+        "strata:clay" => CLAY,
+        "strata:crystal" => CRYSTAL,
+        "strata:basalt" => BASALT,
+        "strata:coal_ore" => COAL_ORE,
+        "strata:iron_ore" => IRON_ORE,
+        "strata:gold_ore" => GOLD_ORE,
+        "strata:diamond_ore" => DIAMOND_ORE,
+        _ => return missing_checker(x, y),
+    };
+    pixel(authoring, x, y)
+}
+
+/// Magenta/black stand-in for `strata:missing`. Not a reused limestone tile.
+fn missing_checker(x: i32, y: i32) -> [u8; 4] {
+    let x = x.rem_euclid(TILE_SIZE as i32);
+    let y = y.rem_euclid(TILE_SIZE as i32);
+    if (x / 4 + y / 4).rem_euclid(2) == 0 {
+        [255, 0, 255, 255]
+    } else {
+        [0, 0, 0, 255]
+    }
 }
 
 /// Complete 32,16,8,4,2,1 mip chain, each level containing every packed layer.
@@ -81,8 +114,9 @@ pub fn mip_chain() -> Vec<Vec<u8>> {
 
 fn downsample(source: &[u8], size: u32) -> Vec<u8> {
     let next = size / 2;
-    let mut destination = vec![255; (next * next * LAYER_COUNT * 4) as usize];
-    for layer in 0..LAYER_COUNT {
+    let layers = layer_count();
+    let mut destination = vec![255; (next * next * layers * 4) as usize];
+    for layer in 0..layers {
         for y in 0..next {
             for x in 0..next {
                 let target = ((layer * next * next + y * next + x) * 4) as usize;
@@ -427,7 +461,7 @@ mod tests {
     #[test]
     fn dimensions_alpha_and_bytes_are_deterministic() {
         let first = rgba_layers();
-        assert_eq!(first.len(), (32 * 32 * LAYER_COUNT * 4) as usize);
+        assert_eq!(first.len(), (32 * 32 * layer_count() * 4) as usize);
         assert_eq!(first, rgba_layers());
         assert!(first.chunks_exact(4).all(|rgba| rgba[3] == 255));
     }
@@ -442,43 +476,45 @@ mod tests {
             [0, 0, 1],
             [0, 0, -1],
         ];
+        use crate::world::{self, Block};
         let mut id = 0_u8;
         while let Some(block) = Block::from_id(id) {
             for normal in normals {
-                assert!(layer_for(block, normal) < LAYER_COUNT);
+                assert!(layer_for(block, normal) < layer_count());
             }
             id += 1;
         }
         assert!(id > 15);
+        assert!(layer_for(crate::registry::MISSING, [0, 1, 0]) < layer_count());
         let ore_layers = [
-            layer_for(Block::CoalOre, [0, 1, 0]),
-            layer_for(Block::IronOre, [0, 1, 0]),
-            layer_for(Block::GoldOre, [0, 1, 0]),
-            layer_for(Block::DiamondOre, [0, 1, 0]),
+            layer_for(world::COAL_ORE, [0, 1, 0]),
+            layer_for(world::IRON_ORE, [0, 1, 0]),
+            layer_for(world::GOLD_ORE, [0, 1, 0]),
+            layer_for(world::DIAMOND_ORE, [0, 1, 0]),
         ];
         assert!(
             ore_layers
                 .iter()
-                .all(|layer| *layer != layer_for(Block::Stone, [0, 1, 0]))
+                .all(|layer| *layer != layer_for(world::STONE, [0, 1, 0]))
         );
         for (index, layer) in ore_layers.iter().enumerate() {
             assert!(!ore_layers[..index].contains(layer));
         }
         assert_ne!(
-            layer_for(Block::Grass, [0, 1, 0]),
-            layer_for(Block::Grass, [1, 0, 0])
+            layer_for(world::GRASS, [0, 1, 0]),
+            layer_for(world::GRASS, [1, 0, 0])
         );
         assert_eq!(
-            layer_for(Block::Grass, [0, -1, 0]),
-            layer_for(Block::Dirt, [0, 1, 0])
+            layer_for(world::GRASS, [0, -1, 0]),
+            layer_for(world::DIRT, [0, 1, 0])
         );
         assert_ne!(
-            layer_for(Block::Wood, [0, 1, 0]),
-            layer_for(Block::Wood, [1, 0, 0])
+            layer_for(world::WOOD, [0, 1, 0]),
+            layer_for(world::WOOD, [1, 0, 0])
         );
         assert_eq!(
-            layer_for(Block::Wood, [0, 1, 0]),
-            layer_for(Block::Wood, [0, -1, 0])
+            layer_for(world::WOOD, [0, 1, 0]),
+            layer_for(world::WOOD, [0, -1, 0])
         );
     }
 
@@ -488,29 +524,48 @@ mod tests {
         let layers: Vec<_> = pixels
             .chunks_exact((TILE_SIZE * TILE_SIZE * 4) as usize)
             .collect();
+        let missing = registry::registry()
+            .texture_index("strata:missing")
+            .unwrap() as usize;
         for (index, layer) in layers.iter().enumerate() {
-            let colors: HashSet<_> = layer.chunks_exact(4).collect();
-            assert!(
-                colors.len() > 12,
-                "layer {index} needs visible structural variation"
-            );
-            let min = layer.chunks_exact(4).map(|p| p[0]).min().unwrap();
-            let max = layer.chunks_exact(4).map(|p| p[0]).max().unwrap();
-            assert!(max - min > 20, "layer {index} must exceed fine-grain noise");
+            if index == missing {
+                assert!(layer.chunks_exact(4).any(|px| px == [255, 0, 255, 255]));
+                assert!(layer.chunks_exact(4).any(|px| px == [0, 0, 0, 255]));
+            } else {
+                let colors: HashSet<_> = layer.chunks_exact(4).collect();
+                assert!(
+                    colors.len() > 12,
+                    "layer {index} needs visible structural variation"
+                );
+                let min = layer.chunks_exact(4).map(|pixel| pixel[0]).min().unwrap();
+                let max = layer.chunks_exact(4).map(|pixel| pixel[0]).max().unwrap();
+                assert!(max - min > 20, "layer {index} must exceed fine-grain noise");
+            }
             for other in &layers[..index] {
                 assert_ne!(layer, other);
             }
         }
+        let grass_top = registry::registry()
+            .texture_index("strata:grass_top")
+            .unwrap();
+        let stride = (TILE_SIZE * TILE_SIZE * 4) as usize;
+        let baked = &pixels[grass_top as usize * stride..(grass_top as usize + 1) * stride];
+        assert_eq!(&baked[..4], &pixel(GRASS_TOP, 0, 0));
         assert!(pixel(GRASS_SIDE, 10, 0)[1] > pixel(GRASS_SIDE, 10, 31)[1]);
         assert!(pixel(CRYSTAL, 0, 0)[2] > pixel(CRYSTAL, 0, 0)[0]);
     }
 
     #[test]
     fn periodic_sampling_preserves_features_across_repeated_tiles() {
-        for layer in 0..LAYER_COUNT {
+        let registry = registry::registry();
+        for layer in 0..layer_count() {
+            let texture = registry.texture_id(layer);
             for y in 0..32 {
                 for x in 0..32 {
-                    assert_eq!(pixel(layer, x, y), pixel(layer, x + 32, y - 32));
+                    assert_eq!(
+                        pixel_for_texture(texture, x, y),
+                        pixel_for_texture(texture, x + 32, y - 32)
+                    );
                 }
             }
         }
@@ -523,7 +578,7 @@ mod tests {
         assert_eq!(levels[0], rgba_layers());
         for (level, pixels) in levels.iter().enumerate() {
             let size = TILE_SIZE >> level;
-            assert_eq!(pixels.len(), (size * size * LAYER_COUNT * 4) as usize);
+            assert_eq!(pixels.len(), (size * size * layer_count() * 4) as usize);
             assert!(pixels.chunks_exact(4).all(|rgba| rgba[3] == 255));
         }
         assert_eq!(levels, mip_chain());
@@ -531,8 +586,8 @@ mod tests {
 
     #[test]
     fn mip_filter_preserves_constant_layer_colors_and_averages_in_linear_light() {
-        let mut pixels = vec![0; (LAYER_COUNT * 2 * 2 * 4) as usize];
-        for layer in 0..LAYER_COUNT as usize {
+        let mut pixels = vec![0; (layer_count() * 2 * 2 * 4) as usize];
+        for layer in 0..layer_count() as usize {
             for pixel in 0..4 {
                 let offset = (layer * 4 + pixel) * 4;
                 pixels[offset..offset + 4].copy_from_slice(&[37 + layer as u8, 113, 209, 255]);

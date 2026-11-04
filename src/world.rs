@@ -6,7 +6,8 @@
 //! ore veins are anchored on global grids, so a feature that crosses a chunk is
 //! identical from either side. No generation cache is stored on `World`.
 
-use std::collections::HashMap;
+use crate::registry::{self, BlockId, RenderClass, WorldgenBlocks};
+use std::{collections::HashMap, sync::Arc};
 
 pub const CHUNK_SIZE: i32 = 32;
 pub const SEA_LEVEL: i32 = 28;
@@ -48,108 +49,13 @@ pub struct Mesh {
     pub indices: Vec<u32>,
 }
 
-/// IDs are part of the save format. Never reorder or recycle them.
-#[repr(u8)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub enum Block {
-    Air = 0,
-    Grass = 1,
-    Dirt = 2,
-    Stone = 3,
-    Sand = 4,
-    Water = 5,
-    Wood = 6,
-    Leaves = 7,
-    Snow = 8,
-    Clay = 9,
-    Crystal = 10,
-    Basalt = 11,
-    CoalOre = 12,
-    IronOre = 13,
-    GoldOre = 14,
-    DiamondOre = 15,
-}
+/// Runtime block id. Definitions live in the registry, not in this enum.
+pub type Block = BlockId;
 
-impl Block {
-    pub fn color(self) -> [f32; 4] {
-        match self {
-            Self::Air => [0.0, 0.0, 0.0, 0.0],
-            Self::Grass => [0.38, 0.58, 0.22, 1.0],
-            Self::Dirt => [0.39, 0.26, 0.16, 1.0],
-            Self::Stone => [0.51, 0.54, 0.56, 1.0],
-            Self::Sand => [0.80, 0.72, 0.48, 1.0],
-            Self::Water => [0.10, 0.44, 0.53, 0.72],
-            Self::Wood => [0.38, 0.24, 0.14, 1.0],
-            Self::Leaves => [0.22, 0.43, 0.22, 1.0],
-            Self::Snow => [0.87, 0.91, 0.91, 1.0],
-            Self::Clay => [0.66, 0.34, 0.22, 1.0],
-            Self::Crystal => [0.28, 0.86, 0.89, 1.0],
-            Self::Basalt => [0.24, 0.28, 0.31, 1.0],
-            Self::CoalOre => [0.16, 0.16, 0.17, 1.0],
-            Self::IronOre => [0.66, 0.48, 0.40, 1.0],
-            Self::GoldOre => [0.86, 0.72, 0.28, 1.0],
-            Self::DiamondOre => [0.45, 0.86, 0.84, 1.0],
-        }
-    }
-
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Air => "Air",
-            Self::Grass => "Meadow grass",
-            Self::Dirt => "Earth",
-            Self::Stone => "Limestone",
-            Self::Sand => "River sand",
-            Self::Water => "Water",
-            Self::Wood => "Timber",
-            Self::Leaves => "Canopy",
-            Self::Snow => "Alpine snow",
-            Self::Clay => "Terracotta",
-            Self::Crystal => "Lumen crystal",
-            Self::Basalt => "Basalt",
-            Self::CoalOre => "Coal ore",
-            Self::IronOre => "Iron ore",
-            Self::GoldOre => "Gold ore",
-            Self::DiamondOre => "Diamond ore",
-        }
-    }
-
-    pub fn is_solid(self) -> bool {
-        !matches!(self, Self::Air | Self::Water)
-    }
-
-    /// Solid blocks can be placed. Air and fluids such as water cannot.
-    /// A new solid variant is placeable as soon as [`Self::from_id`] knows it.
-    pub fn is_placeable(self) -> bool {
-        self.is_solid()
-    }
-
-    /// Every block id the save format can name, in stable id order.
-    pub fn all() -> impl Iterator<Item = Self> {
-        (0..=u8::MAX).filter_map(Self::from_id)
-    }
-
-    pub fn from_id(id: u8) -> Option<Self> {
-        Some(match id {
-            0 => Self::Air,
-            1 => Self::Grass,
-            2 => Self::Dirt,
-            3 => Self::Stone,
-            4 => Self::Sand,
-            5 => Self::Water,
-            6 => Self::Wood,
-            7 => Self::Leaves,
-            8 => Self::Snow,
-            9 => Self::Clay,
-            10 => Self::Crystal,
-            11 => Self::Basalt,
-            12 => Self::CoalOre,
-            13 => Self::IronOre,
-            14 => Self::GoldOre,
-            15 => Self::DiamondOre,
-            _ => return None,
-        })
-    }
-}
+pub use registry::{
+    AIR, BASALT, CLAY, COAL_ORE, CRYSTAL, DIAMOND_ORE, DIRT, GOLD_ORE, GRASS, IRON_ORE, LEAVES,
+    SAND, SNOW, STONE, WATER, WOOD,
+};
 
 /// Climate region at a column. Transitions are continuous in height and dithered
 /// in cover; this label is the dominant region after that blend.
@@ -166,6 +72,11 @@ pub enum Biome {
 pub struct World {
     seed: u64,
     edits: HashMap<[i32; 3], Block>,
+    /// Builtin ids resolved once from names. Terrain reads these, not strings.
+    worldgen: WorldgenBlocks,
+    /// Parallel to [`ORE_RULES`], in the same order, copied from [`Self::worldgen`].
+    ore_ids: [BlockId; 4],
+    registry: Arc<registry::Registry>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -193,6 +104,9 @@ struct Tree {
     z: i32,
     ground: i32,
     height: i32,
+    /// Captured from [`WorldgenBlocks`] when the anchor is accepted.
+    wood: BlockId,
+    leaves: BlockId,
 }
 
 impl Tree {
@@ -201,18 +115,18 @@ impl Tree {
         let dz = (i64::from(z) - i64::from(self.z)).abs();
         let dy = y - self.ground;
         if !(0..=i64::from(TREE_CANOPY)).contains(&dx.max(dz)) {
-            return Block::Air;
+            return AIR;
         }
         if dx == 0 && dz == 0 && dy > 0 && dy <= self.height {
-            return Block::Wood;
+            return self.wood;
         }
         let crown = dy - self.height;
         if (-2..=TREE_CROWN_ABOVE).contains(&crown)
             && dx * dx + dz * dz + i64::from(crown * crown) <= 6
         {
-            return Block::Leaves;
+            return self.leaves;
         }
-        Block::Air
+        AIR
     }
 }
 
@@ -223,7 +137,6 @@ struct OreRule {
     max_y: i32,
     chance: u64,
     radius_sq: i32,
-    block: Block,
 }
 
 struct Cluster {
@@ -261,7 +174,6 @@ const ORE_RULES: [OreRule; 4] = [
         max_y: 12,
         chance: 8,
         radius_sq: 1,
-        block: Block::DiamondOre,
     },
     OreRule {
         salt: 0x60D0,
@@ -270,7 +182,6 @@ const ORE_RULES: [OreRule; 4] = [
         max_y: 22,
         chance: 14,
         radius_sq: 1,
-        block: Block::GoldOre,
     },
     OreRule {
         salt: 0x1A0,
@@ -279,7 +190,6 @@ const ORE_RULES: [OreRule; 4] = [
         max_y: 46,
         chance: 34,
         radius_sq: 2,
-        block: Block::IronOre,
     },
     OreRule {
         salt: 0xC0A1,
@@ -288,16 +198,72 @@ const ORE_RULES: [OreRule; 4] = [
         max_y: 70,
         chance: 46,
         radius_sq: 2,
-        block: Block::CoalOre,
     },
 ];
 
 impl World {
     pub fn new(seed: u64) -> Self {
+        let registry = registry::registry_handle();
+        let worldgen = WorldgenBlocks::resolve(&registry);
         Self {
             seed,
             edits: HashMap::new(),
+            ore_ids: [
+                worldgen.diamond_ore,
+                worldgen.gold_ore,
+                worldgen.iron_ore,
+                worldgen.coal_ore,
+            ],
+            worldgen,
+            registry,
         }
+        .checked()
+    }
+
+    /// The resolved ids must match the builtin constants. A mismatch means the
+    /// TOML load order drifted from the schema-1 numbers.
+    fn checked(self) -> Self {
+        debug_assert_eq!(self.worldgen.air, AIR);
+        debug_assert_eq!(self.worldgen.grass, GRASS);
+        debug_assert_eq!(self.worldgen.dirt, DIRT);
+        debug_assert_eq!(self.worldgen.stone, STONE);
+        debug_assert_eq!(self.worldgen.sand, SAND);
+        debug_assert_eq!(self.worldgen.water, WATER);
+        debug_assert_eq!(self.worldgen.wood, WOOD);
+        debug_assert_eq!(self.worldgen.leaves, LEAVES);
+        debug_assert_eq!(self.worldgen.snow, SNOW);
+        debug_assert_eq!(self.worldgen.clay, CLAY);
+        debug_assert_eq!(self.worldgen.crystal, CRYSTAL);
+        debug_assert_eq!(self.worldgen.basalt, BASALT);
+        debug_assert_eq!(self.worldgen.coal_ore, COAL_ORE);
+        debug_assert_eq!(self.worldgen.iron_ore, IRON_ORE);
+        debug_assert_eq!(self.worldgen.gold_ore, GOLD_ORE);
+        debug_assert_eq!(self.worldgen.diamond_ore, DIAMOND_ORE);
+        debug_assert_eq!(self.registry.name(STONE), "strata:stone");
+        debug_assert_eq!(self.registry.name_key(AIR), "block.strata.air");
+        debug_assert_eq!(self.registry.flag_rows().len(), 17);
+        debug_assert_eq!(self.registry.texture_index("strata:limestone"), Some(12));
+        debug_assert_eq!(
+            self.registry.flags(GRASS).layers[0],
+            self.registry.texture_index("strata:grass_top").unwrap()
+        );
+        debug_assert_eq!(self.registry.builtin_content_hash().len(), 64);
+        debug_assert!(
+            self.registry
+                .builtin_content_hash()
+                .chars()
+                .all(|character| character.is_ascii_hexdigit())
+        );
+        debug_assert_eq!(
+            self.registry.loaded_from_disk(),
+            std::path::Path::new("assets/strata/blocks").is_dir()
+        );
+        debug_assert_eq!(
+            self.registry
+                .texture_rotation(STONE, registry::BlockFace::Side),
+            registry::TextureRotation::None
+        );
+        self
     }
 
     pub fn seed(&self) -> u64 {
@@ -324,7 +290,14 @@ impl World {
         let mut edits: Vec<_> = self
             .edits
             .iter()
-            .map(|(&position, &block)| (position, block as u8))
+            .map(|(&position, &block)| {
+                (
+                    position,
+                    block
+                        .legacy_u8()
+                        .expect("schema 1 edits only store builtin ids 0..=15"),
+                )
+            })
             .collect();
         edits.sort_unstable_by_key(|&(position, _)| position);
         edits
@@ -512,7 +485,7 @@ impl World {
         if !(1..=70).contains(&y) {
             return None;
         }
-        for rule in &ORE_RULES {
+        for (rule_index, rule) in ORE_RULES.iter().enumerate() {
             if !(rule.min_y..=rule.max_y).contains(&y) {
                 continue;
             }
@@ -526,7 +499,7 @@ impl World {
                 for cy in min_cy..=max_cy {
                     for cx in min_cx..=max_cx {
                         if self.vein_hits(rule, [cx, cy, cz], [x, y, z]) {
-                            return Some(rule.block);
+                            return Some(self.ore_ids[rule_index]);
                         }
                     }
                 }
@@ -556,49 +529,50 @@ impl World {
     }
 
     fn terrain_block(&self, x: i32, y: i32, z: i32, column: Column) -> Block {
+        let blocks = self.worldgen;
         if y > column.height {
             return if y <= SEA_LEVEL {
-                Block::Water
+                blocks.water
             } else {
-                Block::Air
+                blocks.air
             };
         }
         if y < 1 {
-            return Block::Basalt;
+            return blocks.basalt;
         }
         if self.carves(x, y, z, column) {
-            return Block::Air;
+            return blocks.air;
         }
         let depth = column.height - y;
         let sandy = self.sandy(x, z, column);
         if depth == 0 {
             if sandy {
                 if self.clay_patch(x, z, column) {
-                    Block::Clay
+                    blocks.clay
                 } else {
-                    Block::Sand
+                    blocks.sand
                 }
             } else {
-                Block::Grass
+                blocks.grass
             }
         } else if depth < 4 {
             if sandy {
                 if depth == 1 && self.clay_patch(x, z, column) {
-                    Block::Clay
+                    blocks.clay
                 } else {
-                    Block::Sand
+                    blocks.sand
                 }
             } else {
-                Block::Dirt
+                blocks.dirt
             }
         } else if let Some(ore) = self.ore_at(x, y, z) {
             ore
         } else if self.cell_cluster([x, y, z], CRYSTAL_CLUSTER) {
-            Block::Crystal
+            blocks.crystal
         } else if self.cell_cluster([x, y, z], BASALT_CLUSTER) {
-            Block::Basalt
+            blocks.basalt
         } else {
-            Block::Stone
+            blocks.stone
         }
     }
 
@@ -629,11 +603,13 @@ impl World {
             z,
             ground: column.height,
             height: 4 + ((hash >> 16) % 3) as i32,
+            wood: self.worldgen.wood,
+            leaves: self.worldgen.leaves,
         })
     }
 
     fn foliage_at(&self, x: i32, y: i32, z: i32) -> Block {
-        let mut foliage = Block::Air;
+        let mut foliage = self.worldgen.air;
         let min_z = (z - TREE_CANOPY).div_euclid(TREE_GRID);
         let max_z = (z + TREE_CANOPY).div_euclid(TREE_GRID);
         let min_x = (x - TREE_CANOPY).div_euclid(TREE_GRID);
@@ -642,10 +618,10 @@ impl World {
             for gx in min_x..=max_x {
                 if let Some(tree) = self.tree(gx, gz) {
                     let block = tree.block(x, y, z);
-                    if block == Block::Wood {
+                    if block == self.worldgen.wood {
                         return block;
                     }
-                    if block == Block::Leaves {
+                    if block == self.worldgen.leaves {
                         foliage = block;
                     }
                 }
@@ -656,24 +632,24 @@ impl World {
 
     fn generated_block(&self, x: i32, y: i32, z: i32) -> Block {
         if y < 0 {
-            return Block::Basalt;
+            return self.worldgen.basalt;
         }
         if y > 128 {
-            return Block::Air;
+            return self.worldgen.air;
         }
         let column = self.column(x, z);
         let terrain = self.terrain_block(x, y, z, column);
-        if y <= column.height || terrain != Block::Air {
+        if y <= column.height || terrain != self.worldgen.air {
             return terrain;
         }
         let foliage = self.foliage_at(x, y, z);
-        if foliage != Block::Air {
+        if foliage != self.worldgen.air {
             return foliage;
         }
         if y == column.height + 1 && y > SEA_LEVEL && self.wears_snow(x, z, column) {
-            Block::Snow
+            self.worldgen.snow
         } else {
-            Block::Air
+            self.worldgen.air
         }
     }
 
@@ -688,7 +664,7 @@ impl World {
     }
 
     fn sample_halo(&self, origin: [i32; 3]) -> Vec<Block> {
-        let mut blocks = vec![Block::Air; HALO_VOLUME];
+        let mut blocks = vec![self.worldgen.air; HALO_VOLUME];
         let mut heights = vec![0; HALO_SIDE * HALO_SIDE];
         let mut snow_caps = vec![false; HALO_SIDE * HALO_SIDE];
         // Compute a column once, rather than running fBm for every voxel or face.
@@ -737,9 +713,13 @@ impl World {
                             }
                             let index = halo_index([x, y, z]);
                             let block = tree.block(origin[0] + x, origin[1] + y, origin[2] + z);
-                            if blocks[index] == Block::Air
-                                || (blocks[index] == Block::Leaves && block == Block::Wood)
-                            {
+                            // Snow and leaves overwrite only replaceable cells (air).
+                            // A trunk still replaces leaves so an overlapping crown
+                            // cannot erase the stem. That is the pre-registry rule.
+                            let existing = blocks[index];
+                            let trunk_over_leaves =
+                                existing == self.worldgen.leaves && block == self.worldgen.wood;
+                            if existing.is_replaceable() || trunk_over_leaves {
                                 blocks[index] = block;
                             }
                         }
@@ -762,8 +742,8 @@ impl World {
                     continue;
                 }
                 let index = halo_index([x, y, z]);
-                if blocks[index] == Block::Air {
-                    blocks[index] = Block::Snow;
+                if blocks[index].is_replaceable() {
+                    blocks[index] = self.worldgen.snow;
                 }
             }
         }
@@ -903,6 +883,18 @@ impl Face {
     }
 }
 
+/// Fluid emits only into invisible cells (air). Cutout is culled as opaque
+/// until the cutout pipeline exists, so leaves keep today's solid faces.
+fn face_visible(block: Block, neighbor: Block) -> bool {
+    match registry::render_class(block) {
+        RenderClass::Invisible => false,
+        RenderClass::Fluid => registry::render_class(neighbor) == RenderClass::Invisible,
+        RenderClass::Cutout | RenderClass::Opaque | RenderClass::Translucent => {
+            block.is_solid() && !neighbor.is_solid()
+        }
+    }
+}
+
 fn mesh_halo(origin: [i32; 3], halo: &[Block]) -> Mesh {
     let mut mesh = Mesh::default();
     let side = CHUNK_SIZE as usize;
@@ -922,11 +914,7 @@ fn mesh_halo(origin: [i32; 3], halo: &[Block]) -> Mesh {
                         let mut outside = p;
                         outside[axis] += sign;
                         let neighbor = halo[halo_index(outside)];
-                        let visible = if block == Block::Water {
-                            neighbor == Block::Air
-                        } else {
-                            block.is_solid() && !neighbor.is_solid()
-                        };
+                        let visible = face_visible(block, neighbor);
                         mask[i as usize + j as usize * side] = if visible {
                             let ao = corner_ao(halo, outside, u, v);
                             let world = [origin[0] + p[0], origin[1] + p[1], origin[2] + p[2]];
@@ -1037,8 +1025,19 @@ fn emit_quad(mesh: &mut Mesh, p: [i32; 3], axis: usize, sign: i32, size: [f32; 2
         mesh.vertices.push(Vertex {
             position,
             normal,
-            // Texture owns albedo. Vertex RGB carries only linear AO/variation.
-            color: [brightness, brightness, brightness, face.block.color()[3]],
+            // Texture owns albedo. Vertex RGB is lighting only. Fluid alpha is the
+            // development shader's water signal (`color.a < 0.99`), not tint[3].
+            // Forge multiplies linear tint in the shader; fluids are RGB-only there.
+            color: [
+                brightness,
+                brightness,
+                brightness,
+                if face.block.render_class() == RenderClass::Fluid {
+                    0.72
+                } else {
+                    1.0
+                },
+            ],
             texture_layer,
         });
     }
@@ -1183,7 +1182,7 @@ mod tests {
     use super::*;
 
     fn artificial_mesh(cells: &[([i32; 3], Block)]) -> Mesh {
-        let mut halo = vec![Block::Air; HALO_VOLUME];
+        let mut halo = vec![AIR; HALO_VOLUME];
         for &(p, block) in cells {
             halo[halo_index(p)] = block;
         }
@@ -1289,41 +1288,38 @@ mod tests {
         };
         match label {
             "ocean" => {
-                assert!(count(Block::Water) > 1000, "{key:?} should be ocean");
-                assert_eq!(count(Block::Grass), 0, "{key:?} ocean cover");
+                assert!(count(WATER) > 1000, "{key:?} should be ocean");
+                assert_eq!(count(GRASS), 0, "{key:?} ocean cover");
             }
             "desert surface" => {
-                assert!(count(Block::Sand) > 1000, "{key:?} should be desert");
-                assert_eq!(count(Block::Grass), 0, "{key:?} desert cover");
-                assert_eq!(count(Block::Wood), 0, "{key:?} desert trees");
+                assert!(count(SAND) > 1000, "{key:?} should be desert");
+                assert_eq!(count(GRASS), 0, "{key:?} desert cover");
+                assert_eq!(count(WOOD), 0, "{key:?} desert trees");
             }
             "forest canopy" => {
-                assert!(count(Block::Wood) > 0, "{key:?} should contain a trunk");
-                assert!(count(Block::Leaves) > 0, "{key:?} should contain leaves");
+                assert!(count(WOOD) > 0, "{key:?} should contain a trunk");
+                assert!(count(LEAVES) > 0, "{key:?} should contain leaves");
             }
             "snow cap" => {
-                assert!(count(Block::Snow) > 0, "{key:?} should contain snow");
+                assert!(count(SNOW) > 0, "{key:?} should contain snow");
             }
             "clay, crystal, and deep basalt" => {
-                assert!(count(Block::Clay) > 0, "{key:?} clay");
-                assert!(count(Block::Crystal) > 0, "{key:?} crystal");
-                assert!(
-                    count(Block::Basalt) > 1024,
-                    "{key:?} deep basalt above the floor"
-                );
+                assert!(count(CLAY) > 0, "{key:?} clay");
+                assert!(count(CRYSTAL) > 0, "{key:?} crystal");
+                assert!(count(BASALT) > 1024, "{key:?} deep basalt above the floor");
             }
             "caves and ores" | "far negative caves and ores" => {
                 assert!(
                     key.0 < 0 && key.2 < 0,
                     "{label} should use negative coordinates"
                 );
-                assert!(count(Block::CoalOre) > 0, "{key:?} coal");
-                assert!(count(Block::IronOre) > 0, "{key:?} iron");
-                assert!(count(Block::GoldOre) > 0, "{key:?} gold");
-                assert!(count(Block::DiamondOre) > 0, "{key:?} diamond");
+                assert!(count(COAL_ORE) > 0, "{key:?} coal");
+                assert!(count(IRON_ORE) > 0, "{key:?} iron");
+                assert!(count(GOLD_ORE) > 0, "{key:?} gold");
+                assert!(count(DIAMOND_ORE) > 0, "{key:?} diamond");
                 let deep_air = blocks.iter().enumerate().any(|(index, block)| {
                     let y = (index / (CHUNK_SIZE * CHUNK_SIZE) as usize) as i32;
-                    y <= 12 && *block == Block::Air
+                    y <= 12 && *block == AIR
                 });
                 assert!(deep_air, "{key:?} should carve cave air at y <= 12");
             }
@@ -1345,7 +1341,9 @@ mod tests {
         for coord in [key.0, key.1, key.2] {
             bytes.extend_from_slice(&coord.to_le_bytes());
         }
-        bytes.extend(blocks.iter().map(|block| *block as u8));
+        bytes.extend(blocks.iter().map(|block| {
+            u8::try_from(block.raw()).expect("golden chunks only contain builtin ids 0..=15")
+        }));
         bytes
     }
 
@@ -1353,7 +1351,7 @@ mod tests {
     fn all_material_ids_round_trip_and_unknown_ids_are_rejected() {
         let mut id = 0_u8;
         while let Some(block) = Block::from_id(id) {
-            assert_eq!(block as u8, id);
+            assert_eq!(block.legacy_u8(), Some(id));
             assert!(!block.name().is_empty());
             assert!(block.color().iter().all(|channel| channel.is_finite()));
             id += 1;
@@ -1361,8 +1359,8 @@ mod tests {
         assert!(id > 15, "ore ids must stay registered");
         assert_eq!(Block::from_id(id), None);
         assert_eq!(Block::from_id(255), None);
-        assert!(!Block::Water.is_solid());
-        assert!(Block::DiamondOre.is_solid());
+        assert!(!WATER.is_solid());
+        assert!(DIAMOND_ORE.is_solid());
     }
 
     #[test]
@@ -1387,11 +1385,11 @@ mod tests {
         let mut world = World::new(16);
         let positions = [[32, 150, -1], [-1, 150, 32], [0, 150, 0]];
         for p in positions {
-            world.set_block(p, Block::Crystal);
-            assert_eq!(world.block_at(p[0], p[1], p[2]), Block::Crystal);
+            world.set_block(p, CRYSTAL);
+            assert_eq!(world.block_at(p[0], p[1], p[2]), CRYSTAL);
         }
         let snapshot = world.clone();
-        world.set_block(positions[0], Block::Air);
+        world.set_block(positions[0], AIR);
         assert_eq!(world.edits().len(), 2);
         assert_eq!(snapshot.edits().len(), 3);
         assert_eq!(world.edits()[0].0, [-1, 150, 32]);
@@ -1401,33 +1399,33 @@ mod tests {
     #[test]
     fn empty_single_and_adjacent_voxels_have_expected_surface_area() {
         assert!(artificial_mesh(&[]).indices.is_empty());
-        let single = artificial_mesh(&[([8, 8, 8], Block::Stone)]);
+        let single = artificial_mesh(&[([8, 8, 8], STONE)]);
         assert_eq!(single.indices.len(), 36);
         assert_eq!(triangle_area(&single), 6.0);
-        let pair = artificial_mesh(&[([8, 8, 8], Block::Stone), ([9, 8, 8], Block::Stone)]);
+        let pair = artificial_mesh(&[([8, 8, 8], STONE), ([9, 8, 8], STONE)]);
         assert_eq!(triangle_area(&pair), 10.0);
         assert_eq!(pair.indices.len(), 36, "coplanar equal-lit faces merge");
     }
 
     #[test]
     fn chunk_halo_culls_internal_border_faces() {
-        let edge = artificial_mesh(&[([31, 8, 8], Block::Stone), ([32, 8, 8], Block::Stone)]);
+        let edge = artificial_mesh(&[([31, 8, 8], STONE), ([32, 8, 8], STONE)]);
         assert_eq!(triangle_area(&edge), 5.0);
         assert!(
             edge.vertices
                 .iter()
                 .all(|vertex| vertex.normal != [1.0, 0.0, 0.0])
         );
-        let negative = artificial_mesh(&[([0, 8, 8], Block::Stone), ([-1, 8, 8], Block::Stone)]);
+        let negative = artificial_mesh(&[([0, 8, 8], STONE), ([-1, 8, 8], STONE)]);
         assert_eq!(triangle_area(&negative), 5.0);
     }
 
     #[test]
     fn ambient_occlusion_darkens_a_concave_corner() {
-        let mut halo = vec![Block::Air; HALO_VOLUME];
+        let mut halo = vec![AIR; HALO_VOLUME];
         // Sample the top of a voxel at [8,8,8], with two adjacent walls.
-        halo[halo_index([7, 9, 8])] = Block::Stone;
-        halo[halo_index([8, 9, 7])] = Block::Stone;
+        halo[halo_index([7, 9, 8])] = STONE;
+        halo[halo_index([8, 9, 7])] = STONE;
         let ao = corner_ao(&halo, [8, 9, 8], 0, 2);
         assert_eq!(ao[0], 0, "two occluding side cells close the corner");
         assert_eq!(ao[2], 3, "opposite open corner receives full ambient light");
@@ -1435,7 +1433,7 @@ mod tests {
 
     #[test]
     fn emitted_grass_and_timber_faces_select_their_distinct_material_tiles() {
-        for (block, top, side, bottom) in [(Block::Grass, 0, 1, 2), (Block::Wood, 7, 6, 7)] {
+        for (block, top, side, bottom) in [(GRASS, 9, 8, 16), (WOOD, 6, 0, 6)] {
             let mesh = artificial_mesh(&[([8, 8, 8], block)]);
             assert_eq!(mesh.vertices.len(), 24);
             for vertex in mesh.vertices {
@@ -1458,7 +1456,7 @@ mod tests {
 
     #[test]
     fn all_triangles_have_outward_winding_and_valid_indices() {
-        let mesh = artificial_mesh(&[([8, 8, 8], Block::Stone), ([9, 9, 8], Block::Wood)]);
+        let mesh = artificial_mesh(&[([8, 8, 8], STONE), ([9, 9, 8], WOOD)]);
         for tri in mesh.indices.chunks_exact(3) {
             let vertices = [
                 mesh.vertices[tri[0] as usize],
@@ -1484,11 +1482,11 @@ mod tests {
 
     #[test]
     fn water_has_surface_without_internal_water_faces_and_is_not_pickable() {
-        let mesh = artificial_mesh(&[([8, 8, 8], Block::Water), ([9, 8, 8], Block::Water)]);
+        let mesh = artificial_mesh(&[([8, 8, 8], WATER), ([9, 8, 8], WATER)]);
         assert_eq!(triangle_area(&mesh), 10.0);
         let mut world = World::new(1);
-        world.set_block([1, 150, 0], Block::Water);
-        world.set_block([2, 150, 0], Block::Stone);
+        world.set_block([1, 150, 0], WATER);
+        world.set_block([2, 150, 0], STONE);
         let hit = world
             .raycast([0.5, 150.5, 0.5], [1.0, 0.0, 0.0], 5.0)
             .unwrap();
@@ -1498,7 +1496,7 @@ mod tests {
     #[test]
     fn raycast_handles_negative_cells_scaled_direction_and_range() {
         let mut world = World::new(1);
-        world.set_block([-3, 150, -1], Block::Stone);
+        world.set_block([-3, 150, -1], STONE);
         let hit = world
             .raycast([0.5, 150.5, -0.5], [-4.0, 0.0, 0.0], 3.0)
             .unwrap();
@@ -1515,8 +1513,8 @@ mod tests {
     #[test]
     fn raycast_rejects_invalid_input_and_handles_start_inside_and_ties() {
         let mut world = World::new(1);
-        world.set_block([1, 151, 1], Block::Stone);
-        world.set_block([1, 150, 0], Block::Wood);
+        world.set_block([1, 151, 1], STONE);
+        world.set_block([1, 150, 0], WOOD);
         let hit = world
             .raycast([0.5, 150.5, 0.5], [1.0, 1.0, 1.0], 5.0)
             .unwrap();
@@ -1540,7 +1538,7 @@ mod tests {
     #[test]
     fn meshing_halo_matches_point_queries_across_negative_chunk_borders() {
         let mut world = World::new(31415);
-        world.set_block([-1, 42, -32], Block::Crystal);
+        world.set_block([-1, 42, -32], CRYSTAL);
         for key in [(-1, 1, -1), (0, 1, -1), (-1, 2, 0)] {
             let origin = chunk_origin(key).unwrap();
             let halo = world.sample_halo(origin);
@@ -1574,13 +1572,13 @@ mod tests {
         for dy in 1..=tree.height {
             assert_eq!(
                 world.block_at(tree.x, tree.ground + dy, tree.z),
-                Block::Wood,
+                WOOD,
                 "trunk must be continuous"
             );
         }
         assert_eq!(
             world.block_at(tree.x, tree.ground + tree.height + 1, tree.z),
-            Block::Leaves
+            LEAVES
         );
         let boundary = tree.x.div_euclid(CHUNK_SIZE) * CHUNK_SIZE;
         let key = (
@@ -1600,7 +1598,7 @@ mod tests {
                     let x = tree.x + dx;
                     let z = tree.z + dz;
                     let block = world.block_at(x, y, z);
-                    if block == Block::Leaves || block == Block::Wood {
+                    if block == LEAVES || block == WOOD {
                         if x < boundary {
                             left_leaves += 1;
                         } else {
@@ -1730,17 +1728,11 @@ mod tests {
                     Biome::Ocean => {
                         oceans += 1;
                         assert!(height < SEA_LEVEL);
-                        assert_eq!(world.block_at(x, SEA_LEVEL, z), Block::Water);
+                        assert_eq!(world.block_at(x, SEA_LEVEL, z), WATER);
                         let bed = world.block_at(x, height - 1, z);
-                        assert!(
-                            matches!(surface, Block::Sand | Block::Clay),
-                            "ocean bed {surface:?}"
-                        );
-                        assert!(
-                            matches!(bed, Block::Sand | Block::Clay),
-                            "ocean subsurface {bed:?}"
-                        );
-                        if surface == Block::Clay || bed == Block::Clay {
+                        assert!(matches!(surface, SAND | CLAY), "ocean bed {surface:?}");
+                        assert!(matches!(bed, SAND | CLAY), "ocean subsurface {bed:?}");
+                        if surface == CLAY || bed == CLAY {
                             assert!(
                                 height >= SEA_LEVEL - 3,
                                 "clay in deep ocean at height {height}"
@@ -1751,38 +1743,34 @@ mod tests {
                             assert!(block.is_solid(), "ocean floor opened at y={}", height - dy);
                         }
                         for y in height + 1..=SEA_LEVEL {
-                            assert_eq!(world.block_at(x, y, z), Block::Water);
+                            assert_eq!(world.block_at(x, y, z), WATER);
                             for [nx, nz] in [[1, 0], [-1, 0], [0, 1], [0, -1]] {
                                 let neighbor = world.block_at(x + nx, y, z + nz);
-                                if neighbor == Block::Air {
+                                if neighbor == AIR {
                                     flooded += 1;
                                 }
                             }
-                            assert_ne!(world.block_at(x, y - 1, z), Block::Air);
+                            assert_ne!(world.block_at(x, y - 1, z), AIR);
                         }
                     }
                     Biome::Beach | Biome::Desert => {
                         desert_seen += usize::from(biome == Biome::Desert);
-                        desert_sand +=
-                            usize::from(biome == Biome::Desert && surface == Block::Sand);
+                        desert_sand += usize::from(biome == Biome::Desert && surface == SAND);
                         if biome == Biome::Desert {
-                            assert_eq!(surface, Block::Sand);
+                            assert_eq!(surface, SAND);
                         } else {
-                            assert!(
-                                matches!(surface, Block::Sand | Block::Clay),
-                                "beach cover {surface:?}"
-                            );
+                            assert!(matches!(surface, SAND | CLAY), "beach cover {surface:?}");
                         }
                         assert!(height >= SEA_LEVEL);
                     }
                     Biome::Forest => {
                         forest_seen += 1;
-                        forest_grass += usize::from(surface == Block::Grass);
+                        forest_grass += usize::from(surface == GRASS);
                         assert!(height > SEA_LEVEL);
                     }
                     Biome::Plains => {
                         plains_seen += 1;
-                        plains_grass += usize::from(surface == Block::Grass);
+                        plains_grass += usize::from(surface == GRASS);
                         assert!(height > SEA_LEVEL);
                     }
                 }
@@ -1816,16 +1804,13 @@ mod tests {
                     _ => elsewhere += 1,
                 }
                 assert!(world.surface_height(tree.x, tree.z) > SEA_LEVEL);
-                assert_eq!(world.block_at(tree.x, tree.ground, tree.z), Block::Grass);
+                assert_eq!(world.block_at(tree.x, tree.ground, tree.z), GRASS);
                 for dy in 1..=tree.height {
-                    assert_eq!(
-                        world.block_at(tree.x, tree.ground + dy, tree.z),
-                        Block::Wood
-                    );
+                    assert_eq!(world.block_at(tree.x, tree.ground + dy, tree.z), WOOD);
                 }
                 assert_eq!(
                     world.block_at(tree.x + 1, tree.ground + tree.height, tree.z),
-                    Block::Leaves
+                    LEAVES
                 );
             }
         }
@@ -1851,13 +1836,13 @@ mod tests {
         assert!(matches!(column.biome, Biome::Forest));
         assert!(!world.sandy(x, z, column));
         assert!(world.edits().is_empty());
-        assert_eq!(world.block_at(x, column.height, z), Block::Grass);
-        assert_eq!(world.block_at(x, column.height + 1, z), Block::Snow);
+        assert_eq!(world.block_at(x, column.height, z), GRASS);
+        assert_eq!(world.block_at(x, column.height + 1, z), SNOW);
         // The sample maximum is warmer than the cool gate, so it stays bare.
         let warm = world.column(884, -460);
         assert_eq!(warm.height, 46);
         assert!(warm.temperature >= 0.02, "{}", warm.temperature);
-        assert_ne!(world.block_at(884, warm.height + 1, -460), Block::Snow);
+        assert_ne!(world.block_at(884, warm.height + 1, -460), SNOW);
     }
 
     #[test]
@@ -1865,17 +1850,17 @@ mod tests {
         let world = World::new(20261021);
         assert!(world.edits().is_empty());
         assert_eq!(world.surface_height(-340, -480), 31);
-        assert_eq!(world.block_at(-340, 31, -480), Block::Grass);
-        assert_eq!(world.block_at(-340, 32, -480), Block::Snow);
+        assert_eq!(world.block_at(-340, 31, -480), GRASS);
+        assert_eq!(world.block_at(-340, 32, -480), SNOW);
         assert!(matches!(
             world.biome_at(-340, -480),
             Biome::Plains | Biome::Forest
         ));
-        assert_eq!(world.block_at(-480, 29, -480), Block::Clay);
+        assert_eq!(world.block_at(-480, 29, -480), CLAY);
         assert!((SEA_LEVEL - 3..=SEA_LEVEL + 2).contains(&world.surface_height(-480, -480)));
-        assert_eq!(world.block_at(-12, 6, -96), Block::Crystal);
-        assert_eq!(world.block_at(-92, 0, -96), Block::Basalt);
-        assert_eq!(world.block_at(-92, 1, -96), Block::Basalt);
+        assert_eq!(world.block_at(-12, 6, -96), CRYSTAL);
+        assert_eq!(world.block_at(-92, 0, -96), BASALT);
+        assert_eq!(world.block_at(-92, 1, -96), BASALT);
     }
 
     #[test]
@@ -1893,19 +1878,19 @@ mod tests {
                     for (index, block) in chunk.iter().copied().enumerate() {
                         let y = origin_y + (index / (CHUNK_SIZE * CHUNK_SIZE) as usize) as i32;
                         match block {
-                            Block::CoalOre => {
+                            COAL_ORE => {
                                 assert!((6..=70).contains(&y));
                                 coal += 1;
                             }
-                            Block::IronOre => {
+                            IRON_ORE => {
                                 assert!((1..=46).contains(&y));
                                 iron += 1;
                             }
-                            Block::GoldOre => {
+                            GOLD_ORE => {
                                 assert!((1..=22).contains(&y));
                                 gold += 1;
                             }
-                            Block::DiamondOre => {
+                            DIAMOND_ORE => {
                                 assert!((1..=12).contains(&y));
                                 diamond += 1;
                             }
@@ -1933,9 +1918,9 @@ mod tests {
         for x in (-80..80).step_by(5) {
             for z in (-80..80).step_by(5) {
                 let height = world.surface_height(x, z);
-                assert_ne!(world.block_at(x, height, z), Block::Air);
+                assert_ne!(world.block_at(x, height, z), AIR);
                 for y in 2..height {
-                    if world.block_at(x, y, z) == Block::Air {
+                    if world.block_at(x, y, z) == AIR {
                         caves += 1;
                         assert!(y <= height - 4);
                     }
@@ -1948,24 +1933,30 @@ mod tests {
     #[test]
     fn chunk_generation_reports_average_time() {
         let world = World::new(20261021);
-        let keys: Vec<ChunkKey> = (-1..=1)
-            .flat_map(|z| (-1..=1).map(move |x| (x, 0, z)))
-            .collect();
-        for key in &keys {
-            std::hint::black_box(world.generate_chunk(*key));
-        }
-        let rounds = 2;
-        let start = std::time::Instant::now();
-        for _ in 0..rounds {
-            for key in &keys {
-                std::hint::black_box(world.generate_chunk(*key));
+        let keys = [
+            (-1, 0, -8),
+            (20, 1, -25),
+            (-2, 1, -2),
+            (-5, 0, -6),
+            (-25, 0, -27),
+            (-11, 1, -15),
+            (-15, 0, -15),
+        ];
+        for _ in 0..3 {
+            for key in keys {
+                std::hint::black_box(world.generate_chunk(key));
             }
         }
-        let average_us = start.elapsed().as_secs_f64() * 1_000_000.0 / (keys.len() * rounds) as f64;
-        eprintln!(
-            "STRATA_CHUNK_GEN_AVG_US {average_us:.1} chunks={} rounds={rounds}",
-            keys.len()
-        );
+        let rounds = 30;
+        let start = std::time::Instant::now();
+        for _ in 0..rounds {
+            for key in keys {
+                std::hint::black_box(world.generate_chunk(key));
+            }
+        }
+        let total = rounds * keys.len();
+        let average_us = start.elapsed().as_secs_f64() * 1_000_000.0 / total as f64;
+        eprintln!("STRATA_CHUNK_GEN_AVG_US {average_us:.1} chunks={total}");
         assert!(
             average_us < 50_000.0,
             "chunk generation averaged {average_us:.1} µs"
@@ -2000,7 +1991,7 @@ mod tests {
                 let wz = origin_z + z;
                 let height = world.surface_height(wx, wz);
                 let mut biome = biome_rgb(world.biome_at(wx, wz), height);
-                if world.block_at(wx, height + 1, wz) == Block::Snow {
+                if world.block_at(wx, height + 1, wz) == SNOW {
                     biome = [230, 236, 238];
                 }
                 let height_shade = height_rgb(height, world.biome_at(wx, wz));
@@ -2083,17 +2074,17 @@ mod tests {
                     _ => saw_land = true,
                 }
                 let height = world.surface_height(x, z).min(72);
-                if world.block_at(x, height + 1, z) == Block::Snow {
+                if world.block_at(x, height + 1, z) == SNOW {
                     restored += 1;
                 }
                 for y in 1..height {
                     match world.block_at(x, y, z) {
-                        Block::Air => caves += 1,
-                        Block::CoalOre => coal += 1,
-                        Block::IronOre => iron += 1,
-                        Block::GoldOre => gold += 1,
-                        Block::DiamondOre => diamond += 1,
-                        Block::Clay | Block::Crystal | Block::Basalt | Block::Snow => {
+                        AIR => caves += 1,
+                        COAL_ORE => coal += 1,
+                        IRON_ORE => iron += 1,
+                        GOLD_ORE => gold += 1,
+                        DIAMOND_ORE => diamond += 1,
+                        CLAY | CRYSTAL | BASALT | SNOW => {
                             restored += 1;
                         }
                         _ => {}
@@ -2151,28 +2142,29 @@ mod tests {
 
     fn block_rgb(block: Block, y: i32) -> [u8; 3] {
         match block {
-            Block::Air => {
+            AIR => {
                 if y > SEA_LEVEL {
                     [186, 214, 232]
                 } else {
                     [28, 22, 36]
                 }
             }
-            Block::Grass => [74, 150, 58],
-            Block::Dirt => [122, 84, 52],
-            Block::Stone => [132, 136, 134],
-            Block::Sand => [214, 196, 132],
-            Block::Water => [42, 112, 168],
-            Block::Wood => [112, 74, 42],
-            Block::Leaves => [48, 124, 54],
-            Block::Snow => [230, 236, 238],
-            Block::Clay => [168, 86, 56],
-            Block::Crystal => [72, 210, 214],
-            Block::Basalt => [48, 52, 58],
-            Block::CoalOre => [42, 42, 46],
-            Block::IronOre => [176, 110, 78],
-            Block::GoldOre => [214, 176, 64],
-            Block::DiamondOre => [80, 220, 210],
+            GRASS => [74, 150, 58],
+            DIRT => [122, 84, 52],
+            STONE => [132, 136, 134],
+            SAND => [214, 196, 132],
+            WATER => [42, 112, 168],
+            WOOD => [112, 74, 42],
+            LEAVES => [48, 124, 54],
+            SNOW => [230, 236, 238],
+            CLAY => [168, 86, 56],
+            CRYSTAL => [72, 210, 214],
+            BASALT => [48, 52, 58],
+            COAL_ORE => [42, 42, 46],
+            IRON_ORE => [176, 110, 78],
+            GOLD_ORE => [214, 176, 64],
+            DIAMOND_ORE => [80, 220, 210],
+            _ => [255, 0, 255],
         }
     }
 

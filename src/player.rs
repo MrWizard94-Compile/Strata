@@ -672,14 +672,14 @@ fn accelerate(velocity: &mut Vec3, wish_dir: Vec3, wish_speed: f32, accel: f32, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::world::{Biome, Block};
+    use crate::world::{AIR, Biome, Block, GRASS, LEAVES, STONE, WOOD};
 
     const DT: f32 = 1.0 / 60.0;
     fn platform() -> World {
         let mut world = World::new(3);
         for x in -3..=3 {
             for z in -3..=3 {
-                world.set_block([x, 200, z], Block::Stone);
+                world.set_block([x, 200, z], STONE);
             }
         }
         world
@@ -728,8 +728,8 @@ mod tests {
 
     fn open_platform() -> World {
         let mut world = World::new(3);
-        fill_box(&mut world, [-6, 160, -6], [6, 260, 6], Block::Air);
-        fill_box(&mut world, [-6, 200, -6], [6, 200, 6], Block::Stone);
+        fill_box(&mut world, [-6, 160, -6], [6, 260, 6], AIR);
+        fill_box(&mut world, [-6, 200, -6], [6, 200, 6], STONE);
         world
     }
 
@@ -804,8 +804,8 @@ mod tests {
         // trunk. Plant one and require recovery to clear it. The natural case
         // is `a_natural_trunk_grows_without_being_planted`.
         if !tree_world.block_at(64, ground + 1, -64).is_solid() {
-            tree_world.set_block([64, ground + 1, -64], Block::Wood);
-            tree_world.set_block([64, ground + 2, -64], Block::Leaves);
+            tree_world.set_block([64, ground + 1, -64], WOOD);
+            tree_world.set_block([64, ground + 2, -64], LEAVES);
         }
         let player = Player::new(&tree_world);
         assert!(!Player::collides(player.eye, &tree_world));
@@ -813,7 +813,7 @@ mod tests {
         let mut world = World::new(728_491);
         let ground = world.surface_height(64, -64);
         for y in ground + 1..=ground + 12 {
-            world.set_block([64, y, -64], Block::Stone);
+            world.set_block([64, y, -64], STONE);
         }
         let mut player = Player::new(&world);
         assert!(!Player::collides(player.eye, &world));
@@ -831,11 +831,11 @@ mod tests {
         );
         assert_eq!(world.biome_at(-321, -354), Biome::Forest);
         assert_eq!(world.surface_height(-321, -354), 35);
-        assert_eq!(world.block_at(-321, 35, -354), Block::Grass);
+        assert_eq!(world.block_at(-321, 35, -354), GRASS);
         for y in 36..=40 {
-            assert_eq!(world.block_at(-321, y, -354), Block::Wood, "y={y}");
+            assert_eq!(world.block_at(-321, y, -354), WOOD, "y={y}");
         }
-        assert_eq!(world.block_at(-321, 41, -354), Block::Leaves);
+        assert_eq!(world.block_at(-321, 41, -354), LEAVES);
     }
 
     #[test]
@@ -1003,8 +1003,8 @@ mod tests {
     #[test]
     fn coyote_time_forgives_a_late_jump_and_then_expires() {
         let mut world = World::new(3);
-        fill_box(&mut world, [-2, 160, -2], [2, 240, 2], Block::Air);
-        fill_box(&mut world, [-2, 200, -1], [1, 200, 1], Block::Stone);
+        fill_box(&mut world, [-2, 160, -2], [2, 240, 2], AIR);
+        fill_box(&mut world, [-2, 200, -1], [1, 200, 1], STONE);
 
         let leave_airborne = || {
             let mut player = Player::new(&world);
@@ -1191,7 +1191,7 @@ mod tests {
         place(&mut player, Vec3::new(0.5, 210.0, 0.5));
         settle(&mut player, &world);
         // Built after the fall so the body settles on the floor, under the lid.
-        fill_box(&mut world, [-2, 203, -2], [2, 203, 2], Block::Stone);
+        fill_box(&mut world, [-2, 203, -2], [2, 203, 2], STONE);
         let start_y = player.eye.y;
         let mut peak_up = 0.0_f32;
         let mut cancelled = false;
@@ -1230,9 +1230,9 @@ mod tests {
     #[test]
     fn full_block_ledge_blocks_walking_until_a_jump() {
         let mut world = World::new(3);
-        fill_box(&mut world, [-4, 160, -3], [8, 240, 3], Block::Air);
-        fill_box(&mut world, [-4, 200, -3], [1, 200, 3], Block::Stone);
-        fill_box(&mut world, [2, 200, -3], [8, 201, 3], Block::Stone);
+        fill_box(&mut world, [-4, 160, -3], [8, 240, 3], AIR);
+        fill_box(&mut world, [-4, 200, -3], [1, 200, 3], STONE);
+        fill_box(&mut world, [2, 200, -3], [8, 201, 3], STONE);
         let mut player = Player::new(&world);
         place(&mut player, Vec3::new(0.5, 210.0, 0.5));
         settle(&mut player, &world);
@@ -1290,8 +1290,8 @@ mod tests {
     fn wall_slide_and_outside_corner_do_not_snag() {
         let mut world = open_platform();
         for z in -2..=8 {
-            world.set_block([4, 201, z], Block::Stone);
-            world.set_block([4, 202, z], Block::Stone);
+            world.set_block([4, 201, z], STONE);
+            world.set_block([4, 202, z], STONE);
         }
         let mut player = Player::new(&world);
         place(&mut player, Vec3::new(0.5, 210.0, 0.5));
@@ -1320,8 +1320,8 @@ mod tests {
         // The wall ends. Continuing to hold into it must pass the corner.
         let mut world = open_platform();
         for z in 0..=2 {
-            world.set_block([4, 201, z], Block::Stone);
-            world.set_block([4, 202, z], Block::Stone);
+            world.set_block([4, 201, z], STONE);
+            world.set_block([4, 202, z], STONE);
         }
         let mut player = Player::new(&world);
         place(&mut player, Vec3::new(0.5, 210.0, 0.5));
@@ -1343,8 +1343,8 @@ mod tests {
     #[test]
     fn high_speed_landing_and_thin_wall_do_not_tunnel() {
         let mut world = World::new(3);
-        fill_box(&mut world, [-1, 120, -1], [1, 420, 1], Block::Air);
-        fill_box(&mut world, [-1, 200, -1], [1, 200, 1], Block::Stone);
+        fill_box(&mut world, [-1, 120, -1], [1, 420, 1], AIR);
+        fill_box(&mut world, [-1, 200, -1], [1, 200, 1], STONE);
         let mut player = Player::new(&world);
         place(&mut player, Vec3::new(0.5, 360.0, 0.5));
         let mut saw_terminal = false;
@@ -1398,8 +1398,8 @@ mod tests {
             player.eye.y
         );
 
-        world.set_block([2, 201, 0], Block::Stone);
-        world.set_block([2, 202, 0], Block::Stone);
+        world.set_block([2, 201, 0], STONE);
+        world.set_block([2, 202, 0], STONE);
         let mut player = Player::new(&world);
         place(&mut player, Vec3::new(1.5, 202.62, 0.5));
         player.velocity.x = 40.0;
@@ -1476,8 +1476,8 @@ mod tests {
     #[test]
     fn sprint_terminal_fall_catches_block_lip() {
         let mut world = World::new(3);
-        fill_box(&mut world, [-2, 160, -2], [3, 260, 2], Block::Air);
-        world.set_block([0, 200, 0], Block::Stone);
+        fill_box(&mut world, [-2, 160, -2], [3, 260, 2], AIR);
+        world.set_block([0, 200, 0], STONE);
         let mut player = Player::new(&world);
         place(&mut player, Vec3::new(1.2, 202.7, 0.5));
         player.velocity = Vec3::new(8.0, -TERMINAL_VELOCITY, 0.0);
@@ -1531,8 +1531,8 @@ mod tests {
     #[test]
     fn sneak_diagonal_single_block_and_l_corner() {
         let mut world = World::new(3);
-        fill_box(&mut world, [-2, 160, -2], [3, 240, 3], Block::Air);
-        world.set_block([0, 200, 0], Block::Stone);
+        fill_box(&mut world, [-2, 160, -2], [3, 240, 3], AIR);
+        world.set_block([0, 200, 0], STONE);
         let mut player = Player::new(&world);
         place(&mut player, Vec3::new(0.5, 210.0, 0.5));
         settle(&mut player, &world);
@@ -1564,9 +1564,9 @@ mod tests {
         );
 
         let mut world = World::new(3);
-        fill_box(&mut world, [-2, 160, -2], [4, 240, 4], Block::Air);
+        fill_box(&mut world, [-2, 160, -2], [4, 240, 4], AIR);
         for (x, z) in [(0, 0), (1, 0), (2, 0), (2, 1), (2, 2)] {
-            world.set_block([x, 200, z], Block::Stone);
+            world.set_block([x, 200, z], STONE);
         }
         let mut player = Player::new(&world);
         place(&mut player, Vec3::new(0.5, 210.0, 0.5));
@@ -1607,8 +1607,8 @@ mod tests {
     #[test]
     fn sneak_retreats_and_jump_leaves_the_ledge() {
         let mut world = World::new(3);
-        fill_box(&mut world, [-2, 160, -2], [8, 240, 2], Block::Air);
-        fill_box(&mut world, [0, 200, -1], [5, 200, 1], Block::Stone);
+        fill_box(&mut world, [-2, 160, -2], [8, 240, 2], AIR);
+        fill_box(&mut world, [0, 200, -1], [5, 200, 1], STONE);
 
         let mut player = Player::new(&world);
         place(&mut player, Vec3::new(2.5, 210.0, 0.5));
@@ -1704,9 +1704,9 @@ mod tests {
                 &mut world,
                 [block_x - 2, 160, -2],
                 [block_x + 2, 240, 2],
-                Block::Air,
+                AIR,
             );
-            world.set_block([block_x, 200, 0], Block::Stone);
+            world.set_block([block_x, 200, 0], STONE);
             let mut player = Player::new(&world);
             place(&mut player, Vec3::new(block_x as f32 + 0.5, 210.0, 0.5));
             settle(&mut player, &world);
@@ -1751,8 +1751,8 @@ mod tests {
     #[test]
     fn sneak_stops_at_edges_and_does_not_sprint() {
         let mut world = World::new(3);
-        fill_box(&mut world, [-2, 160, -2], [6, 240, 2], Block::Air);
-        fill_box(&mut world, [0, 200, -1], [3, 200, 1], Block::Stone);
+        fill_box(&mut world, [-2, 160, -2], [6, 240, 2], AIR);
+        fill_box(&mut world, [0, 200, -1], [3, 200, 1], STONE);
         let mut player = Player::new(&world);
         place(&mut player, Vec3::new(0.8, 210.0, 0.5));
         settle(&mut player, &world);
@@ -1866,7 +1866,7 @@ mod tests {
                     for &overlap in &overlaps {
                         total += 1;
                         let mut world = World::new(3);
-                        world.set_block([0, 200, 0], Block::Stone);
+                        world.set_block([0, 200, 0], STONE);
                         let mut player = Player::new(&world);
                         place(&mut player, lip_eye(overlap, vx, vz));
                         player.velocity = Vec3::new(vx, vy, vz);
@@ -1898,7 +1898,7 @@ mod tests {
         for &overlap in &[0.04_f32, 0.08] {
             for &vy in &[-8.0_f32, -48.0] {
                 let mut world = World::new(3);
-                world.set_block([-1, 200, -1], Block::Stone);
+                world.set_block([-1, 200, -1], STONE);
                 let speed = 8.0 / std::f32::consts::SQRT_2;
                 let mut player = Player::new(&world);
                 place(
@@ -1928,9 +1928,9 @@ mod tests {
         let mut landed_phases = 0usize;
         for phase in 0..8 {
             let mut world = World::new(3);
-            fill_box(&mut world, [-2, 160, -2], [40, 260, 2], Block::Air);
-            fill_box(&mut world, [0, 200, -1], [8, 200, 1], Block::Stone);
-            world.set_block([12, 200, 0], Block::Stone);
+            fill_box(&mut world, [-2, 160, -2], [40, 260, 2], AIR);
+            fill_box(&mut world, [0, 200, -1], [8, 200, 1], STONE);
+            world.set_block([12, 200, 0], STONE);
             let mut player = Player::new(&world);
             let start_x = 2.0 + phase as f32 * SPRINT_SPEED * DT / 8.0;
             place(&mut player, Vec3::new(start_x, 210.0, 0.5));
@@ -1978,10 +1978,10 @@ mod tests {
     #[test]
     fn starting_overlap_does_not_launch_or_trap() {
         let mut world = World::new(3);
-        fill_box(&mut world, [-2, 160, -2], [6, 240, 2], Block::Air);
-        fill_box(&mut world, [-2, 200, -1], [6, 200, 1], Block::Stone);
-        world.set_block([2, 201, 0], Block::Stone);
-        world.set_block([2, 202, 0], Block::Stone);
+        fill_box(&mut world, [-2, 160, -2], [6, 240, 2], AIR);
+        fill_box(&mut world, [-2, 200, -1], [6, 200, 1], STONE);
+        world.set_block([2, 201, 0], STONE);
+        world.set_block([2, 202, 0], STONE);
         let buried = Vec3::new(1.72, 202.62, 0.5);
 
         let mut leaving = Player::new(&world);

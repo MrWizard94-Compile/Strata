@@ -468,7 +468,7 @@ fn create_material_texture(
         size: wgpu::Extent3d {
             width: materials::TILE_SIZE,
             height: materials::TILE_SIZE,
-            depth_or_array_layers: materials::LAYER_COUNT,
+            depth_or_array_layers: materials::layer_count(),
         },
         mip_level_count: mips.len() as u32,
         sample_count: 1,
@@ -495,7 +495,7 @@ fn create_material_texture(
             wgpu::Extent3d {
                 width: side,
                 height: side,
-                depth_or_array_layers: materials::LAYER_COUNT,
+                depth_or_array_layers: materials::layer_count(),
             },
         );
     }

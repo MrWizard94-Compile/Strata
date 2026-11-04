@@ -1,0 +1,10 @@
+name_key = "block.strata.gold_ore"
+display = "Gold ore"
+solid = true
+placeable = true
+replaceable = false
+render = "opaque"
+tint = [0.86, 0.72, 0.28, 1.0]
+
+[textures]
+all = "strata:gold_ore"
