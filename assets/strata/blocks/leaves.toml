@@ -4,7 +4,8 @@ solid = true
 placeable = true
 replaceable = false
 render = "cutout"
-tint = [0.22, 0.43, 0.22, 1.0]
+swatch = [0.22, 0.43, 0.22, 1.0]
+tint = [1.0, 1.0, 1.0, 1.0]
 
 [textures]
-all = "strata:leaves"
+all = "strata:block/leaves"

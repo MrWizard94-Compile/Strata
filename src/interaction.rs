@@ -574,14 +574,13 @@ mod tests {
         assert!(expected.contains(&IRON_ORE));
         assert!(expected.contains(&GOLD_ORE));
         assert!(expected.contains(&DIAMOND_ORE));
-        assert!(expected.len() > HOTBAR_SLOTS);
+        assert_eq!(listed.len(), 14);
+        assert_eq!(expected.len(), 14);
         assert!(expected.iter().all(|block| block.is_placeable()));
         assert!(!listed.contains(&AIR));
         assert!(!listed.contains(&WATER));
-        let ids: Vec<u8> = listed
-            .iter()
-            .map(|block| block.legacy_u8().expect("placeable builtins fit schema 1"))
-            .collect();
+        assert!(!listed.contains(&crate::registry::MISSING));
+        let ids: Vec<u16> = listed.iter().map(|block| block.raw()).collect();
         let mut sorted = ids.clone();
         sorted.sort_unstable();
         sorted.dedup();

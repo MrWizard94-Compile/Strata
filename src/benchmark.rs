@@ -174,7 +174,7 @@ pub fn run_cpu_benchmark(output: &Path) -> Result<(), String> {
         chunk_size: CHUNK_SIZE,
         warmup_runs_per_scenario: 1,
         measured_runs_per_scenario: RUNS,
-        digest_algorithm: "FNV-1a-64 over chunk keys/counts and ordered little-endian vertex f32 bits, texture-layer u32 and index u32 values; noncryptographic",
+        digest_algorithm: "FNV-1a-64 over chunk keys/counts and ordered little-endian vertex position, normal, color and tint f32 bits, texture-layer u32 and index u32 values; noncryptographic",
         scenarios: reports,
     };
     let mut bytes = serde_json::to_vec_pretty(&report)
@@ -316,6 +316,12 @@ fn inspect_mesh(mesh: &Mesh, key: ChunkKey, geometry: &mut Geometry) -> Result<(
             digest_bytes(&mut geometry.digest, &value.to_bits().to_le_bytes());
         }
         digest_bytes(&mut geometry.digest, &vertex.texture_layer.to_le_bytes());
+        for value in &vertex.tint {
+            if !value.is_finite() {
+                return Err("non-finite vertex component".into());
+            }
+            digest_bytes(&mut geometry.digest, &value.to_bits().to_le_bytes());
+        }
     }
     for &index in &mesh.indices {
         if index as usize >= mesh.vertices.len() {

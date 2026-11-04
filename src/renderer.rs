@@ -12,8 +12,13 @@ use crate::{
 };
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
-const VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 4] =
-    wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4, 3 => Uint32];
+const VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![
+    0 => Float32x3,
+    1 => Float32x3,
+    2 => Float32x4,
+    3 => Uint32,
+    4 => Float32x4
+];
 
 pub enum PresentOutcome {
     Presented,
@@ -752,12 +757,15 @@ mod tests {
         assert_eq!(std::mem::offset_of!(CameraUniform, ambient_ground), 224);
         assert_eq!(std::mem::offset_of!(CameraUniform, ambient_sky), 240);
         assert_eq!(std::mem::offset_of!(CameraUniform, sun_color), 256);
-        assert_eq!(std::mem::size_of::<Vertex>(), 44);
+        assert_eq!(std::mem::size_of::<Vertex>(), 60);
         assert_eq!(std::mem::offset_of!(Vertex, normal), 12);
         assert_eq!(std::mem::offset_of!(Vertex, color), 24);
         assert_eq!(std::mem::offset_of!(Vertex, texture_layer), 40);
+        assert_eq!(std::mem::offset_of!(Vertex, tint), 44);
         assert_eq!(VERTEX_ATTRIBUTES[3].offset, 40);
         assert_eq!(VERTEX_ATTRIBUTES[3].format, wgpu::VertexFormat::Uint32);
+        assert_eq!(VERTEX_ATTRIBUTES[4].offset, 44);
+        assert_eq!(VERTEX_ATTRIBUTES[4].format, wgpu::VertexFormat::Float32x4);
     }
 
     #[test]

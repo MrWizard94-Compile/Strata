@@ -45,6 +45,8 @@ const PANEL: Color32 = Color32::from_rgba_premultiplied(12, 24, 28, 236);
 struct Options {
     seed: u64,
     save_dir: PathBuf,
+    /// Data root, used as given. Blocks load from `{data_dir}/assets/strata/blocks`.
+    data_dir: Option<PathBuf>,
     smoke_seconds: Option<f32>,
     benchmark_cpu: Option<PathBuf>,
     export_materials: Option<PathBuf>,
@@ -55,6 +57,7 @@ impl Options {
         let mut result = Self {
             seed: 728_491,
             save_dir: PathBuf::from("saves/emerald-reach"),
+            data_dir: None,
             smoke_seconds: None,
             benchmark_cpu: None,
             export_materials: None,
@@ -72,6 +75,10 @@ impl Options {
                 }
                 "--save-dir" => {
                     result.save_dir = PathBuf::from(args.next().ok_or("--save-dir needs a path")?)
+                }
+                "--data-dir" => {
+                    result.data_dir =
+                        Some(PathBuf::from(args.next().ok_or("--data-dir needs a path")?))
                 }
                 "--benchmark-cpu" => {
                     result.benchmark_cpu = Some(PathBuf::from(
@@ -104,7 +111,7 @@ impl Options {
                 }
                 "--help" | "-h" => {
                     return Err(
-                        "STRATA: --seed <u64> --save-dir <directory> --smoke-seconds <1..120> --trace-streaming <new-trace.jsonl>\nCPU-only benchmark: --benchmark-cpu <new-report.json> (fixed dataset, no window or saves)\nMaterial PNG export: --export-materials <new-directory>"
+                        "STRATA: --seed <u64> --save-dir <directory> --data-dir <data-root> --smoke-seconds <1..120> --trace-streaming <new-trace.jsonl>\n--data-dir is optional. It is the data root, used as given, and overrides STRATA_DATA_DIR. Blocks load from <data-root>/assets/strata/blocks. Without it, the embedded registry is used. The working directory is not searched.\nCPU-only benchmark: --benchmark-cpu <new-report.json> (fixed dataset, no window or saves)\nMaterial PNG export: --export-materials <new-directory>"
                             .into(),
                     );
                 }
@@ -1270,6 +1277,39 @@ fn record_startup_failure(directory: &std::path::Path, error: &str) -> std::io::
     )
 }
 
+/// Prints data-directory use and writes texture warnings beside the executable.
+/// A Windows release build has no console, so the file is the copy a player can open.
+/// An empty warning list removes a file left by an earlier run.
+fn note_registry_load(registry: &registry::Registry) {
+    if registry.loaded_from_disk() {
+        eprintln!("STRATA_REGISTRY: loaded blocks from the data directory");
+    }
+    let directory = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let path = directory.join("strata-registry-warnings.txt");
+    let warnings = registry.load_warnings();
+    if warnings.is_empty() {
+        if path.exists() {
+            let _ = std::fs::remove_file(path);
+        }
+        return;
+    }
+    let mut body = String::new();
+    for warning in warnings {
+        body.push_str("STRATA_REGISTRY_WARN ");
+        body.push_str(warning);
+        body.push('\n');
+    }
+    if let Err(error) = std::fs::write(&path, body) {
+        eprintln!(
+            "STRATA_REGISTRY_WARN could not write {}: {error}",
+            path.display()
+        );
+    }
+}
+
 fn report_startup_failure(error: &str) {
     eprintln!("STRATA_START_FAILED {error}");
     let directory = std::env::current_exe()
@@ -1302,10 +1342,6 @@ fn apply_debug_hour_skip(
 }
 
 fn main() {
-    if let Err(error) = registry::install() {
-        eprintln!("STRATA block registry: {error}");
-        std::process::exit(1);
-    }
     let options = match Options::parse() {
         Ok(o) => o,
         Err(e) => {
@@ -1313,6 +1349,19 @@ fn main() {
             std::process::exit(2);
         }
     };
+    let installed = if options.data_dir.is_some() {
+        registry::install_from(options.data_dir.as_deref())
+    } else {
+        registry::install()
+    };
+    let registry = match installed {
+        Ok(registry) => registry,
+        Err(error) => {
+            report_startup_failure(&error);
+            std::process::exit(1);
+        }
+    };
+    note_registry_load(&registry);
     if let Some(output) = &options.benchmark_cpu {
         match benchmark::run_cpu_benchmark(output) {
             Ok(()) => println!("STRATA_CPU_BENCHMARK report={}", output.display()),

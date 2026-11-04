@@ -51,11 +51,16 @@ fn default_time_of_day() -> f32 {
 }
 
 fn default_hotbar_ids() -> [u8; HOTBAR_SLOTS] {
-    interaction::default_hotbar().map(|block| {
-        block
-            .legacy_u8()
-            .expect("default hotbar ids are schema-1 builtins")
-    })
+    // The default bar is eight schema-1 builtins. Their raw ids are 1, 3, 6, 7,
+    // 4, 9, 10 and 11. An id above 15 is not converted through `legacy_u8`;
+    // schema 1 save rejects it instead of panicking.
+    interaction::default_hotbar().map(|block| block.raw() as u8)
+}
+
+fn schema1_hotbar_id(block: Block) -> Result<u8, String> {
+    block
+        .legacy_u8()
+        .ok_or_else(|| format!("Schema 1 cannot store hotbar block {}.", block.raw()))
 }
 
 impl Snapshot {
@@ -234,11 +239,16 @@ impl SaveStore {
             player,
             edits: world.edits(),
             time_of_day,
-            hotbar: hotbar.map(|block| {
-                block
-                    .legacy_u8()
-                    .expect("schema 1 hotbar ids are builtins 0..=15")
-            }),
+            hotbar: [
+                schema1_hotbar_id(hotbar[0])?,
+                schema1_hotbar_id(hotbar[1])?,
+                schema1_hotbar_id(hotbar[2])?,
+                schema1_hotbar_id(hotbar[3])?,
+                schema1_hotbar_id(hotbar[4])?,
+                schema1_hotbar_id(hotbar[5])?,
+                schema1_hotbar_id(hotbar[6])?,
+                schema1_hotbar_id(hotbar[7])?,
+            ],
             selected_slot,
         };
         snapshot.validate()?;
@@ -336,6 +346,19 @@ mod tests {
         assert_eq!(loaded.hotbar(), interaction::default_hotbar());
         assert_eq!(loaded.selected_slot(), 0);
         assert_eq!(loaded.time_of_day(), daylight::MORNING);
+        fs::remove_dir_all(path).unwrap();
+    }
+    #[test]
+    fn schema1_save_rejects_a_hotbar_id_above_15() {
+        let path = directory();
+        let (mut store, _) = SaveStore::open(&path).unwrap();
+        let mut hotbar = interaction::default_hotbar();
+        hotbar[0] = crate::registry::MISSING;
+        let error = store
+            .save(&World::new(1), player(), daylight::MORNING, hotbar, 0)
+            .unwrap_err();
+        assert!(error.contains("Schema 1"), "{error}");
+        assert!(error.contains("16"), "{error}");
         fs::remove_dir_all(path).unwrap();
     }
     #[test]

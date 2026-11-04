@@ -4,15 +4,15 @@ use crate::registry;
 use std::{fs, io::BufWriter, path::Path};
 
 /// File stem for one texture id, in registry layer order.
+///
+/// The namespace stays in the name. `:` and `/` both become `-`, so
+/// `strata:block/grass_top` is `strata-block-grass_top` and the export never
+/// creates a directory for a path segment. Windows file names cannot contain `:`.
 fn layer_names() -> Vec<String> {
     registry::registry()
         .textures_sorted()
         .iter()
-        .map(|id| {
-            id.split_once(':')
-                .map(|(_, name)| name.to_string())
-                .unwrap_or_else(|| id.clone())
-        })
+        .map(|id| id.replace([':', '/'], "-"))
         .collect()
 }
 

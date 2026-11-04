@@ -41,6 +41,8 @@ pub struct Vertex {
     pub normal: [f32; 3],
     pub color: [f32; 4],
     pub texture_layer: u32,
+    /// Linear shader multiply. Identity white leaves the texture unchanged.
+    pub tint: [f32; 4],
 }
 
 #[derive(Clone, Debug, Default)]
@@ -77,6 +79,9 @@ pub struct World {
     /// Parallel to [`ORE_RULES`], in the same order, copied from [`Self::worldgen`].
     ore_ids: [BlockId; 4],
     registry: Arc<registry::Registry>,
+    /// Solid bit and render class, plus one layer and tint per id. Built once
+    /// so meshing does not touch the registry lock or copy flag rows.
+    mesh_lookup: MeshLookup,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -205,6 +210,7 @@ impl World {
     pub fn new(seed: u64) -> Self {
         let registry = registry::registry_handle();
         let worldgen = WorldgenBlocks::resolve(&registry);
+        let mesh_lookup = MeshLookup::from_registry(&registry);
         Self {
             seed,
             edits: HashMap::new(),
@@ -216,51 +222,59 @@ impl World {
             ],
             worldgen,
             registry,
+            mesh_lookup,
         }
         .checked()
     }
 
     /// The resolved ids must match the builtin constants. A mismatch means the
-    /// TOML load order drifted from the schema-1 numbers.
+    /// TOML load order drifted from the schema-1 numbers. These checks stay on
+    /// in release builds: schema 1 stores the same numbers.
     fn checked(self) -> Self {
-        debug_assert_eq!(self.worldgen.air, AIR);
-        debug_assert_eq!(self.worldgen.grass, GRASS);
-        debug_assert_eq!(self.worldgen.dirt, DIRT);
-        debug_assert_eq!(self.worldgen.stone, STONE);
-        debug_assert_eq!(self.worldgen.sand, SAND);
-        debug_assert_eq!(self.worldgen.water, WATER);
-        debug_assert_eq!(self.worldgen.wood, WOOD);
-        debug_assert_eq!(self.worldgen.leaves, LEAVES);
-        debug_assert_eq!(self.worldgen.snow, SNOW);
-        debug_assert_eq!(self.worldgen.clay, CLAY);
-        debug_assert_eq!(self.worldgen.crystal, CRYSTAL);
-        debug_assert_eq!(self.worldgen.basalt, BASALT);
-        debug_assert_eq!(self.worldgen.coal_ore, COAL_ORE);
-        debug_assert_eq!(self.worldgen.iron_ore, IRON_ORE);
-        debug_assert_eq!(self.worldgen.gold_ore, GOLD_ORE);
-        debug_assert_eq!(self.worldgen.diamond_ore, DIAMOND_ORE);
-        debug_assert_eq!(self.registry.name(STONE), "strata:stone");
-        debug_assert_eq!(self.registry.name_key(AIR), "block.strata.air");
-        debug_assert_eq!(self.registry.flag_rows().len(), 17);
-        debug_assert_eq!(self.registry.texture_index("strata:limestone"), Some(12));
-        debug_assert_eq!(
-            self.registry.flags(GRASS).layers[0],
-            self.registry.texture_index("strata:grass_top").unwrap()
+        assert_eq!(self.worldgen.air, AIR);
+        assert_eq!(AIR.raw(), 0);
+        assert_eq!(self.worldgen.grass, GRASS);
+        assert_eq!(self.worldgen.dirt, DIRT);
+        assert_eq!(self.worldgen.stone, STONE);
+        assert_eq!(self.worldgen.sand, SAND);
+        assert_eq!(self.worldgen.water, WATER);
+        assert_eq!(self.worldgen.wood, WOOD);
+        assert_eq!(self.worldgen.leaves, LEAVES);
+        assert_eq!(self.worldgen.snow, SNOW);
+        assert_eq!(self.worldgen.clay, CLAY);
+        assert_eq!(self.worldgen.crystal, CRYSTAL);
+        assert_eq!(self.worldgen.basalt, BASALT);
+        assert_eq!(self.worldgen.coal_ore, COAL_ORE);
+        assert_eq!(self.worldgen.iron_ore, IRON_ORE);
+        assert_eq!(self.worldgen.gold_ore, GOLD_ORE);
+        assert_eq!(self.worldgen.diamond_ore, DIAMOND_ORE);
+        assert_eq!(DIAMOND_ORE.raw(), 15);
+        assert_eq!(self.registry.get("strata:missing"), Some(registry::MISSING));
+        assert_eq!(registry::MISSING.raw(), 16);
+        assert_eq!(self.registry.name(STONE), "strata:stone");
+        assert_eq!(self.registry.name_key(AIR), "block.strata.air");
+        let grass_top = self
+            .registry
+            .texture_index("strata:block/grass_top")
+            .expect("grass top tile");
+        assert_eq!(
+            self.registry.flags(GRASS).layers[registry::BlockFace::Top.index()],
+            grass_top
         );
-        debug_assert_eq!(self.registry.builtin_content_hash().len(), 64);
-        debug_assert!(
+        assert_eq!(crate::materials::layer_for(GRASS, [0, 1, 0]), grass_top);
+        assert_eq!(WATER.tint(), [1.0, 1.0, 1.0, 1.0]);
+        assert_eq!(WATER.render_class(), RenderClass::Fluid);
+        assert_eq!(registry::render_class(LEAVES), RenderClass::Cutout);
+        assert_eq!(self.registry.builtin_content_hash().len(), 64);
+        assert!(
             self.registry
                 .builtin_content_hash()
                 .chars()
                 .all(|character| character.is_ascii_hexdigit())
         );
-        debug_assert_eq!(
-            self.registry.loaded_from_disk(),
-            std::path::Path::new("assets/strata/blocks").is_dir()
-        );
-        debug_assert_eq!(
+        assert_eq!(
             self.registry
-                .texture_rotation(STONE, registry::BlockFace::Side),
+                .texture_rotation(STONE, registry::BlockFace::North),
             registry::TextureRotation::None
         );
         self
@@ -660,7 +674,7 @@ impl World {
             return Mesh::default();
         };
         let halo = self.sample_halo(origin);
-        mesh_halo(origin, &halo)
+        mesh_halo(origin, &halo, &self.mesh_lookup)
     }
 
     fn sample_halo(&self, origin: [i32; 3]) -> Vec<Block> {
@@ -883,19 +897,112 @@ impl Face {
     }
 }
 
+/// Dense per-id facts for one mesh. Bit 0 is solid. Bits 1.. store [`RenderClass`].
+#[derive(Clone)]
+struct MeshLookup {
+    flags: Vec<u8>,
+    layers: Vec<u32>,
+    tints: Vec<[f32; 4]>,
+    fallback_flags: u8,
+    fallback_layers: [u32; 6],
+    fallback_tint: [f32; 4],
+}
+
+fn pack_flags(solid: bool, render: RenderClass) -> u8 {
+    u8::from(solid) | ((render as u8) << 1)
+}
+
+fn unpack_render(flags: u8) -> RenderClass {
+    match flags >> 1 {
+        0 => RenderClass::Opaque,
+        1 => RenderClass::Cutout,
+        2 => RenderClass::Fluid,
+        3 => RenderClass::Translucent,
+        _ => RenderClass::Invisible,
+    }
+}
+
+impl MeshLookup {
+    fn from_registry(registry: &registry::Registry) -> Self {
+        let rows = registry.flag_rows();
+        let mut flags = Vec::with_capacity(rows.len());
+        let mut layers = Vec::with_capacity(rows.len() * 6);
+        let mut tints = Vec::with_capacity(rows.len());
+        for (index, row) in rows.iter().enumerate() {
+            let id = BlockId::from_index(index as u16);
+            flags.push(pack_flags(row.solid, row.render));
+            tints.push(row.tint);
+            for face in registry::BlockFace::ALL {
+                let layer = registry
+                    .texture_variants(id, face)
+                    .first()
+                    .copied()
+                    .unwrap_or_else(|| registry.missing_layer());
+                layers.push(layer);
+            }
+        }
+        let unknown = BlockId::from_index(u16::MAX);
+        let placeholder = registry.flags(unknown);
+        let mut fallback_layers = [registry.missing_layer(); 6];
+        for face in registry::BlockFace::ALL {
+            fallback_layers[face.index()] = registry
+                .texture_variants(unknown, face)
+                .first()
+                .copied()
+                .unwrap_or(registry.missing_layer());
+        }
+        Self {
+            flags,
+            layers,
+            tints,
+            fallback_flags: pack_flags(placeholder.solid, placeholder.render),
+            fallback_layers,
+            fallback_tint: placeholder.tint,
+        }
+    }
+
+    fn flags_of(&self, block: Block) -> u8 {
+        self.flags
+            .get(block.index())
+            .copied()
+            .unwrap_or(self.fallback_flags)
+    }
+
+    fn layer_of(&self, block: Block, normal: [i32; 3]) -> u32 {
+        let face = registry::BlockFace::from_normal(normal).index();
+        self.layers
+            .get(block.index() * 6 + face)
+            .copied()
+            .unwrap_or(self.fallback_layers[face])
+    }
+
+    fn tint_of(&self, block: Block) -> [f32; 4] {
+        self.tints
+            .get(block.index())
+            .copied()
+            .unwrap_or(self.fallback_tint)
+    }
+
+    fn solid(&self, block: Block) -> bool {
+        self.flags_of(block) & 1 == 1
+    }
+}
+
 /// Fluid emits only into invisible cells (air). Cutout is culled as opaque
 /// until the cutout pipeline exists, so leaves keep today's solid faces.
-fn face_visible(block: Block, neighbor: Block) -> bool {
-    match registry::render_class(block) {
+fn face_visible(tables: &MeshLookup, block: Block, neighbor: Block) -> bool {
+    let block_flags = tables.flags_of(block);
+    let neighbor_flags = tables.flags_of(neighbor);
+    match unpack_render(block_flags) {
         RenderClass::Invisible => false,
-        RenderClass::Fluid => registry::render_class(neighbor) == RenderClass::Invisible,
+        RenderClass::Fluid => unpack_render(neighbor_flags) == RenderClass::Invisible,
         RenderClass::Cutout | RenderClass::Opaque | RenderClass::Translucent => {
-            block.is_solid() && !neighbor.is_solid()
+            block_flags & 1 == 1 && neighbor_flags & 1 == 0
         }
     }
 }
 
-fn mesh_halo(origin: [i32; 3], halo: &[Block]) -> Mesh {
+fn mesh_halo(origin: [i32; 3], halo: &[Block], tables: &MeshLookup) -> Mesh {
     let mut mesh = Mesh::default();
     let side = CHUNK_SIZE as usize;
     let mut mask = vec![None; side * side];
@@ -914,9 +1021,9 @@ fn mesh_halo(origin: [i32; 3], halo: &[Block]) -> Mesh {
                         let mut outside = p;
                         outside[axis] += sign;
                         let neighbor = halo[halo_index(outside)];
-                        let visible = face_visible(block, neighbor);
+                        let visible = face_visible(tables, block, neighbor);
                         mask[i as usize + j as usize * side] = if visible {
-                            let ao = corner_ao(halo, outside, u, v);
+                            let ao = corner_ao(halo, tables, outside, u, v);
                             let world = [origin[0] + p[0], origin[1] + p[1], origin[2] + p[2]];
                             Some(Face {
                                 block,
@@ -961,6 +1068,7 @@ fn mesh_halo(origin: [i32; 3], halo: &[Block]) -> Mesh {
                         p[v] += j as i32;
                         emit_quad(
                             &mut mesh,
+                            tables,
                             p,
                             axis,
                             sign,
@@ -981,7 +1089,13 @@ fn mesh_halo(origin: [i32; 3], halo: &[Block]) -> Mesh {
     mesh
 }
 
-fn corner_ao(halo: &[Block], outside: [i32; 3], u: usize, v: usize) -> [u8; 4] {
+fn corner_ao(
+    halo: &[Block],
+    tables: &MeshLookup,
+    outside: [i32; 3],
+    u: usize,
+    v: usize,
+) -> [u8; 4] {
     let mut ao = [3; 4];
     for (corner, (du, dv)) in [(-1, -1), (1, -1), (1, 1), (-1, 1)].into_iter().enumerate() {
         let mut side_u = outside;
@@ -991,21 +1105,33 @@ fn corner_ao(halo: &[Block], outside: [i32; 3], u: usize, v: usize) -> [u8; 4] {
         side_v[v] += dv;
         diagonal[u] += du;
         diagonal[v] += dv;
-        let a = u8::from(halo[halo_index(side_u)].is_solid());
-        let b = u8::from(halo[halo_index(side_v)].is_solid());
-        let c = u8::from(halo[halo_index(diagonal)].is_solid());
+        let a = u8::from(tables.solid(halo[halo_index(side_u)]));
+        let b = u8::from(tables.solid(halo[halo_index(side_v)]));
+        let c = u8::from(tables.solid(halo[halo_index(diagonal)]));
         ao[corner] = if a == 1 && b == 1 { 0 } else { 3 - a - b - c };
     }
     ao
 }
 
-fn emit_quad(mesh: &mut Mesh, p: [i32; 3], axis: usize, sign: i32, size: [f32; 2], face: Face) {
+fn emit_quad(
+    mesh: &mut Mesh,
+    tables: &MeshLookup,
+    p: [i32; 3],
+    axis: usize,
+    sign: i32,
+    size: [f32; 2],
+    face: Face,
+) {
     let base = mesh.vertices.len() as u32;
     let u = (axis + 1) % 3;
     let v = (axis + 2) % 3;
     let mut normal = [0.0; 3];
     normal[axis] = sign as f32;
-    let texture_layer = crate::materials::layer_for(face.block, normal.map(|v| v as i32));
+    let mut grid_normal = [0; 3];
+    grid_normal[axis] = sign;
+    let layer = tables.layer_of(face.block, grid_normal);
+    let tint = tables.tint_of(face.block);
+    let fluid = unpack_render(tables.flags_of(face.block)) == RenderClass::Fluid;
     let variation = 0.94 + f32::from(face.variation) * 0.02;
     let directional = if axis == 1 && sign < 0 {
         0.80
@@ -1027,18 +1153,14 @@ fn emit_quad(mesh: &mut Mesh, p: [i32; 3], axis: usize, sign: i32, size: [f32; 2
             normal,
             // Texture owns albedo. Vertex RGB is lighting only. Fluid alpha is the
             // development shader's water signal (`color.a < 0.99`), not tint[3].
-            // Forge multiplies linear tint in the shader; fluids are RGB-only there.
             color: [
                 brightness,
                 brightness,
                 brightness,
-                if face.block.render_class() == RenderClass::Fluid {
-                    0.72
-                } else {
-                    1.0
-                },
+                if fluid { 0.72 } else { 1.0 },
             ],
-            texture_layer,
+            texture_layer: layer,
+            tint,
         });
     }
     // Pick the diagonal with the lower AO discontinuity. Reverse negative faces
@@ -1186,7 +1308,11 @@ mod tests {
         for &(p, block) in cells {
             halo[halo_index(p)] = block;
         }
-        mesh_halo([0; 3], &halo)
+        mesh_halo(
+            [0; 3],
+            &halo,
+            &MeshLookup::from_registry(registry::registry()),
+        )
     }
 
     fn triangle_area(mesh: &Mesh) -> f32 {
@@ -1426,14 +1552,35 @@ mod tests {
         // Sample the top of a voxel at [8,8,8], with two adjacent walls.
         halo[halo_index([7, 9, 8])] = STONE;
         halo[halo_index([8, 9, 7])] = STONE;
-        let ao = corner_ao(&halo, [8, 9, 8], 0, 2);
+        let ao = corner_ao(
+            &halo,
+            &MeshLookup::from_registry(registry::registry()),
+            [8, 9, 8],
+            0,
+            2,
+        );
         assert_eq!(ao[0], 0, "two occluding side cells close the corner");
         assert_eq!(ao[2], 3, "opposite open corner receives full ambient light");
     }
 
     #[test]
     fn emitted_grass_and_timber_faces_select_their_distinct_material_tiles() {
-        for (block, top, side, bottom) in [(GRASS, 9, 8, 16), (WOOD, 6, 0, 6)] {
+        let registry = registry::registry();
+        let layer = |name: &str| registry.texture_index(name).unwrap();
+        for (block, top, side, bottom) in [
+            (
+                GRASS,
+                layer("strata:block/grass_top"),
+                layer("strata:block/grass_side"),
+                layer("strata:block/soil"),
+            ),
+            (
+                WOOD,
+                layer("strata:block/endgrain"),
+                layer("strata:block/bark"),
+                layer("strata:block/endgrain"),
+            ),
+        ] {
             let mesh = artificial_mesh(&[([8, 8, 8], block)]);
             assert_eq!(mesh.vertices.len(), 24);
             for vertex in mesh.vertices {
@@ -1445,6 +1592,7 @@ mod tests {
                     side
                 };
                 assert_eq!(vertex.texture_layer, expected);
+                assert_eq!(vertex.tint, [1.0, 1.0, 1.0, 1.0]);
                 assert_eq!(
                     vertex.color[0], vertex.color[1],
                     "albedo must come from the texture"
@@ -1484,6 +1632,12 @@ mod tests {
     fn water_has_surface_without_internal_water_faces_and_is_not_pickable() {
         let mesh = artificial_mesh(&[([8, 8, 8], WATER), ([9, 8, 8], WATER)]);
         assert_eq!(triangle_area(&mesh), 10.0);
+        assert!(mesh.vertices.iter().all(|vertex| vertex.color[3] == 0.72));
+        assert!(
+            mesh.vertices
+                .iter()
+                .all(|vertex| vertex.tint == [1.0, 1.0, 1.0, 1.0])
+        );
         let mut world = World::new(1);
         world.set_block([1, 150, 0], WATER);
         world.set_block([2, 150, 0], STONE);

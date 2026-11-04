@@ -4,9 +4,10 @@ solid = true
 placeable = true
 replaceable = false
 render = "opaque"
-tint = [0.38, 0.58, 0.22, 1.0]
+swatch = [0.38, 0.58, 0.22, 1.0]
+tint = [1.0, 1.0, 1.0, 1.0]
 
 [textures]
-top = "strata:grass_top"
-side = "strata:grass_side"
-bottom = "strata:soil"
+top = "strata:block/grass_top"
+side = "strata:block/grass_side"
+bottom = "strata:block/soil"

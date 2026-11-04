@@ -4,4 +4,5 @@ solid = false
 placeable = false
 replaceable = true
 render = "invisible"
-tint = [0.0, 0.0, 0.0, 0.0]
+swatch = [0.0, 0.0, 0.0, 0.0]
+tint = [1.0, 1.0, 1.0, 1.0]

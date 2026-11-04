@@ -34,20 +34,47 @@ pub fn layer_count() -> u32 {
 
 /// Axis-aligned block face to texture-array layer. The index comes from the
 /// registry, not from this file's authoring order. Grass side v=0 is its top
-/// edge; wood grain runs along increasing v. Air is never meshed; its defensive
-/// layer is limestone, stored on the invisible row.
+/// edge; wood grain runs along increasing v. Air is never meshed. An unknown
+/// block or an empty face list uses the single `strata:missing` checker.
 pub fn layer_for(block: BlockId, normal: [i32; 3]) -> u32 {
+    let registry = registry::registry();
     let face = registry::BlockFace::from_normal(normal);
-    registry::registry()
+    registry
         .texture_variants(block, face)
         .first()
         .copied()
-        .unwrap_or(0)
+        .unwrap_or_else(|| registry.missing_layer())
+}
+
+/// True when `texture` is a tile this module paints. Freeze maps every other
+/// reference onto the one `strata:missing` layer instead of allocating a new one.
+pub fn authored_texture(texture: &str) -> bool {
+    matches!(
+        texture,
+        "strata:block/grass_top"
+            | "strata:block/grass_side"
+            | "strata:block/soil"
+            | "strata:block/limestone"
+            | "strata:block/sand"
+            | "strata:block/water"
+            | "strata:block/bark"
+            | "strata:block/endgrain"
+            | "strata:block/leaves"
+            | "strata:block/snow"
+            | "strata:block/clay"
+            | "strata:block/crystal"
+            | "strata:block/basalt"
+            | "strata:block/coal_ore"
+            | "strata:block/iron_ore"
+            | "strata:block/gold_ore"
+            | "strata:block/diamond_ore"
+            | "strata:missing"
+    )
 }
 
 /// Packed array order is layer, row, column, RGBA. Each layer has 4096 bytes.
-/// These are full albedo colors. Linear tint is multiplied in the shader later;
-/// it is not baked into these tiles.
+/// These are full albedo colors. Linear tint is a vertex attribute multiplied
+/// in the shader. It is not baked into these tiles.
 pub fn rgba_layers() -> Vec<u8> {
     let registry = registry::registry();
     let count = registry.texture_count();
@@ -65,23 +92,23 @@ pub fn rgba_layers() -> Vec<u8> {
 
 fn pixel_for_texture(texture: &str, x: i32, y: i32) -> [u8; 4] {
     let authoring = match texture {
-        "strata:grass_top" => GRASS_TOP,
-        "strata:grass_side" => GRASS_SIDE,
-        "strata:soil" => SOIL,
-        "strata:limestone" => LIMESTONE,
-        "strata:sand" => SAND,
-        "strata:water" => WATER,
-        "strata:bark" => BARK,
-        "strata:endgrain" => ENDGRAIN,
-        "strata:leaves" => LEAVES,
-        "strata:snow" => SNOW,
-        "strata:clay" => CLAY,
-        "strata:crystal" => CRYSTAL,
-        "strata:basalt" => BASALT,
-        "strata:coal_ore" => COAL_ORE,
-        "strata:iron_ore" => IRON_ORE,
-        "strata:gold_ore" => GOLD_ORE,
-        "strata:diamond_ore" => DIAMOND_ORE,
+        "strata:block/grass_top" => GRASS_TOP,
+        "strata:block/grass_side" => GRASS_SIDE,
+        "strata:block/soil" => SOIL,
+        "strata:block/limestone" => LIMESTONE,
+        "strata:block/sand" => SAND,
+        "strata:block/water" => WATER,
+        "strata:block/bark" => BARK,
+        "strata:block/endgrain" => ENDGRAIN,
+        "strata:block/leaves" => LEAVES,
+        "strata:block/snow" => SNOW,
+        "strata:block/clay" => CLAY,
+        "strata:block/crystal" => CRYSTAL,
+        "strata:block/basalt" => BASALT,
+        "strata:block/coal_ore" => COAL_ORE,
+        "strata:block/iron_ore" => IRON_ORE,
+        "strata:block/gold_ore" => GOLD_ORE,
+        "strata:block/diamond_ore" => DIAMOND_ORE,
         _ => return missing_checker(x, y),
     };
     pixel(authoring, x, y)
@@ -476,15 +503,16 @@ mod tests {
             [0, 0, 1],
             [0, 0, -1],
         ];
-        use crate::world::{self, Block};
-        let mut id = 0_u8;
-        while let Some(block) = Block::from_id(id) {
+        use crate::registry::BlockId;
+        use crate::world;
+        let registry = registry::registry();
+        for index in 0..registry.flag_rows().len() {
+            let block = BlockId::from_index(index as u16);
             for normal in normals {
                 assert!(layer_for(block, normal) < layer_count());
             }
-            id += 1;
         }
-        assert!(id > 15);
+        assert!(registry.flag_rows().len() > world::DIAMOND_ORE.index());
         assert!(layer_for(crate::registry::MISSING, [0, 1, 0]) < layer_count());
         let ore_layers = [
             layer_for(world::COAL_ORE, [0, 1, 0]),
@@ -546,7 +574,7 @@ mod tests {
             }
         }
         let grass_top = registry::registry()
-            .texture_index("strata:grass_top")
+            .texture_index("strata:block/grass_top")
             .unwrap();
         let stride = (TILE_SIZE * TILE_SIZE * 4) as usize;
         let baked = &pixels[grass_top as usize * stride..(grass_top as usize + 1) * stride];

@@ -4,29 +4,47 @@
 
 ## Block registry (schema 1 still)
 
-Builtin blocks load from `assets/strata/blocks/*.toml` through the only TOML parser, in `src/registry.rs`. Runtime ids are `u16`. Ids 0 through 15 match the old schema-1 numbers. `strata:missing` is 16. Worldgen resolves names once in `World::new`. The mesher treats fluid by `RenderClass`, and still culls cutout blocks like opaque ones. Saves are still schema 1: edits and the hotbar are those numeric ids. Generator version stays 3. The seven golden chunk digests are unchanged.
+Builtin blocks load from `assets/strata/blocks/*.toml` through the only TOML parser, in `src/registry.rs`. The embedded copies are the normal path. `--data-dir <data-root>` or `STRATA_DATA_DIR` opts into that folder, used as given; the working directory is not searched. Non-`.toml` files are ignored and CRLF is accepted. A bad file fails startup, writes `strata-error.txt` beside the executable, and names the file and the key. Runtime ids are `u16`. Ids 0 through 15 match the old schema-1 numbers. `strata:missing` is 16. Those order checks run in release builds. Worldgen resolves names once in `World::new`. The mesher treats fluid by `RenderClass`, and still culls cutout blocks like opaque ones. `render = "translucent"` is rejected. Saves are still schema 1: edits and the hotbar are those numeric ids, and a hotbar id above 15 returns an error instead of panicking. Generator version stays 3. The seven golden chunk digests are unchanged.
 
-Texture layers are assigned at freeze in sorted texture-id order. The seventeen authored tiles keep their pixels. `strata:missing` is a new magenta/black checker, layer 13, not limestone. A packaged executable with no `assets/strata/blocks` directory uses the same TOML embedded in the binary. If that directory exists and a file is wrong, startup fails and names the file and the key.
+Texture references may contain path segments (`strata:block/grass_top`). Layers are assigned at freeze in sorted texture-id order and capped at 256. The seventeen authored tiles keep their pixels. `strata:missing` is the magenta/black checker and sorts last. An unknown reference adds no layer and uses that checker, with a warning that names the file and the key. The game writes that warning to `strata-registry-warnings.txt` beside the executable and removes the file on a later start that has none. Block `tint` is identity white and is a vertex attribute the shader multiplies. Hotbar color is `swatch`. Fluid tint alpha must be 1.0. Water still uses vertex alpha `0.72` as the shader's water signal. The terrain vertex is 60 bytes. Content hashing uses the `sha2` crate. The mesher keeps a dense per-id table on `World` so the face loop does not call the registry. Freeze does not pack variant lists into one contiguous layer run.
 
-Release chunk generation on this Linux agent, seed `20261021`, the seven golden chunks, 3 untimed warmup passes and 30 timed passes (210 chunks), `cargo test --release --locked`:
+The previous registry round, on a Linux agent, measured release chunk generation for seed `20261021` on the seven golden chunks (3 untimed warmup passes and 30 timed passes, `cargo test --release --locked`):
 
 - Before the registry, one run: **2741.8 µs/chunk**.
-- After, three runs: **2764.4, 2777.1, and 2779.0 µs/chunk**.
+- After that round, three runs: **2764.4, 2777.1, and 2779.0 µs/chunk**.
 
-That is about one percent, inside run-to-run noise. It is not a GTX 1660 Ti measurement and it does not include meshing.
+That was about one percent, inside run-to-run noise. It is not a GTX 1660 Ti measurement and it did not include meshing. That round's Linux check was `cargo test --locked` **133 passed, 0 failed, 1 ignored**.
 
-Linux verification for this change, Rust 1.97.1:
+Windows review round, same seven chunks, seed `20261021`, 3 warmup passes and 30 timed passes, `cargo test --release --locked`, on the GTX 1660 Ti machine (i7-9700). One run each. Milliseconds per chunk:
+
+| Build | Generate | Mesh |
+|---|---:|---:|
+| `origin/development` `61cf20d` | 3.8876 | 5.9869 |
+| This branch before the review edits, `7a2a23f` | 3.9316 | 6.4256 |
+| This branch after the dense mesh table | 3.955 | 6.500 |
+
+The after row is the mean of two back-to-back runs (3.9560 / 6.4972 and 3.9547 / 6.5023). Generation stayed flat. Meshing is about 8.6% above `origin/development` on this machine and about 1% above this branch before the review edits. QA's earlier pair was 4.95 ms on development and 5.29 ms on this branch. The face loop no longer calls the registry. The remaining gap is the data-driven block record plus the terrain vertex growing from 44 bytes to 60 bytes so the shader can multiply by tint. Freeze still does not pack variant lists into one contiguous layer run.
+
+Windows verification for this review round, Rust 1.97.1:
 
 - `cargo fmt --check`: passed.
-- `cargo test --locked`: **133 passed, 0 failed, 1 ignored**. The ignored test is `native_gpu_validates_all_world_shader_pipelines`. It was not re-run for this change.
+- `cargo test --locked`: **142 passed, 0 failed, 1 ignored**. The ignored test is `native_gpu_validates_all_world_shader_pipelines`. `golden_chunks_match_platform_independent_hashes` passed. The lavapipe GPU test was not re-run.
 - `cargo clippy --locked --all-targets -- -D warnings`: passed.
-- `cargo build --release --locked`: passed on this agent after the commands above.
+- `cargo build --release --locked`: passed.
+- Release `strata.exe --smoke-seconds 1` exited 0 and left no `strata-error.txt`. A `--data-dir` folder with `solid = "yes"` in `stone.toml` exited 1 and wrote `strata-error.txt` naming `stone.toml` and `solid`. That folder and the error file were removed. The process had already exited.
 
-Unverified: windowed play, the lavapipe shader pipeline with the 18-layer array, and the Windows / NVIDIA GTX 1660 Ti acceptance machine.
+Linux verification recorded for the previous registry round, Rust 1.97.1:
+
+- `cargo fmt --check`: passed.
+- `cargo test --locked`: **133 passed, 0 failed, 1 ignored**. The ignored test is `native_gpu_validates_all_world_shader_pipelines`. It was not re-run for that round.
+- `cargo clippy --locked --all-targets -- -D warnings`: passed.
+- `cargo build --release --locked`: passed on that agent after the commands above.
+
+That round left windowed play, the lavapipe shader pipeline, and the Windows / NVIDIA GTX 1660 Ti acceptance machine unverified.
 
 ## Day/night cycle
 
-Playing advances a 20-minute day on the fixed 60 Hz simulation tick. The title, pause menu, settings, and focus loss all go through the same step function and freeze that clock. Schema 1 generator 3 stores `time_of_day` in `[0, 1)` (midnight is 0). A generator 3 file missing that field loads at 08:00. Generator 1 and generator 2 files are rejected and left untouched. Non-finite values, negatives, and exactly 1.0 are rejected and the file is kept. Sun direction, sky, fog, ambient, and sun color are appended camera uniforms. Night clouds and water use the same linear lighting as the terrain. The 44-byte vertex layout is unchanged.
+Playing advances a 20-minute day on the fixed 60 Hz simulation tick. The title, pause menu, settings, and focus loss all go through the same step function and freeze that clock. Schema 1 generator 3 stores `time_of_day` in `[0, 1)` (midnight is 0). A generator 3 file missing that field loads at 08:00. Generator 1 and generator 2 files are rejected and left untouched. Non-finite values, negatives, and exactly 1.0 are rejected and the file is kept. Sun direction, sky, fog, ambient, and sun color are appended camera uniforms. Night clouds and water use the same linear lighting as the terrain. This checkpoint left the vertex at 44 bytes. The registry change after it stores linear tint in the vertex, so the current layout is 60 bytes.
 
 Linux verification for this change, Rust 1.97.1:
 
@@ -74,7 +92,7 @@ The canonical local project is `C:\WPAI\Software\Rust Based Voxel`, an independe
 - `cargo build --release --locked`: passed.
 - All three PowerShell entry points parsed; CPU benchmark, native launcher and streaming-trace wrapper ran. The launcher retains diagnostics; benchmark reports and exports preserve existing destinations.
 
-The original 40-byte vertex assertion failed when adding the texture-layer field intentionally changed the contract to 44 bytes. The test now verifies size, normal/color/layer offsets and GPU attribute format. Geometry-area and intended-behavior assertions were not weakened.
+The original 40-byte vertex assertion failed when adding the texture-layer field intentionally changed the contract to 44 bytes. A later registry change appended linear tint, so the current vertex is 60 bytes. The test verifies size, normal/color/layer/tint offsets and GPU attribute format. Geometry-area and intended-behavior assertions were not weakened.
 
 ## Walking controller
 
