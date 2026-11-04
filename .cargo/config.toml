@@ -2,5 +2,7 @@
 # including a Linux host build, do not inherit this flag.
 # tools/repro_build.py sets CARGO_ENCODED_RUSTFLAGS for player zips. That
 # variable replaces this list, so the script repeats +crt-static itself.
+# A rustflag added only here is omitted from player zips until the script
+# repeats it.
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]

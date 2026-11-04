@@ -92,6 +92,20 @@ def encoded_rustflags(flags: list[str]) -> str:
     return UNIT.join(flags)
 
 
+def build_environment(base: dict[str, str], epoch: int, flags: list[str]) -> dict[str, str]:
+    """Environment cargo sees for one player-zip build.
+
+    CARGO_ENCODED_RUSTFLAGS replaces RUSTFLAGS and `.cargo/config.toml`.
+    The caller passes the flags this script intends, including the Windows
+    `+crt-static` repeat. A flag that exists only in the config file is absent.
+    """
+    env = dict(base)
+    env["SOURCE_DATE_EPOCH"] = str(epoch)
+    env["CARGO_INCREMENTAL"] = "0"
+    env["CARGO_ENCODED_RUSTFLAGS"] = encoded_rustflags(flags)
+    return env
+
+
 def scan_binary(path: Path, pairs: list[tuple[str, str]]) -> int:
     data = path.read_bytes()
     hits: list[str] = []
@@ -140,10 +154,7 @@ def main(argv: list[str]) -> int:
         return scan_binary(args.scan, pairs)
     epoch = player_zip.source_date_epoch()
     flags = rustflags(args.target)
-    env = os.environ.copy()
-    env["SOURCE_DATE_EPOCH"] = str(epoch)
-    env["CARGO_INCREMENTAL"] = "0"
-    env["CARGO_ENCODED_RUSTFLAGS"] = encoded_rustflags(flags)
+    env = build_environment(dict(os.environ), epoch, flags)
     print(f"SOURCE_DATE_EPOCH={epoch}")
     for prefix, label in pairs:
         print(f"remap {prefix} -> {label}")

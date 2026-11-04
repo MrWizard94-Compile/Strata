@@ -43,8 +43,8 @@ jobs:
             [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $PWD $script), [ref]$tokens, [ref]$errors) | Out-Null
             if ($errors.Count) { $errors; exit 1 }
           }
-      - name: Deterministic zip writer
-        run: python -m unittest tools/test_player_zip.py
+      - name: Packaging unit tests
+        run: python -m unittest tools/test_player_zip.py tools/test_repro_build.py
       - name: Install the pinned toolchain
         run: |
           rustup show
@@ -101,8 +101,8 @@ jobs:
           rustup show
           rustc --version
           cargo --version
-      - name: Deterministic zip writer
-        run: python3 -m unittest tools/test_player_zip.py
+      - name: Packaging unit tests
+        run: python3 -m unittest tools/test_player_zip.py tools/test_repro_build.py
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Formatting
         run: cargo fmt --check

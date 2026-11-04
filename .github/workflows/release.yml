@@ -28,18 +28,23 @@ on:
 permissions:
   contents: read
 
+# A tag publish must run to completion. gh release create records the release
+# before the asset upload finishes, so cancelling that job leaves a release
+# every later run refuses to replace. Branch and manual runs of one ref may
+# still cancel an older run. Tag refs never do.
 concurrency:
   group: playable-build-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
   package:
     name: Package ${{ matrix.label }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
+    # Checkout needs contents: read. Same-run artifact upload uses the Actions
+    # runtime token (upload-artifact v4+), so this job has no actions: write.
     permissions:
       contents: read
-      actions: write
     defaults:
       run:
         shell: ${{ matrix.shell }}
@@ -75,7 +80,7 @@ jobs:
         if: matrix.shaders == true
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers libvulkan1 zip
+          sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers libvulkan1
           icd="$(find /usr/share/vulkan/icd.d -name 'lvp_icd*.json' -print -quit)"
           if [ -z "$icd" ]; then
             echo 'lavapipe ICD was not installed'
@@ -223,8 +228,9 @@ jobs:
     needs: package
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    permissions:
-      actions: write
+    # Same-run download and upload use the Actions runtime token. This job
+    # does not check out the repo and does not call gh.
+    permissions: {}
     steps:
       # A player zip is itself a .zip. Without this, download-artifact
       # unpacks it and the checksum job cannot see the file that was uploaded.
@@ -266,8 +272,9 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v') && inputs.dry_run != true
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # contents: write is only for gh release create. Same-run artifact
+    # download does not need actions: read.
     permissions:
-      actions: read
       contents: write
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -298,8 +305,18 @@ jobs:
             done
           } > SHA256SUMS.txt
           sha256sum -c SHA256SUMS.txt
-          if gh release view "$GITHUB_REF_NAME" --repo "$GH_REPO" >/dev/null 2>&1; then
+          # Print gh's own output. "release not found" is the absent-release
+          # message from `gh release view` (exit 1). Any other failure stops
+          # the job instead of being treated as a missing release.
+          view_status=0
+          view_output="$(gh release view "$GITHUB_REF_NAME" --repo "$GH_REPO" 2>&1)" || view_status=$?
+          printf '%s\n' "$view_output"
+          if [ "$view_status" -eq 0 ]; then
             echo "Release $GITHUB_REF_NAME already exists. Refusing to replace it."
+            exit 1
+          fi
+          if [ "$view_status" -ne 1 ] || [ "$view_output" != "release not found" ]; then
+            echo "gh release view failed with status $view_status."
             exit 1
           fi
           cat > release-notes.md <<'EOF'

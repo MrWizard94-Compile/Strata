@@ -50,6 +50,16 @@ Presentation telemetry counts only calls that reach `Queue::present`; skipped ac
 | Original procedural assets | Coherent early visual foundation without copying protected game assets | Art direction, animation, sound and material authored detail require dedicated later phases. |
 | Windows first, GTX 1660 Ti measured first | Real available acceptance machine | Vulkan/DX12 backend availability does not establish Xbox compatibility; console evidence is a separate stage. |
 
+## Player packages
+
+`tools/repro_build.py` builds the release binary for `strata-windows-x86_64.zip` and `strata-linux-x86_64.zip`. It sets `SOURCE_DATE_EPOCH` from the commit, disables incremental compilation, and passes remapped path prefixes through `CARGO_ENCODED_RUSTFLAGS`. The Windows target also gets `+crt-static` and `/Brepro`. The script scans the binary and fails if an absolute workspace, Cargo, or rustup path remains. `tools/player_zip.py` stores sorted ASCII names, fixed modes, and UTC DOS timestamps from that epoch. The playable-build workflow deletes `target` and requires the second zip to hash the same.
+
+Known limits of that package:
+
+- The runner's Python and zlib versions are not pinned. The same source can deflate to different bytes after an interpreter update.
+- Zip timestamps are UTC, with DOS even-second resolution. They follow the commit time, not the runner's local clock.
+- `CARGO_ENCODED_RUSTFLAGS` replaces `.cargo/config.toml`. A rustflag added only in that file is omitted until `repro_build.py` repeats it. The script repeats `+crt-static` for `x86_64-pc-windows-msvc` and does not read the config file.
+
 ## Known architectural limits to address
 
 - World mesh coordinates use f32; far-coordinate precision is not yet premium large-world behavior. Camera-relative geometry and integer spatial authority are a planned S2 contract.

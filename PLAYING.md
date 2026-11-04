@@ -15,7 +15,26 @@ Windows may say "Windows protected your PC". This build is not signed. Click **M
 
 The game needs Vulkan or DirectX 12. It does not open a console window, so a startup failure does not appear as a Windows message. If no window appears, open `strata-error.txt` in the same folder as `strata.exe`. The first line starts with `STRATA_START_FAILED`. A missing graphics driver is the usual cause.
 
-`SHA256SUMS.txt` on that page is optional. It only checks that the zip was not corrupted.
+`SHA256SUMS.txt` on that page is the SHA-256 digest of each zip. The game runs without checking it. To check the Windows download, put the zip and `SHA256SUMS.txt` in one folder and run:
+
+```powershell
+Get-FileHash .\strata-windows-x86_64.zip -Algorithm SHA256
+Get-Content .\SHA256SUMS.txt
+```
+
+The `Hash` value and the line ending in `strata-windows-x86_64.zip` are the same digest. Letter case does not matter.
+
+On Linux, in a folder that contains every zip named in the file:
+
+```sh
+sha256sum -c SHA256SUMS.txt
+```
+
+To check only the Linux zip:
+
+```sh
+grep 'strata-linux-x86_64.zip$' SHA256SUMS.txt | sha256sum -c -
+```
 
 If Releases has no Windows zip yet, open [Playable build](https://github.com/MrWizard94-Compile/Strata/actions/workflows/release.yml), click the newest run with a green check, and download **`strata-windows-x86_64.zip`** at the bottom. Those downloads are deleted after 30 days. A Release stays up.
 
@@ -42,9 +61,9 @@ On the title screen, click **ENTER THE REACH** or press Enter.
 | W A S D | Walk |
 | Mouse | Look around |
 | Space | Jump. While flying, this rises |
-| Left Shift | Sprint |
+| Left Shift | Sprint, only while walking forward |
 | F | Turn flight on or off. You must move clear of solid ground before flight can turn off |
-| Left Ctrl | Descend while flying |
+| Left Ctrl | Sneak. Sneak is slower and stops at edges. While flying, Left Ctrl descends |
 | Left click, or X | Break the block you are looking at, up to five blocks away. Hold the mouse button to repeat |
 | Right click, or C | Place the selected material, up to five blocks away. Hold the mouse button to repeat |
 | 1 through 8, or the mouse wheel | Select a hotbar slot |
