@@ -487,24 +487,26 @@ mod tests {
                     );
                 }
                 let expected: (usize, usize, usize, String, u32, u32, u32) =
+                    // Generator 3 on seed 728491: snow caps, clay, crystal, and
+                    // deep basalt. The previous pin was the generator 2 route.
                     if scenario.name == "seeded_route" {
                         (
-                            13551,
-                            108_408,
-                            27_102,
-                            "d732c9d403bf9a68".to_string(),
-                            10_792,
-                            2_759,
+                            13416,
+                            107_328,
+                            26_832,
+                            "eea13108cbbc62ee".to_string(),
+                            10_713,
+                            2_703,
                             0,
                         )
                     } else {
                         (
-                            13_589,
-                            108_712,
-                            27_178,
-                            "553186af4f85dbdf".to_string(),
-                            10_830,
-                            2_759,
+                            13_462,
+                            107_696,
+                            26_924,
+                            "ce065bae1978a3cb".to_string(),
+                            10_759,
+                            2_703,
                             0,
                         )
                     };

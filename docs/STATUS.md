@@ -81,9 +81,11 @@ Compared with the same generator and the previous face rule (a solid neighbor hi
 
 The extra 2,368 route bytes still fit in one 4 MiB callback. Upload milliseconds were not measured. Leaf holes are 208 of 1,024 texels. The 1-pixel leaf mip alpha is 203. Non-leaf mips stay opaque, including the sRGB black/white average of 188.
 
+Those route and ocean figures are the generator 2 mesh. Generator 3 keeps the same pass order. On seed 728491 the locked seeded route is 13,416 quads, 26,832 triangles, 107,328 bytes, digest `eea13108cbbc62ee` (opaque 10,713, cutout 2,703, water 0). The edited route is 13,462 quads, 26,924 triangles, 107,696 bytes, digest `ce065bae1978a3cb`. Ocean chunk `(-8, 0, -8)` is 1,488 opaque quads, 0 cutout, 46 water quads, and 12,272 bytes; the three extra opaque quads are basalt, not a texture-pack change. Checkerboard and isolated-solid digests are unchanged.
+
 ## 2026-10-28 block texture pack
 
-The runtime samples PNGs from `assets/<namespace>/textures/block/`, embedded with `include_bytes!`. The shipped `strata` files match `materials.rs` byte for byte, including leaf alpha. The quad is still 8 bytes, so this pack does not change upload size. The layer field is now 10 bits. Variant count and a top-face spin flag share the remaining bits. The default pack uses one variant and leaves spin off, so the route digests above stay valid. A debug build may replace tiles from `STRATA_BLOCK_TEXTURES`. Release builds ignore that variable.
+The runtime samples PNGs from `assets/<namespace>/textures/block/`, embedded with `include_bytes!`. The shipped `strata` files match `materials.rs` byte for byte, including leaf alpha. The quad is still 8 bytes, so this pack does not change upload size. The layer field is now 10 bits. Variant count and a top-face spin flag share the remaining bits. The default pack uses one variant and leaves spin off, so the pack itself does not change mesh digests. The live seed 728491 route pins are the generator 3 figures above; the table above those figures is the generator 2 cutout comparison. A debug build may replace tiles from `STRATA_BLOCK_TEXTURES`. Release builds ignore that variable.
 
 `cargo fmt --check`, `cargo test --locked` (98 passed, 0 failed, 2 ignored) and `cargo clippy --locked --all-targets -- -D warnings` are the source checks for this pack. The ignored GPU pipeline test still has no adapter on this VM.
 
