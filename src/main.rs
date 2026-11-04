@@ -451,7 +451,7 @@ impl Game {
                 } else if self.player.flying {
                     "Flight enabled · Space up · Ctrl down"
                 } else {
-                    "Walking · Space to jump"
+                    "Walking · Space to jump · Ctrl to sneak"
                 });
             }
             KeyCode::KeyX => self.edit(false),
@@ -478,6 +478,7 @@ impl Game {
             vertical: key(KeyCode::Space) - key(KeyCode::ControlLeft),
             sprint: self.keys.contains(&KeyCode::ShiftLeft),
             jump: self.keys.contains(&KeyCode::Space),
+            sneak: self.keys.contains(&KeyCode::ControlLeft),
         }
     }
 
@@ -737,7 +738,7 @@ impl Game {
                             if secondary_button(ui,"Settings") { self.settings_return=Screen::Paused; self.screen=Screen::Settings; }
                             if secondary_button(ui,"Save and quit") && self.save() { self.should_exit=true; }
                             ui.add_space(10.0);
-                            ui.label(RichText::new("WASD  Move     Space  Jump     Shift  Sprint\nF  Flight     1–8 / Wheel  Hotbar     E  Blocks\nLeft click / X  Break     Right click / C  Place\nHold the mouse button to repeat     F5  Save\nArrows  Turn     F3  Performance     Esc  Pause").size(12.0).color(MUTED));
+                            ui.label(RichText::new("WASD  Move     Space  Jump     Shift  Sprint\nCtrl  Sneak     F  Flight     1–8 / Wheel  Hotbar     E  Blocks\nLeft click / X  Break     Right click / C  Place\nHold the mouse button to repeat     F5  Save\nArrows  Turn     F3  Performance     Esc  Pause").size(12.0).color(MUTED));
                         }
                         Screen::Settings => {
                             ui.label(RichText::new("MAKE YOURSELF AT HOME").color(ACCENT).size(11.0));
@@ -834,6 +835,8 @@ impl Game {
                     "CHOOSING A MATERIAL"
                 } else if self.player.flying {
                     "FREE FLIGHT"
+                } else if self.keys.contains(&KeyCode::ControlLeft) {
+                    "SNEAKING"
                 } else {
                     "EXPLORING"
                 },
