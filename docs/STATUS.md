@@ -4,29 +4,49 @@
 
 ## Day/night cycle
 
-Playing advances a 20-minute day on the fixed 60 Hz simulation tick. The title, pause menu, settings, and focus loss all go through the same step function and freeze that clock. Schema 1 generator 2 stores `time_of_day` in `[0, 1)` (midnight is 0). A generator 2 save without the field loads at 08:00. Generator 1 files are rejected and left untouched. Non-finite values, negatives, and exactly 1.0 are rejected and the file is kept. Sun direction, sky, fog, ambient, and sun color are appended camera uniforms. Night clouds and water use the same linear lighting as the terrain. The 44-byte vertex layout is unchanged.
+Playing advances a 20-minute day on the fixed 60 Hz simulation tick. The title, pause menu, settings, and focus loss all go through the same step function and freeze that clock. Schema 1 generator 3 stores `time_of_day` in `[0, 1)` (midnight is 0). A generator 3 file missing that field loads at 08:00. Generator 1 and generator 2 files are rejected and left untouched. Non-finite values, negatives, and exactly 1.0 are rejected and the file is kept. Sun direction, sky, fog, ambient, and sun color are appended camera uniforms. Night clouds and water use the same linear lighting as the terrain. The 44-byte vertex layout is unchanged.
 
 Linux verification for this change, Rust 1.97.1:
 
 - `cargo fmt --check`: passed.
-- `cargo test --locked`: **80 passed, 0 failed, 1 ignored** after rebasing onto generator 2 (`8af9548`). The generator 2 checkpoint below remains 65.
+- `cargo test --locked`: **80 passed, 0 failed, 1 ignored** on the day/night change after it was rebased onto `8af9548`. That commit still used save generator 2. This count is that checkpoint, not the current suite.
 - `cargo test --locked native_gpu_validates_all_world_shader_pipelines -- --ignored --nocapture`: **passed** on Mesa lavapipe (software Vulkan from mesa-vulkan-drivers 25.2.8). That is shader-pipeline and material-upload validation, not a GTX 1660 Ti and not a windowed playthrough.
 - `cargo clippy --locked --all-targets -- -D warnings`: passed.
 - `cargo build --release --locked`: passed.
 
 Unverified: interactive dawn, noon, dusk, and night appearance, mouse play, and the Windows / NVIDIA GTX 1660 Ti acceptance machine.
 
+## Interaction polish
+
+Holding break or place edits on the press, then again after `EDIT_REPEAT_TICKS` (15 simulation ticks, `EDIT_REPEAT_SECONDS` = 0.25 s). Repeat advances inside the same fixed 60 Hz simulation tick as the day clock and the player. A frame can catch up at most `FRAME_HITCH_CAP_SECONDS` (0.1 s), so a hitch cannot burst edits. A frame that drains zero ticks leaves the hold armed, which is what a monitor above the tick rate does on most frames. The hold is cleared when the mouse button is released and when simulation is suspended: pause, title, settings, focus loss, or the material picker. Resuming does not fire a stale repeat. The outline and both edit actions share `REACH_BLOCKS` (5), including a target whose near face is exactly five blocks along −X. Placement still refuses the player's body. Editable height remains -30 through 158, with the same messages.
+
+The hotbar has eight slots. The default is meadow grass, limestone, timber, canopy, river sand, terracotta, lumen crystal, and basalt. Press E to open a material grid of every placeable block from the registry (`Block::all` filtered by `is_placeable`). Air and water are omitted, so a new solid block shows up without a separate list. Coal, iron, gold, and diamond ore appear in that grid. Ore blocks in the material picker are a deliberate, approved choice. 1–8 and the wheel select a slot; a click fills that slot. Esc or E closes the grid and releases the mouse while it is open. While the picker is open it freezes the day clock and the player. F4 still reaches the game while the picker is open, so the debug hour skip is not swallowed.
+
+Schema 1 is one `PlayerSave` plus one world save (`Snapshot`). `time_of_day`, `hotbar`, and `selected_slot` are optional under `deny_unknown_fields`. A save that omits all three loads 08:00, the default bar, and slot 0. Unknown ids, non-placeable ids, a slot outside 0–7, JSON null for those fields, and a generator newer than `GENERATOR_VERSION` are rejected without rewriting the file. Loadable fixtures are produced by `SaveStore::save` and checked against the live schema and generator constants.
+
+Linux verification for this change, Rust 1.97.1, on day/night `188b322`:
+
+- `cargo fmt --check`: passed.
+- `cargo test --locked`: **99 passed, 0 failed, 1 ignored** after rebasing onto CI `4bbd3c6`. Hold-to-repeat and held-arrow turning both go through `advance_play_frame` at 144 Hz, 60 Hz, and a capped hitch.
+- `cargo test --locked native_gpu_validates_all_world_shader_pipelines -- --ignored --nocapture`: **passed** with the Vulkan loader pointed at Mesa lavapipe (`libvulkan_lvp.so`). That is shader-pipeline and material-upload validation, not a GTX 1660 Ti and not a windowed playthrough.
+- `cargo clippy --locked --all-targets -- -D warnings`: passed.
+- `cargo build --release --locked`: passed.
+
+Unverified: windowed play of hold-to-repeat, the material picker, and the Windows / NVIDIA GTX 1660 Ti acceptance machine. This environment cannot create a game window surface.
+
+This note does not replace the native evidence below. Windowed play of the new controls was not run on the Windows acceptance machine.
+
 The canonical local project is `C:\WPAI\Software\Rust Based Voxel`, an independent Git root. `origin` now points to `https://github.com/MrWizard94-Compile/Strata.git`; fetch succeeded. The repository is public. The director subsequently authorized committing and pushing all project changes. Source checkpoints and a Windows CI workflow are being delivered on development; this is not a production release.
 
 ## Source and artifact verification
 
-- Deterministic generator 2 terrain is integrated: plains, forest, desert, ocean, and beach, with sea-level water, caves, grid-anchored trees, and coal, iron, gold, and diamond. Sparse edits, greedy meshing, DDA targeting, walking/jump/flight, body collision, bounded streaming and versioned two-slot saves are integrated. Generator 1 saves are rejected and left untouched.
+- Deterministic generator 3 terrain is integrated: plains, forest, desert, ocean, and beach, with sea-level water, caves, grid-anchored trees, and coal, iron, gold, and diamond. Cold grass wears a snow cap. Cool grass from surface height 41 up wears one too; on seed 20261021 that is about the top 3.4% of a 231,361-column sample, and the warm height-46 peaks stay bare. Shallow beaches and seabeds have clay patches. Deep caves contain rare crystal clusters, and basalt forms the y < 1 floor plus occasional intrusions from y 1 through 8. Sparse edits, greedy meshing, DDA targeting, walking/jump/flight, body collision, bounded streaming and versioned two-slot saves are integrated. The save terrain version is 3. Generator 1 and generator 2 files are rejected and left untouched. A generator 3 file missing time of day loads at 08:00.
 - Seventeen original 32×32 sRGB tiles, face-specific grass/timber layers, repeating merged faces, six linear-light mip levels and PNG export are integrated. The exported contact sheet was inspected. Tests decode all seventeen PNGs and compare them byte-for-byte with runtime pixels.
 - Eighteen streaming regressions cover stale revisions, bounded queues, byte/time/count admission, deferred work, duplicate work, halo invalidation, unload and shutdown. A dirty-resident eviction leak was corrected.
-- Spawn/fall recovery checks a planted trunk and player construction. Seed 396 at column `(64, -64)` is not a generator 2 trunk site, so that regression plants the wood. Seed `20261021` grows a natural trunk at `(-321, -354)`, ground 35, five blocks tall; that test uses no edits. Unsafe flight-to-walk transitions are rejected with player feedback.
+- Spawn/fall recovery checks a planted trunk and player construction. Seed 396 at column `(64, -64)` is not a natural trunk column, so that regression plants the wood. Seed `20261021` grows a natural trunk at `(-321, -354)`, ground 35, five blocks tall; that test uses no edits. Unsafe flight-to-walk transitions are rejected with player feedback.
 - Presentation counters now exclude skipped acquisitions. Skipped/unfocused rendering is throttled. Controlled renderer failures attempt to save the CPU world before exit; this is not panic/power-loss recovery.
 - `cargo fmt --check`: passed.
-- `cargo test --locked`: **65 passed, 0 failed, 1 explicit GPU skip** on 2026-10-21 after generator 2. The ignored test is the native GPU pipeline check.
+- `cargo test --locked`: **103 passed, 0 failed, 1 ignored** after generator 3 was rebased onto `4afa708` (hotbar, PR #6). The ignored test is the native GPU pipeline check. The 55, 65, 66, 80, 84, and 99 counts described older trees. The 99 count was the hotbar branch before this terrain rebase.
 - `cargo test --locked native_gpu_validates_all_world_shader_pipelines -- --ignored --nocapture`: **1 passed**, including material mip upload validation on the native GPU.
 - `cargo clippy --locked --all-targets -- -D warnings`: passed without warnings.
 - `cargo build --release --locked`: passed.
@@ -36,7 +56,7 @@ The original 40-byte vertex assertion failed when adding the texture-layer field
 
 ## Native evidence and limits
 
-The runs in this section are the 2026-10-20 checkpoint. They predate generator 2. The retained seed 728491 save is a generator 1 file: current code rejects it and leaves the bytes in place. Those runs are not evidence that the current generator loads that world.
+The runs in this section are the 2026-10-20 checkpoint. They predate the current terrain. The retained seed 728491 save is a generator 1 file: current code rejects it and leaves the bytes in place. Those runs are not evidence that the current generator loads that world.
 
 Earlier actual-window testing entered the world, visibly broke `[63,46,-67]`, placed grass there, saved and closed. A subsequent font-enabled build showed readable menu text; missing menu-arrow glyphs were then removed. The retained test save records seed 728491, that edit, and player eye `[64.5,46.60417,-63.5]`.
 

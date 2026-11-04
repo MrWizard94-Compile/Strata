@@ -24,7 +24,7 @@ Or run `./run.ps1` from PowerShell. It builds `--target x86_64-pc-windows-msvc` 
 
 The client supports `--seed <u64>` for a new world and `--save-dir <path>` for a separate world. An existing world retains its stored seed. `--smoke-seconds <1..120>` launches the real native client and exits after the stated duration for graphics acceptance; this does not automate gameplay acceptance.
 
-One full day lasts 20 real minutes and advances only while playing. Pausing the game pauses the clock. The time is stored in the world save; a generator 2 save with no time opens at morning. Generator 1 worlds are rejected and left unchanged.
+One full day lasts 20 real minutes and advances only while playing. Pausing the game pauses the clock. The time is stored in the world save. A generator 3 file with no time opens at 08:00. Generator 1 and generator 2 worlds are rejected and left unchanged.
 
 | Control | Action |
 |---|---|
@@ -33,14 +33,15 @@ One full day lasts 20 real minutes and advances only while playing. Pausing the 
 | Space / Shift | Jump / sprint |
 | F | Toggle creative flight |
 | Space / Left Ctrl in flight | Rise / descend |
-| Left click or X | Break targeted block |
-| Right click or C | Place selected material |
-| 1–8 / mouse wheel | Select material |
+| Left click or X | Break the targeted block. Hold the mouse button to repeat |
+| Right click or C | Place the selected material. Hold the mouse button to repeat |
+| 1–8 / mouse wheel | Select a hotbar slot |
+| E | Open or close the material picker for the selected slot |
 | Arrow keys | Turn camera without mouse |
 | F5 | Save world |
 | F3 | Toggle frame-time, clock, and world statistics |
 | F4 | With the F3 overlay open, skip the clock forward one hour |
-| Escape | Pause / resume |
+| Escape | Close the material picker, or pause / resume |
 
 ## Verification
 
