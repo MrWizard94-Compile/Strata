@@ -77,6 +77,11 @@ pub struct World {
     /// Parallel to [`ORE_RULES`], in the same order, copied from [`Self::worldgen`].
     ore_ids: [BlockId; 4],
     registry: Arc<registry::Registry>,
+    /// Loaded name-to-number table. Saves append names; they do not reorder it.
+    palette: Vec<String>,
+    /// Original ids for blocks the frozen registry does not know.
+    placeholders: Vec<String>,
+    placeholder_ids: HashMap<String, BlockId>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -201,6 +206,31 @@ const ORE_RULES: [OreRule; 4] = [
     },
 ];
 
+/// Schema 1 numbers, in order. `strata:missing` is not part of a migrated palette.
+fn legacy_palette() -> Vec<String> {
+    [
+        "strata:air",
+        "strata:grass",
+        "strata:dirt",
+        "strata:stone",
+        "strata:sand",
+        "strata:water",
+        "strata:wood",
+        "strata:leaves",
+        "strata:snow",
+        "strata:clay",
+        "strata:crystal",
+        "strata:basalt",
+        "strata:coal_ore",
+        "strata:iron_ore",
+        "strata:gold_ore",
+        "strata:diamond_ore",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
 impl World {
     pub fn new(seed: u64) -> Self {
         let registry = registry::registry_handle();
@@ -216,6 +246,9 @@ impl World {
             ],
             worldgen,
             registry,
+            palette: legacy_palette(),
+            placeholders: Vec::new(),
+            placeholder_ids: HashMap::new(),
         }
         .checked()
     }
@@ -286,21 +319,84 @@ impl World {
         }
     }
 
-    pub fn edits(&self) -> Vec<([i32; 3], u8)> {
-        let mut edits: Vec<_> = self
-            .edits
+    pub fn edits(&self) -> Vec<([i32; 3], u16)> {
+        self.saved_palette_and_edits().1
+    }
+
+    /// Palette for the next schema 2 save, then edits as indexes into it.
+    /// The stored palette is not reordered. Names that are not in it yet are appended.
+    pub fn saved_palette_and_edits(&self) -> (Vec<String>, Vec<([i32; 3], u16)>) {
+        let mut palette = self.palette.clone();
+        let mut index_of: HashMap<String, u16> = palette
             .iter()
-            .map(|(&position, &block)| {
-                (
-                    position,
-                    block
-                        .legacy_u8()
-                        .expect("schema 1 edits only store builtin ids 0..=15"),
-                )
-            })
+            .enumerate()
+            .map(|(index, name)| (name.clone(), index as u16))
             .collect();
+        let mut edits = Vec::with_capacity(self.edits.len());
+        for (&position, &block) in &self.edits {
+            let name = self.block_key(block).to_string();
+            let index = if let Some(index) = index_of.get(&name) {
+                *index
+            } else {
+                let index = u16::try_from(palette.len()).expect("palette stays within u16");
+                palette.push(name.clone());
+                index_of.insert(name, index);
+                index
+            };
+            edits.push((position, index));
+        }
         edits.sort_unstable_by_key(|&(position, _)| position);
-        edits
+        (palette, edits)
+    }
+
+    /// English label for a builtin, or the original id string for a placeholder.
+    pub fn display_name(&self, id: Block) -> &str {
+        self.placeholder_name(id)
+            .unwrap_or_else(|| self.registry.display(id))
+    }
+
+    /// Namespaced id for a block, including a placeholder's original string.
+    pub fn block_key(&self, id: Block) -> &str {
+        self.placeholder_name(id)
+            .unwrap_or_else(|| self.registry.name(id))
+    }
+
+    /// Replace the save palette and allocate placeholders for unknown names.
+    /// `names` must already be valid and free of duplicates.
+    pub fn install_palette(&mut self, names: Vec<String>) -> Result<Vec<Block>, String> {
+        let mut ids = Vec::with_capacity(names.len());
+        for name in &names {
+            ids.push(self.intern_block(name)?);
+        }
+        self.palette = names;
+        Ok(ids)
+    }
+
+    pub fn intern_block(&mut self, name: &str) -> Result<Block, String> {
+        if let Some(id) = self.registry.get(name) {
+            return Ok(id);
+        }
+        if let Some(id) = self.placeholder_ids.get(name) {
+            return Ok(*id);
+        }
+        if !registry::is_block_id(name) {
+            return Err(format!("{name}: block id does not match the id regex"));
+        }
+        let index = self
+            .registry
+            .builtin_count()
+            .checked_add(self.placeholders.len())
+            .filter(|index| *index < 65_535)
+            .ok_or_else(|| "block registry refuses the 65536th block".to_string())?;
+        let id = BlockId::from_index(u16::try_from(index).expect("index fits u16"));
+        self.placeholders.push(name.to_string());
+        self.placeholder_ids.insert(name.to_string(), id);
+        Ok(id)
+    }
+
+    fn placeholder_name(&self, id: Block) -> Option<&str> {
+        let index = id.index().checked_sub(self.registry.builtin_count())?;
+        self.placeholders.get(index).map(String::as_str)
     }
 
     /// Highest base-terrain cell, excluding caves, trees, and player edits.

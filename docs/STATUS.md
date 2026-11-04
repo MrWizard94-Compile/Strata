@@ -2,9 +2,11 @@
 
 2026-10-21. **Goal active.** STRATA has a native editable-world foundation, original 32×32 materials and reproducible CPU meshing evidence. The requested production and studio grade survival/combat/building/exploration game and Microsoft pitch remain incomplete. The 2026-10-20 counts below remain that checkpoint. Day/night evidence is the next section.
 
-## Block registry (schema 1 still)
+## Block registry and save schema 2
 
-Builtin blocks load from `assets/strata/blocks/*.toml` through the only TOML parser, in `src/registry.rs`. Runtime ids are `u16`. Ids 0 through 15 match the old schema-1 numbers. `strata:missing` is 16. Worldgen resolves names once in `World::new`. The mesher treats fluid by `RenderClass`, and still culls cutout blocks like opaque ones. Saves are still schema 1: edits and the hotbar are those numeric ids. Generator version stays 3. The seven golden chunk digests are unchanged.
+Builtin blocks load from `assets/strata/blocks/*.toml` through the only TOML parser, in `src/registry.rs`. Runtime ids are `u16`. Ids 0 through 15 match the old schema-1 numbers. `strata:missing` is 16. Worldgen resolves names once in `World::new`. The mesher treats fluid by `RenderClass`, and still culls cutout blocks like opaque ones. Generator version stays 3. The seven golden chunk digests are unchanged.
+
+New saves are schema 2. Each world stores a palette of namespaced ids, and edits store indexes into that palette. Schema 1 loads in memory: the old numbers map onto the builtin names, and `open` does not rewrite the file. An unknown palette or hotbar name becomes a solid placeholder that keeps the original string and is written back. It does not become air or `strata:missing`. Schema 1 ids outside `0..=15` are still rejected.
 
 Texture layers are assigned at freeze in sorted texture-id order. The seventeen authored tiles keep their pixels. `strata:missing` is a new magenta/black checker, layer 13, not limestone. A packaged executable with no `assets/strata/blocks` directory uses the same TOML embedded in the binary. If that directory exists and a file is wrong, startup fails and names the file and the key.
 
@@ -18,7 +20,7 @@ That is about one percent, inside run-to-run noise. It is not a GTX 1660 Ti meas
 Linux verification for this change, Rust 1.97.1:
 
 - `cargo fmt --check`: passed.
-- `cargo test --locked`: **133 passed, 0 failed, 1 ignored**. The ignored test is `native_gpu_validates_all_world_shader_pipelines`. It was not re-run for this change.
+- `cargo test --locked`: **138 passed, 0 failed, 1 ignored**. The ignored test is `native_gpu_validates_all_world_shader_pipelines`. It was not re-run for this change. The count includes the registry tests and the schema 2 migration, placeholder, and generator-rejection tests.
 - `cargo clippy --locked --all-targets -- -D warnings`: passed.
 - `cargo build --release --locked`: passed on this agent after the commands above.
 
