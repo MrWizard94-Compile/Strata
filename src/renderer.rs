@@ -12,8 +12,7 @@ use crate::{
 };
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
-const VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 4] =
-    wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4, 3 => Uint32];
+const VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4, 3 => Float32x2, 4 => Uint32];
 
 pub enum PresentOutcome {
     Presented,
@@ -83,6 +82,7 @@ pub struct Renderer {
     multisample_view: Option<wgpu::TextureView>,
     sample_count: u32,
     chunks: HashMap<ChunkKey, GpuChunk>,
+    entities: Option<GpuChunk>,
     suspended: bool,
 }
 
@@ -186,6 +186,7 @@ impl Renderer {
             multisample_view,
             sample_count,
             chunks: HashMap::new(),
+            entities: None,
             suspended: size.width == 0 || size.height == 0,
         })
     }
@@ -252,6 +253,43 @@ impl Renderer {
 
     pub fn remove_chunk(&mut self, key: ChunkKey) {
         self.chunks.remove(&key);
+    }
+
+    pub fn upload_entities(&mut self, mesh: &Mesh) {
+        if mesh.vertices.is_empty() || mesh.indices.is_empty() {
+            self.entities = None;
+            return;
+        }
+        let mut min = Vec3::splat(f32::INFINITY);
+        let mut max = Vec3::splat(f32::NEG_INFINITY);
+        for vertex in &mesh.vertices {
+            let position = Vec3::from_array(vertex.position);
+            min = min.min(position);
+            max = max.max(position);
+        }
+        let vertices = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Entity vertices"),
+                contents: bytemuck::cast_slice(&mesh.vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+        let indices = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Entity triangle indices"),
+                contents: bytemuck::cast_slice(&mesh.indices),
+                usage: wgpu::BufferUsages::INDEX,
+            });
+        self.entities = Some(GpuChunk {
+            vertices,
+            indices,
+            index_count: mesh.indices.len() as u32,
+            payload_bytes: std::mem::size_of_val(mesh.vertices.as_slice())
+                + std::mem::size_of_val(mesh.indices.as_slice()),
+            min,
+            max,
+        });
     }
 
     pub fn chunk_count(&self) -> usize {
@@ -345,7 +383,14 @@ impl Renderer {
         let daylight = camera.daylight;
         let selected = camera
             .selected
-            .map(|p| [p[0] as f32, p[1] as f32, p[2] as f32, 1.0])
+            .map(|p| {
+                [
+                    p[0] as f32 * crate::world::VOXEL_METERS,
+                    p[1] as f32 * crate::world::VOXEL_METERS,
+                    p[2] as f32 * crate::world::VOXEL_METERS,
+                    crate::world::VOXEL_METERS,
+                ]
+            })
             .unwrap_or([0.0; 4]);
         let uniform = CameraUniform {
             view_projection: view_projection.to_cols_array_2d(),
@@ -421,6 +466,12 @@ impl Renderer {
                 pass.draw_indexed(0..chunk.index_count, 0, 0..1);
                 self.visible_chunks += 1;
                 self.visible_triangles += chunk.index_count as usize / 3;
+            }
+            if let Some(entities) = &self.entities {
+                pass.set_vertex_buffer(0, entities.vertices.slice(..));
+                pass.set_index_buffer(entities.indices.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..entities.index_count, 0, 0..1);
+                self.visible_triangles += entities.index_count as usize / 3;
             }
             if camera.selected.is_some() {
                 pass.set_pipeline(&self.pipelines.selection);
@@ -752,12 +803,15 @@ mod tests {
         assert_eq!(std::mem::offset_of!(CameraUniform, ambient_ground), 224);
         assert_eq!(std::mem::offset_of!(CameraUniform, ambient_sky), 240);
         assert_eq!(std::mem::offset_of!(CameraUniform, sun_color), 256);
-        assert_eq!(std::mem::size_of::<Vertex>(), 44);
+        assert_eq!(std::mem::size_of::<Vertex>(), 52);
         assert_eq!(std::mem::offset_of!(Vertex, normal), 12);
         assert_eq!(std::mem::offset_of!(Vertex, color), 24);
-        assert_eq!(std::mem::offset_of!(Vertex, texture_layer), 40);
+        assert_eq!(std::mem::offset_of!(Vertex, uv), 40);
+        assert_eq!(std::mem::offset_of!(Vertex, texture_layer), 48);
         assert_eq!(VERTEX_ATTRIBUTES[3].offset, 40);
-        assert_eq!(VERTEX_ATTRIBUTES[3].format, wgpu::VertexFormat::Uint32);
+        assert_eq!(VERTEX_ATTRIBUTES[3].format, wgpu::VertexFormat::Float32x2);
+        assert_eq!(VERTEX_ATTRIBUTES[4].offset, 48);
+        assert_eq!(VERTEX_ATTRIBUTES[4].format, wgpu::VertexFormat::Uint32);
     }
 
     #[test]

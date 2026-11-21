@@ -45,8 +45,9 @@ On the title screen, click **ENTER THE REACH** or press Enter.
 | Left Shift | Sprint |
 | F | Turn flight on or off. You must move clear of solid ground before flight can turn off |
 | Left Ctrl | Descend while flying |
-| Left click, or X | Break the block you are looking at, up to five blocks away. Hold the mouse button to repeat |
+| Left click, or X | Strike a Hollow Warden if one is in reach, otherwise break the block you are looking at, up to five blocks away. Hold the mouse button to repeat |
 | Right click, or C | Place the selected material, up to five blocks away. Hold the mouse button to repeat |
+| R | Craft a pick from 3 timber and 2 limestone in your gathered inventory |
 | 1 through 8, or the mouse wheel | Select a hotbar slot |
 | E | Open or close the material picker for the selected hotbar slot |
 | Arrow keys | Turn without the mouse. Hold an arrow key to keep turning |

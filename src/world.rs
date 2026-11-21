@@ -6,9 +6,19 @@
 //! ore veins are anchored on global grids, so a feature that crosses a chunk is
 //! identical from either side. No generation cache is stored on `World`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-pub const CHUNK_SIZE: i32 = 32;
+use crate::svo::{LEAF_CELLS, SparseVoxelOctree};
+
+/// Simulation / data chunk edge. Physical voxels live in these 8³ arrays.
+pub const DATA_CHUNK_SIZE: i32 = 8;
+/// Render super-chunk / Render Region edge. Exactly four data chunks per axis.
+pub const RENDER_CHUNK_SIZE: i32 = 32;
+pub const DATA_CHUNKS_PER_RENDER: i32 = RENDER_CHUNK_SIZE / DATA_CHUNK_SIZE;
+/// World-space edge of one voxel, in metres. Physics and meshes share this.
+pub const VOXEL_METERS: f32 = 0.5;
+/// Render-region edge used by meshing, streaming, and the GPU.
+pub const CHUNK_SIZE: i32 = RENDER_CHUNK_SIZE;
 pub const SEA_LEVEL: i32 = 28;
 /// Inclusive surface clamp. Terrain, including tree crowns, stays below the
 /// y=192 benchmark fixtures.
@@ -16,8 +26,72 @@ pub const MIN_SURFACE: i32 = 12;
 pub const MAX_SURFACE: i32 = 96;
 /// Save-file terrain version. Generator 1 is rejected so older files keep
 /// their bytes instead of being reinterpreted under these rules.
-pub const GENERATOR_VERSION: u32 = 2;
-pub type ChunkKey = (i32, i32, i32);
+pub const GENERATOR_VERSION: u32 = 3;
+/// 8³ simulation key, in data-chunk units. Distinct from [`RenderChunkKey`].
+pub type DataChunkKey = (i32, i32, i32);
+/// 32³ render-region key, in render-chunk units. Distinct from [`DataChunkKey`].
+pub type RenderChunkKey = (i32, i32, i32);
+/// Streaming and the GPU address render regions.
+pub type ChunkKey = RenderChunkKey;
+
+pub fn data_chunk_key(position: [i32; 3]) -> DataChunkKey {
+    (
+        position[0].div_euclid(DATA_CHUNK_SIZE),
+        position[1].div_euclid(DATA_CHUNK_SIZE),
+        position[2].div_euclid(DATA_CHUNK_SIZE),
+    )
+}
+
+pub fn data_chunk_origin(key: DataChunkKey) -> [i32; 3] {
+    [
+        key.0 * DATA_CHUNK_SIZE,
+        key.1 * DATA_CHUNK_SIZE,
+        key.2 * DATA_CHUNK_SIZE,
+    ]
+}
+
+pub fn render_chunk_key(position: [i32; 3]) -> RenderChunkKey {
+    (
+        position[0].div_euclid(RENDER_CHUNK_SIZE),
+        position[1].div_euclid(RENDER_CHUNK_SIZE),
+        position[2].div_euclid(RENDER_CHUNK_SIZE),
+    )
+}
+
+pub fn render_key_from_data(key: DataChunkKey) -> RenderChunkKey {
+    (
+        key.0.div_euclid(DATA_CHUNKS_PER_RENDER),
+        key.1.div_euclid(DATA_CHUNKS_PER_RENDER),
+        key.2.div_euclid(DATA_CHUNKS_PER_RENDER),
+    )
+}
+
+/// The 4×4×4 data chunks that one Render Region owns.
+pub fn data_keys_in_render(key: RenderChunkKey) -> [DataChunkKey; 64] {
+    let mut keys = [(0, 0, 0); 64];
+    let mut index = 0;
+    for dy in 0..DATA_CHUNKS_PER_RENDER {
+        for dz in 0..DATA_CHUNKS_PER_RENDER {
+            for dx in 0..DATA_CHUNKS_PER_RENDER {
+                keys[index] = (
+                    key.0 * DATA_CHUNKS_PER_RENDER + dx,
+                    key.1 * DATA_CHUNKS_PER_RENDER + dy,
+                    key.2 * DATA_CHUNKS_PER_RENDER + dz,
+                );
+                index += 1;
+            }
+        }
+    }
+    keys
+}
+
+pub fn voxel_to_meters(position: [i32; 3]) -> [f32; 3] {
+    position.map(|component| component as f32 * VOXEL_METERS)
+}
+
+pub fn meters_to_voxel(meters: [f32; 3]) -> [i32; 3] {
+    meters.map(|component| (component / VOXEL_METERS).floor() as i32)
+}
 
 const TREE_GRID: i32 = 9;
 const TREE_CANOPY: i32 = 2;
@@ -29,13 +103,44 @@ pub struct Vertex {
     pub position: [f32; 3],
     pub normal: [f32; 3],
     pub color: [f32; 4],
+    pub uv: [f32; 2],
     pub texture_layer: u32,
+}
+
+/// Voxel-space face UV. One unit is one voxel, so a 0.5 m face spans UV 1 and
+/// the 32×32 tile repeats once per block. Matches [`fs_terrain`] sampling.
+pub fn terrain_face_uv(normal: [f32; 3], world_meters: [f32; 3]) -> [f32; 2] {
+    let voxel = world_meters.map(|component| component / VOXEL_METERS);
+    if normal[0].abs() > 0.5 {
+        [voxel[2], -voxel[1]]
+    } else if normal[2].abs() > 0.5 {
+        [voxel[0], -voxel[1]]
+    } else {
+        [voxel[0], voxel[2]]
+    }
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct Mesh {
     pub vertices: Vec<Vertex>,
     pub indices: Vec<u32>,
+}
+
+/// `(b-a)×(c-a)·n` for one triangle. Positive means front faces match the
+/// vertex normal, which the terrain pipeline back-face culls against.
+pub fn triangle_outward_dot(mesh: &Mesh, tri: &[u32]) -> f32 {
+    let a = mesh.vertices[tri[0] as usize].position;
+    let b = mesh.vertices[tri[1] as usize].position;
+    let c = mesh.vertices[tri[2] as usize].position;
+    let n = mesh.vertices[tri[0] as usize].normal;
+    let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    let ac = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+    let cross = [
+        ab[1] * ac[2] - ab[2] * ac[1],
+        ab[2] * ac[0] - ab[0] * ac[2],
+        ab[0] * ac[1] - ab[1] * ac[0],
+    ];
+    cross[0] * n[0] + cross[1] * n[1] + cross[2] * n[2]
 }
 
 /// IDs are part of the save format. Never reorder or recycle them.
@@ -58,6 +163,11 @@ pub enum Block {
     IronOre = 13,
     GoldOre = 14,
     DiamondOre = 15,
+    Motor = 16,
+    Shaft = 17,
+    Gear = 18,
+    Belt = 19,
+    Assembler = 20,
 }
 
 impl Block {
@@ -79,6 +189,11 @@ impl Block {
             Self::IronOre => [0.66, 0.48, 0.40, 1.0],
             Self::GoldOre => [0.86, 0.72, 0.28, 1.0],
             Self::DiamondOre => [0.45, 0.86, 0.84, 1.0],
+            Self::Motor => [0.72, 0.28, 0.18, 1.0],
+            Self::Shaft => [0.62, 0.58, 0.52, 1.0],
+            Self::Gear => [0.48, 0.42, 0.28, 1.0],
+            Self::Belt => [0.18, 0.22, 0.26, 1.0],
+            Self::Assembler => [0.32, 0.46, 0.52, 1.0],
         }
     }
 
@@ -100,6 +215,11 @@ impl Block {
             Self::IronOre => "Iron ore",
             Self::GoldOre => "Gold ore",
             Self::DiamondOre => "Diamond ore",
+            Self::Motor => "Kinetic motor",
+            Self::Shaft => "Kinetic shaft",
+            Self::Gear => "Kinetic gear",
+            Self::Belt => "Item belt",
+            Self::Assembler => "Assembler",
         }
     }
 
@@ -136,6 +256,11 @@ impl Block {
             13 => Self::IronOre,
             14 => Self::GoldOre,
             15 => Self::DiamondOre,
+            16 => Self::Motor,
+            17 => Self::Shaft,
+            18 => Self::Gear,
+            19 => Self::Belt,
+            20 => Self::Assembler,
             _ => return None,
         })
     }
@@ -156,6 +281,8 @@ pub enum Biome {
 pub struct World {
     seed: u64,
     edits: HashMap<[i32; 3], Block>,
+    svo: SparseVoxelOctree,
+    modified_data: HashSet<DataChunkKey>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -258,6 +385,8 @@ impl World {
         Self {
             seed,
             edits: HashMap::new(),
+            svo: SparseVoxelOctree::new(),
+            modified_data: HashSet::new(),
         }
     }
 
@@ -273,12 +402,70 @@ impl World {
     }
 
     /// Restoring the generated block removes the override, keeping saves sparse.
+    /// Flags the containing 8³ data chunk. Does not wait for a mesh.
     pub fn set_block(&mut self, position: [i32; 3], block: Block) {
         if self.generated_block(position[0], position[1], position[2]) == block {
             self.edits.remove(&position);
         } else {
             self.edits.insert(position, block);
         }
+        let key = data_chunk_key(position);
+        self.sync_data_chunk(key);
+        self.modified_data.insert(key);
+    }
+
+    pub fn data_chunk_voxel_payload_bytes(&self, key: DataChunkKey) -> usize {
+        self.svo.voxel_payload_bytes(key)
+    }
+
+    pub fn data_chunk_is_modified(&self, key: DataChunkKey) -> bool {
+        self.modified_data.contains(&key)
+    }
+
+    pub fn modified_data_chunks(&self) -> impl Iterator<Item = DataChunkKey> + '_ {
+        self.modified_data.iter().copied()
+    }
+
+    /// Materialize one 8³ into the SVO. All-air leaves store 0 voxel bytes.
+    #[cfg(test)]
+    pub fn ensure_data_chunk(&mut self, key: DataChunkKey) {
+        self.sync_data_chunk(key);
+    }
+
+    fn sync_data_chunk(&mut self, key: DataChunkKey) {
+        let origin = data_chunk_origin(key);
+        let mut cells = [0_u8; LEAF_CELLS];
+        let mut all_air = true;
+        let edge = DATA_CHUNK_SIZE;
+        for y in 0..edge {
+            for z in 0..edge {
+                for x in 0..edge {
+                    let block = self.block_at(origin[0] + x, origin[1] + y, origin[2] + z);
+                    let index = (x + edge * (z + edge * y)) as usize;
+                    cells[index] = block as u8;
+                    all_air &= block == Block::Air;
+                }
+            }
+        }
+        self.svo
+            .store_leaf(key, if all_air { None } else { Some(cells) });
+    }
+
+    /// Greedy mesh of one 8³ data chunk. Used to show seams the 32³ pass removes.
+    #[cfg(test)]
+    pub fn mesh_data_chunk(&self, key: DataChunkKey) -> Mesh {
+        let origin = data_chunk_origin(key);
+        let halo_side = DATA_CHUNK_SIZE as usize + 2;
+        let mut halo = vec![Block::Air; halo_side * halo_side * halo_side];
+        for z in -1..=DATA_CHUNK_SIZE {
+            for y in -1..=DATA_CHUNK_SIZE {
+                for x in -1..=DATA_CHUNK_SIZE {
+                    halo[halo_index_with([x, y, z], halo_side)] =
+                        self.block_at(origin[0] + x, origin[1] + y, origin[2] + z);
+                }
+            }
+        }
+        mesh_greedy(origin, DATA_CHUNK_SIZE, &halo, halo_side)
     }
 
     pub fn edits(&self) -> Vec<([i32; 3], u8)> {
@@ -555,12 +742,13 @@ impl World {
 
     /// Mesh positions are world-space f32. Camera-relative large-world rendering
     /// is a later renderer contract; avoid claiming precision beyond 2^24 blocks.
+    /// One greedy pass over a 32³ Render Region. Faces merge across internal 8³ borders.
     pub fn mesh_chunk(&self, key: ChunkKey) -> Mesh {
         let Some(origin) = chunk_origin(key) else {
             return Mesh::default();
         };
         let halo = self.sample_halo(origin);
-        mesh_halo(origin, &halo)
+        mesh_greedy(origin, RENDER_CHUNK_SIZE, &halo, HALO_SIDE)
     }
 
     fn sample_halo(&self, origin: [i32; 3]) -> Vec<Block> {
@@ -740,7 +928,11 @@ fn chunk_origin(key: ChunkKey) -> Option<[i32; 3]> {
 }
 
 fn halo_index(p: [i32; 3]) -> usize {
-    (p[0] + 1) as usize + HALO_SIDE * ((p[1] + 1) as usize + HALO_SIDE * (p[2] + 1) as usize)
+    halo_index_with(p, HALO_SIDE)
+}
+
+fn halo_index_with(p: [i32; 3], halo_side: usize) -> usize {
+    (p[0] + 1) as usize + halo_side * ((p[1] + 1) as usize + halo_side * (p[2] + 1) as usize)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -756,41 +948,46 @@ impl Face {
     }
 }
 
+#[cfg(test)]
 fn mesh_halo(origin: [i32; 3], halo: &[Block]) -> Mesh {
+    mesh_greedy(origin, RENDER_CHUNK_SIZE, halo, HALO_SIDE)
+}
+
+fn mesh_greedy(origin: [i32; 3], edge: i32, halo: &[Block], halo_side: usize) -> Mesh {
     let mut mesh = Mesh::default();
-    let side = CHUNK_SIZE as usize;
+    let side = edge as usize;
     let mut mask = vec![None; side * side];
     for axis in 0..3 {
         let u = (axis + 1) % 3;
         let v = (axis + 2) % 3;
         for sign in [-1, 1] {
-            for slice in 0..CHUNK_SIZE {
-                for j in 0..CHUNK_SIZE {
-                    for i in 0..CHUNK_SIZE {
+            for slice in 0..edge {
+                for j in 0..edge {
+                    for i in 0..edge {
                         let mut p = [0; 3];
                         p[axis] = slice;
                         p[u] = i;
                         p[v] = j;
-                        let block = halo[halo_index(p)];
+                        let block = halo[halo_index_with(p, halo_side)];
                         let mut outside = p;
                         outside[axis] += sign;
-                        let neighbor = halo[halo_index(outside)];
+                        let neighbor = halo[halo_index_with(outside, halo_side)];
                         let visible = if block == Block::Water {
                             neighbor == Block::Air
                         } else {
                             block.is_solid() && !neighbor.is_solid()
                         };
                         mask[i as usize + j as usize * side] = if visible {
-                            let ao = corner_ao(halo, outside, u, v);
+                            let ao = corner_ao(halo, outside, u, v, halo_side);
                             let world = [origin[0] + p[0], origin[1] + p[1], origin[2] + p[2]];
                             Some(Face {
                                 block,
                                 ao,
                                 variation: (hash3(
                                     0xFC70,
-                                    world[0].div_euclid(4),
-                                    world[1].div_euclid(4),
-                                    world[2].div_euclid(4),
+                                    world[0].div_euclid(DATA_CHUNK_SIZE * 2),
+                                    world[1].div_euclid(DATA_CHUNK_SIZE * 2),
+                                    world[2].div_euclid(DATA_CHUNK_SIZE * 2),
                                 ) % 7) as u8,
                             })
                         } else {
@@ -846,7 +1043,7 @@ fn mesh_halo(origin: [i32; 3], halo: &[Block]) -> Mesh {
     mesh
 }
 
-fn corner_ao(halo: &[Block], outside: [i32; 3], u: usize, v: usize) -> [u8; 4] {
+fn corner_ao(halo: &[Block], outside: [i32; 3], u: usize, v: usize, halo_side: usize) -> [u8; 4] {
     let mut ao = [3; 4];
     for (corner, (du, dv)) in [(-1, -1), (1, -1), (1, 1), (-1, 1)].into_iter().enumerate() {
         let mut side_u = outside;
@@ -856,9 +1053,9 @@ fn corner_ao(halo: &[Block], outside: [i32; 3], u: usize, v: usize) -> [u8; 4] {
         side_v[v] += dv;
         diagonal[u] += du;
         diagonal[v] += dv;
-        let a = u8::from(halo[halo_index(side_u)].is_solid());
-        let b = u8::from(halo[halo_index(side_v)].is_solid());
-        let c = u8::from(halo[halo_index(diagonal)].is_solid());
+        let a = u8::from(halo[halo_index_with(side_u, halo_side)].is_solid());
+        let b = u8::from(halo[halo_index_with(side_v, halo_side)].is_solid());
+        let c = u8::from(halo[halo_index_with(diagonal, halo_side)].is_solid());
         ao[corner] = if a == 1 && b == 1 { 0 } else { 3 - a - b - c };
     }
     ao
@@ -883,15 +1080,16 @@ fn emit_quad(mesh: &mut Mesh, p: [i32; 3], axis: usize, sign: i32, size: [f32; 2
         .into_iter()
         .enumerate()
     {
-        let mut position = p.map(|value| value as f32);
-        position[u] += uv[0];
-        position[v] += uv[1];
+        let mut position = p.map(|value| value as f32 * VOXEL_METERS);
+        position[u] += uv[0] * VOXEL_METERS;
+        position[v] += uv[1] * VOXEL_METERS;
         let brightness = (0.55 + f32::from(face.ao[corner]) * 0.15) * variation * directional;
         mesh.vertices.push(Vertex {
             position,
             normal,
             // Texture owns albedo. Vertex RGB carries only linear AO/variation.
             color: [brightness, brightness, brightness, face.block.color()[3]],
+            uv: terrain_face_uv(normal, position),
             texture_layer,
         });
     }
@@ -1034,6 +1232,7 @@ fn round_half_away(value: f64) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     fn artificial_mesh(cells: &[([i32; 3], Block)]) -> Mesh {
         let mut halo = vec![Block::Air; HALO_VOLUME];
@@ -1239,23 +1438,73 @@ mod tests {
         assert!(artificial_mesh(&[]).indices.is_empty());
         let single = artificial_mesh(&[([8, 8, 8], Block::Stone)]);
         assert_eq!(single.indices.len(), 36);
-        assert_eq!(triangle_area(&single), 6.0);
+        assert_eq!(triangle_area(&single), 6.0 * VOXEL_METERS * VOXEL_METERS);
+        let extents = mesh_extents(&single);
+        assert!((extents[0] - VOXEL_METERS).abs() < 1e-5);
+        assert!((extents[1] - VOXEL_METERS).abs() < 1e-5);
+        assert!((extents[2] - VOXEL_METERS).abs() < 1e-5);
         let pair = artificial_mesh(&[([8, 8, 8], Block::Stone), ([9, 8, 8], Block::Stone)]);
-        assert_eq!(triangle_area(&pair), 10.0);
+        assert_eq!(triangle_area(&pair), 10.0 * VOXEL_METERS * VOXEL_METERS);
         assert_eq!(pair.indices.len(), 36, "coplanar equal-lit faces merge");
+    }
+
+    fn uv_span(mesh: &Mesh, normal: [f32; 3]) -> [f32; 2] {
+        let mut min = [f32::INFINITY; 2];
+        let mut max = [f32::NEG_INFINITY; 2];
+        let mut count = 0;
+        for vertex in &mesh.vertices {
+            if (0..3).any(|axis| (vertex.normal[axis] - normal[axis]).abs() > 0.1) {
+                continue;
+            }
+            count += 1;
+            min[0] = min[0].min(vertex.uv[0]);
+            min[1] = min[1].min(vertex.uv[1]);
+            max[0] = max[0].max(vertex.uv[0]);
+            max[1] = max[1].max(vertex.uv[1]);
+        }
+        assert!(count >= 4, "expected a face with normal {normal:?}");
+        [max[0] - min[0], max[1] - min[1]]
+    }
+
+    #[test]
+    fn one_voxel_face_covers_one_texture_tile() {
+        let mesh = artificial_mesh(&[([8, 8, 8], Block::Stone)]);
+        for vertex in &mesh.vertices {
+            assert_eq!(
+                vertex.uv,
+                terrain_face_uv(vertex.normal, vertex.position),
+                "shipped emit_quad must write voxel-space UVs"
+            );
+        }
+        let top = uv_span(&mesh, [0.0, 1.0, 0.0]);
+        assert!(
+            (top[0] - 1.0).abs() < 1e-5 && (top[1] - 1.0).abs() < 1e-5,
+            "+Y UV span {top:?} must be one tile, not a 0.5 m world-metre span"
+        );
+        let side = uv_span(&mesh, [1.0, 0.0, 0.0]);
+        assert!(
+            (side[0] - 1.0).abs() < 1e-5 && (side[1] - 1.0).abs() < 1e-5,
+            "+X UV span {side:?}"
+        );
+        let pair = artificial_mesh(&[([8, 8, 8], Block::Stone), ([9, 8, 8], Block::Stone)]);
+        let merged = uv_span(&pair, [0.0, 1.0, 0.0]);
+        assert!(
+            (merged[0] - 2.0).abs() < 1e-5 && (merged[1] - 1.0).abs() < 1e-5,
+            "merged +Y along X spans two tiles, got {merged:?}"
+        );
     }
 
     #[test]
     fn chunk_halo_culls_internal_border_faces() {
         let edge = artificial_mesh(&[([31, 8, 8], Block::Stone), ([32, 8, 8], Block::Stone)]);
-        assert_eq!(triangle_area(&edge), 5.0);
+        assert_eq!(triangle_area(&edge), 5.0 * VOXEL_METERS * VOXEL_METERS);
         assert!(
             edge.vertices
                 .iter()
                 .all(|vertex| vertex.normal != [1.0, 0.0, 0.0])
         );
         let negative = artificial_mesh(&[([0, 8, 8], Block::Stone), ([-1, 8, 8], Block::Stone)]);
-        assert_eq!(triangle_area(&negative), 5.0);
+        assert_eq!(triangle_area(&negative), 5.0 * VOXEL_METERS * VOXEL_METERS);
     }
 
     #[test]
@@ -1264,7 +1513,7 @@ mod tests {
         // Sample the top of a voxel at [8,8,8], with two adjacent walls.
         halo[halo_index([7, 9, 8])] = Block::Stone;
         halo[halo_index([8, 9, 7])] = Block::Stone;
-        let ao = corner_ao(&halo, [8, 9, 8], 0, 2);
+        let ao = corner_ao(&halo, [8, 9, 8], 0, 2, HALO_SIDE);
         assert_eq!(ao[0], 0, "two occluding side cells close the corner");
         assert_eq!(ao[2], 3, "opposite open corner receives full ambient light");
     }
@@ -1301,14 +1550,9 @@ mod tests {
                 mesh.vertices[tri[1] as usize],
                 mesh.vertices[tri[2] as usize],
             ];
-            let a = glam::Vec3::from(vertices[0].position);
-            let b = glam::Vec3::from(vertices[1].position);
-            let c = glam::Vec3::from(vertices[2].position);
             assert!(
-                (b - a)
-                    .cross(c - a)
-                    .dot(glam::Vec3::from(vertices[0].normal))
-                    > 0.0
+                triangle_outward_dot(&mesh, tri) > 0.0,
+                "terrain triangles must face along their normals"
             );
             assert!(
                 vertices
@@ -1321,7 +1565,7 @@ mod tests {
     #[test]
     fn water_has_surface_without_internal_water_faces_and_is_not_pickable() {
         let mesh = artificial_mesh(&[([8, 8, 8], Block::Water), ([9, 8, 8], Block::Water)]);
-        assert_eq!(triangle_area(&mesh), 10.0);
+        assert_eq!(triangle_area(&mesh), 10.0 * VOXEL_METERS * VOXEL_METERS);
         let mut world = World::new(1);
         world.set_block([1, 150, 0], Block::Water);
         world.set_block([2, 150, 0], Block::Stone);
@@ -1746,6 +1990,192 @@ mod tests {
         );
     }
 
+    fn mesh_extents(mesh: &Mesh) -> [f32; 3] {
+        let mut min = [f32::INFINITY; 3];
+        let mut max = [f32::NEG_INFINITY; 3];
+        for vertex in &mesh.vertices {
+            for axis in 0..3 {
+                min[axis] = min[axis].min(vertex.position[axis]);
+                max[axis] = max[axis].max(vertex.position[axis]);
+            }
+        }
+        [max[0] - min[0], max[1] - min[1], max[2] - min[2]]
+    }
+
+    fn plus_y_widths(mesh: &Mesh) -> Vec<f32> {
+        mesh.vertices
+            .chunks_exact(4)
+            .filter(|quad| quad[0].normal[1] > 0.9)
+            .map(|quad| {
+                let min = quad
+                    .iter()
+                    .map(|vertex| vertex.position[0])
+                    .fold(f32::INFINITY, f32::min);
+                let max = quad
+                    .iter()
+                    .map(|vertex| vertex.position[0])
+                    .fold(f32::NEG_INFINITY, f32::max);
+                max - min
+            })
+            .collect()
+    }
+
+    #[test]
+    fn empty_air_data_chunks_store_zero_voxel_payload_and_filled_leaves_round_trip() {
+        let mut world = World::new(1);
+        let air = data_chunk_key([4, 240, 4]);
+        world.ensure_data_chunk(air);
+        assert_eq!(world.data_chunk_voxel_payload_bytes(air), 0);
+        for y in 0..DATA_CHUNK_SIZE {
+            for z in 0..DATA_CHUNK_SIZE {
+                for x in 0..DATA_CHUNK_SIZE {
+                    let origin = data_chunk_origin(air);
+                    assert_eq!(
+                        world.block_at(origin[0] + x, origin[1] + y, origin[2] + z),
+                        Block::Air
+                    );
+                }
+            }
+        }
+
+        let origin = [80, 248, 80];
+        let key = data_chunk_key(origin);
+        for y in 0..DATA_CHUNK_SIZE {
+            for z in 0..DATA_CHUNK_SIZE {
+                for x in 0..DATA_CHUNK_SIZE {
+                    let block = if x == 0 && y == 0 && z == 0 {
+                        Block::Dirt
+                    } else {
+                        Block::Stone
+                    };
+                    world.set_block([origin[0] + x, origin[1] + y, origin[2] + z], block);
+                }
+            }
+        }
+        assert_eq!(
+            world.data_chunk_voxel_payload_bytes(key),
+            crate::svo::LEAF_CELLS
+        );
+        assert!(world.data_chunk_is_modified(key));
+        for y in 0..DATA_CHUNK_SIZE {
+            for z in 0..DATA_CHUNK_SIZE {
+                for x in 0..DATA_CHUNK_SIZE {
+                    let expected = if x == 0 && y == 0 && z == 0 {
+                        Block::Dirt
+                    } else {
+                        Block::Stone
+                    };
+                    assert_eq!(
+                        world.block_at(origin[0] + x, origin[1] + y, origin[2] + z),
+                        expected
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn render_region_addresses_sixty_four_data_chunks_in_a_distinct_key_space() {
+        let render = (2, -1, 3);
+        let keys = data_keys_in_render(render);
+        assert_eq!(keys.len(), 64);
+        let unique: HashSet<_> = keys.iter().copied().collect();
+        assert_eq!(unique.len(), 64);
+        for key in keys {
+            assert_eq!(render_key_from_data(key), render);
+            assert_ne!(
+                key, render,
+                "data keys and render keys are different spaces"
+            );
+        }
+        let voxel = [
+            2 * RENDER_CHUNK_SIZE + 7,
+            -RENDER_CHUNK_SIZE + 8,
+            3 * RENDER_CHUNK_SIZE,
+        ];
+        assert_eq!(render_chunk_key(voxel), render);
+        assert_eq!(data_chunk_key(voxel).0, render.0 * DATA_CHUNKS_PER_RENDER);
+        assert_ne!(data_chunk_key(voxel), render_chunk_key(voxel));
+    }
+
+    #[test]
+    fn greedy_cluster_pass_merges_faces_across_internal_data_chunk_borders() {
+        let mut left_only = World::new(1);
+        let mut right_only = World::new(1);
+        let mut both = World::new(1);
+        for x in 0..8 {
+            left_only.set_block([x, 200, 0], Block::Stone);
+            both.set_block([x, 200, 0], Block::Stone);
+        }
+        for x in 8..16 {
+            right_only.set_block([x, 200, 0], Block::Stone);
+            both.set_block([x, 200, 0], Block::Stone);
+        }
+        let left = left_only.mesh_data_chunk(data_chunk_key([0, 200, 0]));
+        let right = right_only.mesh_data_chunk(data_chunk_key([8, 200, 0]));
+        let cluster = both.mesh_chunk(render_chunk_key([0, 200, 0]));
+        let seam = 8.0 * VOXEL_METERS;
+        let independent_seam =
+            count_axis_faces(&left, 0, 1.0, seam) + count_axis_faces(&right, 0, -1.0, seam);
+        let cluster_seam =
+            count_axis_faces(&cluster, 0, 1.0, seam) + count_axis_faces(&cluster, 0, -1.0, seam);
+        assert!(
+            independent_seam >= 2,
+            "independent 8³ meshes keep a seam at x=7|8, got {independent_seam}"
+        );
+        assert_eq!(
+            cluster_seam, 0,
+            "cluster greedy pass merges across the internal 8³ border"
+        );
+        let cluster_top = plus_y_widths(&cluster);
+        assert_eq!(
+            cluster_top.len(),
+            1,
+            "cluster +Y is one run, got {cluster_top:?}"
+        );
+        assert!(
+            (cluster_top[0] - 16.0 * VOXEL_METERS).abs() < 1e-4,
+            "{cluster_top:?}"
+        );
+        let isolated_top = {
+            let mut widths = plus_y_widths(&left);
+            widths.extend(plus_y_widths(&right));
+            widths
+        };
+        assert_eq!(isolated_top.len(), 2);
+        assert!(
+            isolated_top
+                .iter()
+                .all(|width| (*width - 8.0 * VOXEL_METERS).abs() < 1e-4),
+            "{isolated_top:?}"
+        );
+    }
+
+    fn count_axis_faces(mesh: &Mesh, axis: usize, sign: f32, plane: f32) -> usize {
+        mesh.vertices
+            .chunks_exact(4)
+            .filter(|quad| {
+                (quad[0].normal[axis] - sign).abs() < 1e-4
+                    && quad
+                        .iter()
+                        .all(|vertex| (vertex.position[axis] - plane).abs() < 1e-4)
+            })
+            .count()
+    }
+
+    #[test]
+    fn set_block_flags_the_eight_cube_and_does_not_require_a_mesh() {
+        let mut world = World::new(1);
+        let position = [7, 200, 1];
+        world.set_block(position, Block::Stone);
+        let data = data_chunk_key(position);
+        assert!(world.data_chunk_is_modified(data));
+        assert!(world.modified_data_chunks().any(|key| key == data));
+        assert!(!world.data_chunk_is_modified(data_chunk_key([8, 200, 1])));
+        assert_eq!(render_key_from_data(data), render_chunk_key(position));
+        assert_eq!(world.block_at(7, 200, 1), Block::Stone);
+    }
+
     fn biome_index(biome: Biome) -> usize {
         match biome {
             Biome::Plains => 0,
@@ -1922,6 +2352,11 @@ mod tests {
             Block::IronOre => [176, 110, 78],
             Block::GoldOre => [214, 176, 64],
             Block::DiamondOre => [80, 220, 210],
+            Block::Motor => [196, 72, 48],
+            Block::Shaft => [168, 160, 148],
+            Block::Gear => [140, 122, 72],
+            Block::Belt => [48, 56, 62],
+            Block::Assembler => [72, 118, 132],
         }
     }
 

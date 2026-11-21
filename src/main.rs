@@ -2,20 +2,28 @@
 
 mod benchmark;
 mod daylight;
+mod entities;
 mod interaction;
+mod kinetic;
 mod material_export;
 mod materials;
 mod player;
+mod registry;
 mod renderer;
 mod save;
 mod streaming;
 mod streaming_trace;
+mod survival;
+mod svo;
 mod world;
 
 use daylight::DayClock;
 use egui::{Align2, Color32, FontId, Pos2, Rect, RichText, Stroke, Vec2};
+use entities::Entity;
 use interaction::{EditOutcome, EditQuery, EditRepeat, Hotbar, RepeatFires};
+use kinetic::KineticWorld;
 use player::{Motion, Player};
+use registry::Registry;
 use renderer::{PresentOutcome, RenderCamera, Renderer};
 use save::SaveStore;
 use std::{
@@ -26,6 +34,7 @@ use std::{
 };
 use streaming::{Streaming, UploadBudget, UploadStats};
 use streaming_trace::{StreamingTrace, TraceFrame, TraceHeader};
+use survival::Inventory;
 use winit::{
     application::ApplicationHandler,
     dpi::LogicalSize,
@@ -139,6 +148,10 @@ struct Game {
     world: Arc<World>,
     player: Player,
     day: DayClock,
+    entities: Vec<Entity>,
+    inventory: Inventory,
+    kinetic: KineticWorld,
+    registry: Registry,
     streaming: Streaming,
     streaming_trace: Option<StreamingTrace>,
     last_upload: UploadStats,
@@ -188,6 +201,7 @@ impl Game {
                 (world, player, Hotbar::default(), DayClock::morning(), false)
             }
         };
+        let entities = crate::entities::spawn_near_column(&world, [64, -64]);
         let renderer = pollster::block_on(Renderer::new(Arc::clone(&window)))?;
         println!(
             "STRATA_BOOT version=0.1.0 seed={} adapter={} saved_world={has_save}",
@@ -250,6 +264,10 @@ impl Game {
             world: Arc::new(world),
             player,
             day,
+            entities,
+            inventory: Inventory::new(),
+            kinetic: KineticWorld::new(),
+            registry: Registry::builtins(),
             streaming,
             streaming_trace,
             last_upload: UploadStats::default(),
@@ -374,12 +392,49 @@ impl Game {
         }
     }
 
+    fn tick_simulation(&mut self) {
+        if survival::is_dead(self.player.health) {
+            return;
+        }
+        self.kinetic.tick(&self.world);
+        let dt = daylight::SIM_TICK_SECONDS;
+        for entity in &mut self.entities {
+            entities::tick_entity(entity, &self.world, dt);
+            let damage = entities::hostile_melee(
+                entity,
+                self.player.body_min(),
+                self.player.body_max(),
+                survival::HOSTILE_CONTACT_DAMAGE * dt,
+            );
+            self.player.health = survival::apply_damage(self.player.health, damage);
+        }
+        entities::despawn_dead(&mut self.entities);
+    }
+
+    fn try_attack(&mut self) -> bool {
+        entities::player_attack(
+            self.player.eye,
+            self.player.direction(),
+            &mut self.entities,
+            survival::PLAYER_ATTACK_DAMAGE,
+            interaction::REACH_BLOCKS * world::VOXEL_METERS,
+        )
+    }
+
     fn edit(&mut self, place: bool) {
         if self.screen != Screen::Playing || self.picker_open {
             return;
         }
+        if !place && self.try_attack() {
+            self.notify("Strike.");
+            return;
+        }
         let edit_count = self.world.edits().len();
-        let eye = self.player.eye.to_array();
+        let eye = self
+            .player
+            .eye
+            .to_array()
+            .map(|component| component / world::VOXEL_METERS);
         let direction = self.player.direction().to_array();
         let material = self.hotbar.selected_block();
         let outcome = interaction::plan_edit(
@@ -397,8 +452,15 @@ impl Game {
             EditOutcome::Miss => {}
             EditOutcome::Rejected(message) => self.notify(message),
             EditOutcome::Applied { position, block } => {
+                let previous = self.world.block_at(position[0], position[1], position[2]);
                 Arc::make_mut(&mut self.world).set_block(position, block);
                 self.streaming.invalidate_edit(position);
+                self.kinetic.on_block(position, block);
+                if block == world::Block::Air
+                    && let Some(item) = survival::drop_from(previous)
+                {
+                    self.inventory.add(item, 1);
+                }
                 self.dirty = true;
                 println!(
                     "STRATA_EDIT action={} position={position:?} material={}",
@@ -454,6 +516,17 @@ impl Game {
                     "Walking · Space to jump"
                 });
             }
+            KeyCode::KeyR if self.screen == Screen::Playing => {
+                match survival::try_craft_pick(&mut self.inventory) {
+                    Ok(item) => {
+                        let name = survival::placeable_from(item)
+                            .map(|block| block.name())
+                            .unwrap_or("pick");
+                        self.notify(format!("Crafted a strata pick. Place as {name}."));
+                    }
+                    Err(message) => self.notify(message),
+                }
+            }
             KeyCode::KeyX => self.edit(false),
             KeyCode::KeyC => self.edit(true),
             // Arrow keys stay in `self.keys`. Turning is applied once per
@@ -492,12 +565,18 @@ impl Game {
             eye: eye.to_array(),
             target: (eye + direction).to_array(),
             time: self.start.elapsed().as_secs_f32(),
-            fog_distance: self.radius as f32 * 32.0 - 12.0,
+            fog_distance: self.radius as f32
+                * world::RENDER_CHUNK_SIZE as f32
+                * world::VOXEL_METERS
+                - 6.0,
             daylight: self.day.sample(),
             selected: if self.screen == Screen::Playing && !self.picker_open {
                 interaction::outline_target(
                     &self.world,
-                    self.player.eye.to_array(),
+                    self.player
+                        .eye
+                        .to_array()
+                        .map(|component| component / world::VOXEL_METERS),
                     self.player.direction().to_array(),
                 )
             } else {
@@ -542,6 +621,7 @@ impl Game {
             &mut self.day,
             &mut self.edit_repeat,
         );
+        let steps = fires.len();
         for fire in fires {
             if fire.break_block {
                 self.edit(false);
@@ -549,6 +629,9 @@ impl Game {
             if fire.place_block {
                 self.edit(true);
             }
+        }
+        for _ in 0..steps {
+            self.tick_simulation();
         }
         let camera = self.camera();
         // UI actions below can change these for the next redraw. Keep each
@@ -568,6 +651,8 @@ impl Game {
             .upload_ready(UploadBudget::default(), |key, mesh| {
                 self.renderer.upload_chunk(key, mesh);
             });
+        self.renderer
+            .upload_entities(&entities::mesh_entities(&self.entities));
         if self.has_entered && now.duration_since(self.last_save) > Duration::from_secs(30) {
             self.last_save = now;
             self.save();
@@ -823,14 +908,16 @@ impl Game {
             painter.text(
                 Pos2::new(bounds.center().x, bounds.bottom() - 17.0),
                 Align2::CENTER_BOTTOM,
-                "BREAK  LMB    /    PLACE  RMB    /    BLOCKS  E    /    FLIGHT  F    /    PAUSE  ESC",
+                "BREAK  LMB    /    PLACE  RMB    /    CRAFT  R    /    BLOCKS  E    /    FLIGHT  F    /    PAUSE  ESC",
                 FontId::monospace(10.0),
                 IVORY,
             );
             painter.text(
                 Pos2::new(36.0, 96.0),
                 Align2::LEFT_TOP,
-                if self.picker_open {
+                if survival::is_dead(self.player.health) {
+                    "YOU DIED"
+                } else if self.picker_open {
                     "CHOOSING A MATERIAL"
                 } else if self.player.flying {
                     "FREE FLIGHT"
@@ -839,6 +926,35 @@ impl Game {
                 },
                 FontId::monospace(10.0),
                 IVORY,
+            );
+            let health_width =
+                160.0 * (self.player.health / survival::PLAYER_MAX_HEALTH).clamp(0.0, 1.0);
+            let health_origin = Pos2::new(36.0, 114.0);
+            painter.rect_filled(
+                Rect::from_min_size(health_origin, Vec2::new(160.0, 10.0)),
+                2.0,
+                Color32::from_rgb(40, 18, 18),
+            );
+            painter.rect_filled(
+                Rect::from_min_size(health_origin, Vec2::new(health_width, 10.0)),
+                2.0,
+                Color32::from_rgb(176, 48, 48),
+            );
+            painter.text(
+                Pos2::new(36.0, 128.0),
+                Align2::LEFT_TOP,
+                format!(
+                    "HP  {:.0}    WOOD  {}    STONE  {}    PICK  {}    REG  v{}",
+                    self.player.health,
+                    self.inventory
+                        .count(survival::Item::Block(world::Block::Wood)),
+                    self.inventory
+                        .count(survival::Item::Block(world::Block::Stone)),
+                    self.inventory.count(survival::Item::Pick),
+                    self.registry.version
+                ),
+                FontId::monospace(10.0),
+                MUTED,
             );
             if self.picker_open {
                 self.draw_picker(ctx);
@@ -893,8 +1009,11 @@ impl Game {
             egui::Area::new(egui::Id::unique("performance")).anchor(Align2::RIGHT_TOP,Vec2::new(-28.0,64.0)).show(ctx,|ui| {
                 egui::Frame::new().fill(PANEL).inner_margin(16.0).corner_radius(4).show(ui,|ui| {
                     ui.label(RichText::new("FIELD NOTES").color(ACCENT).size(11.0));
+                    let voxel = world::meters_to_voxel(self.player.eye.to_array());
+                    let data = world::data_chunk_key(voxel);
+                    let render = world::render_chunk_key(voxel);
                     ui.monospace(format!(
-                        "{fps:.0} fps  ·  p95 {p95:.2} ms\n{} chunks  ·  {} triangles\n{} workers  ·  {:.2} ms last mesh\nPosition {:.1}, {:.1}, {:.1}\n{}\nF4 +1 hour\n{}",
+                        "{fps:.0} fps  ·  p95 {p95:.2} ms\n{} chunks  ·  {} triangles\n{} workers  ·  {:.2} ms last mesh\nPosition {:.1}, {:.1}, {:.1}\n{}\nF4 +1 hour\n{}\ndata {:?}  render {:?}\npayload {} B  dirty {}\ncluster {}  height {:.2}\n{}  {}\nstacks {}",
                         self.renderer.chunk_count(),
                         self.renderer.triangle_count(),
                         self.streaming.workers,
@@ -903,8 +1022,37 @@ impl Game {
                         self.player.eye.y,
                         self.player.eye.z,
                         self.day.label(),
-                        self.renderer.adapter_name
+                        self.renderer.adapter_name,
+                        data,
+                        render,
+                        self.world.data_chunk_voxel_payload_bytes(data),
+                        self.world.data_chunk_is_modified(data),
+                        world::data_keys_in_render(render).len(),
+                        player::Player::standing_height(),
+                        self.registry
+                            .block("strata:stone")
+                            .map(|def| def.name.as_str())
+                            .unwrap_or("?"),
+                        self.registry
+                            .item("strata:pick")
+                            .map(|def| def.name.as_str())
+                            .unwrap_or("?"),
+                        self.inventory.stacks().len()
                     ));
+                    let _ = world::render_key_from_data(data);
+                    let _ = self.world.modified_data_chunks().count();
+                    let _ = world::DATA_CHUNKS_PER_RENDER;
+                    let target = interaction::outline_target(
+                        &self.world,
+                        self.player
+                            .eye
+                            .to_array()
+                            .map(|component| component / world::VOXEL_METERS),
+                        self.player.direction().to_array(),
+                    );
+                    if let Some(hit) = target {
+                        let _ = self.kinetic.machine(hit);
+                    }
                 });
             });
         }
@@ -991,6 +1139,7 @@ fn gameplay_key(code: KeyCode) -> bool {
         code,
         KeyCode::Escape
             | KeyCode::KeyE
+            | KeyCode::KeyR
             | KeyCode::F3
             | KeyCode::F4
             | KeyCode::F5
@@ -1483,6 +1632,7 @@ mod tests {
             yaw: 0.0,
             pitch: 0.0,
             flying: false,
+            health: crate::survival::PLAYER_MAX_HEALTH,
         });
         let held = HashSet::from([KeyCode::ArrowRight]);
         let ticks = daylight::SIM_TICKS_PER_SECOND;
@@ -1840,6 +1990,7 @@ mod tests {
             yaw: 0.0,
             pitch: 0.0,
             flying: true,
+            health: crate::survival::PLAYER_MAX_HEALTH,
         });
         let mut day = DayClock::morning();
         let mut repeat = EditRepeat::new();

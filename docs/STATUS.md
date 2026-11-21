@@ -1,10 +1,19 @@
 # Current checkpoint
 
-2026-10-21. **Goal active.** STRATA has a native editable-world foundation, original 32×32 materials and reproducible CPU meshing evidence. The requested production and studio grade survival/combat/building/exploration game and Microsoft pitch remain incomplete. The 2026-10-20 counts below remain that checkpoint. Day/night evidence is the next section.
+2026-11-09. **8³ / 32³ split landed.** STRATA stores simulation in 8×8×8 SVO data chunks (all-air leaves have 0 voxel payload) and meshes 32×32×32 Render Regions as one greedy pass / one draw. Voxels are 0.5 m. Generator 3 rejects older saves in place. Survival (gather, one pick recipe, health), textured Hollow Warden / Dune Grazer combat, and a kinetic motor/shaft/belt/assembler slice with a versioned registry are in the native crate. The requested production and studio grade game and Microsoft pitch remain incomplete. The 2026-10-20 counts below remain that earlier checkpoint.
+
+Verification for this split, Rust 1.97.1, Windows / GTX 1660 Ti:
+
+- `cargo fmt --check`: passed.
+- `cargo clippy --locked --all-targets -- -D warnings`: passed.
+- `cargo test --locked`: **111 passed, 0 failed, 1 ignored**.
+- `cargo build --release --locked`: passed.
+- `--benchmark-cpu` twice: both exit 0; all six scenario `mesh_digest` values match.
+- `--smoke-seconds 5` twice: both exit 0; 300 and 298 presentations, zero skips, adapter `NVIDIA GeForce GTX 1660 Ti / Vulkan`. That is title-camera presentation, not a playthrough.
 
 ## Day/night cycle
 
-Playing advances a 20-minute day on the fixed 60 Hz simulation tick. The title, pause menu, settings, and focus loss all go through the same step function and freeze that clock. Schema 1 generator 2 stores `time_of_day` in `[0, 1)` (midnight is 0). A generator 2 save without the field loads at 08:00. Generator 1 files are rejected and left untouched. Non-finite values, negatives, and exactly 1.0 are rejected and the file is kept. Sun direction, sky, fog, ambient, and sun color are appended camera uniforms. Night clouds and water use the same linear lighting as the terrain. The 44-byte vertex layout is unchanged.
+Playing advances a 20-minute day on the fixed 60 Hz simulation tick. The title, pause menu, settings, and focus loss all go through the same step function and freeze that clock. Schema 1 generator 3 stores `time_of_day` in `[0, 1)` (midnight is 0) and optional player health. A generator 3 save without those fields loads at 08:00 with full health. Generator 1 and 2 files are rejected and left untouched. Non-finite values, negatives, and exactly 1.0 are rejected and the file is kept. Sun direction, sky, fog, ambient, and sun color are appended camera uniforms. Night clouds and water use the same linear lighting as the terrain. The terrain vertex is 52 bytes: position, normal, lighting color, voxel/face UV, and texture layer.
 
 Linux verification for this change, Rust 1.97.1:
 
@@ -52,7 +61,7 @@ The canonical local project is `C:\WPAI\Software\Rust Based Voxel`, an independe
 - `cargo build --release --locked`: passed.
 - All three PowerShell entry points parsed; CPU benchmark, native launcher and streaming-trace wrapper ran. The launcher retains diagnostics; benchmark reports and exports preserve existing destinations.
 
-The original 40-byte vertex assertion failed when adding the texture-layer field intentionally changed the contract to 44 bytes. The test now verifies size, normal/color/layer offsets and GPU attribute format. Geometry-area and intended-behavior assertions were not weakened.
+The original 40-byte vertex assertion failed when adding the texture-layer field, then 44 bytes grew to 52 bytes for voxel/face UV. The test verifies size, normal/color/uv/layer offsets and GPU attribute format. Geometry-area and intended-behavior assertions were not weakened.
 
 ## Native evidence and limits
 

@@ -1,5 +1,13 @@
-use crate::{save::PlayerSave, world::World};
+use crate::{
+    save::PlayerSave,
+    survival::PLAYER_MAX_HEALTH,
+    world::{VOXEL_METERS, World, meters_to_voxel, voxel_to_meters},
+};
 use glam::Vec3;
+
+pub const PLAYER_HEIGHT: f32 = 1.8;
+pub const PLAYER_EYE_HEIGHT: f32 = 1.62;
+pub const PLAYER_HALF_WIDTH: f32 = 0.3;
 
 pub struct Player {
     pub eye: Vec3,
@@ -7,6 +15,7 @@ pub struct Player {
     pub pitch: f32,
     pub flying: bool,
     pub grounded: bool,
+    pub health: f32,
     velocity: Vec3,
 }
 
@@ -21,12 +30,18 @@ pub struct Motion {
 
 impl Player {
     pub fn new(world: &World) -> Self {
+        let feet = voxel_to_meters([64, world.surface_height(64, -64) + 1, -64]);
         let mut player = Self {
-            eye: Vec3::new(64.5, world.surface_height(64, -64) as f32 + 3.0, -63.5),
+            eye: Vec3::new(
+                feet[0] + VOXEL_METERS * 0.5,
+                feet[1] + PLAYER_EYE_HEIGHT,
+                feet[2] + VOXEL_METERS * 0.5,
+            ),
             yaw: -0.35,
             pitch: -0.12,
             flying: false,
             grounded: false,
+            health: PLAYER_MAX_HEALTH,
             velocity: Vec3::ZERO,
         };
         player.recover_above_surface(world);
@@ -39,6 +54,7 @@ impl Player {
             pitch: save.pitch,
             flying: save.flying,
             grounded: false,
+            health: save.health,
             velocity: Vec3::ZERO,
         }
     }
@@ -48,7 +64,27 @@ impl Player {
             yaw: self.yaw,
             pitch: self.pitch,
             flying: self.flying,
+            health: self.health,
         }
+    }
+    pub fn body_min(&self) -> Vec3 {
+        Self::aabb_min(self.eye)
+    }
+    pub fn body_max(&self) -> Vec3 {
+        Self::aabb_max(self.eye)
+    }
+    pub fn standing_height() -> f32 {
+        PLAYER_HEIGHT
+    }
+    fn aabb_min(eye: Vec3) -> Vec3 {
+        eye + Vec3::new(-PLAYER_HALF_WIDTH, -PLAYER_EYE_HEIGHT, -PLAYER_HALF_WIDTH)
+    }
+    fn aabb_max(eye: Vec3) -> Vec3 {
+        eye + Vec3::new(
+            PLAYER_HALF_WIDTH,
+            PLAYER_HEIGHT - PLAYER_EYE_HEIGHT,
+            PLAYER_HALF_WIDTH,
+        )
     }
     pub fn direction(&self) -> Vec3 {
         Vec3::new(
@@ -71,14 +107,13 @@ impl Player {
         true
     }
     fn recover_above_surface(&mut self, world: &World) {
-        self.eye.y =
-            world.surface_height(self.eye.x.floor() as i32, self.eye.z.floor() as i32) as f32 + 3.0;
-        // Test the entire body, including adjacent cells, trees and player edits.
-        // Search is bounded even when edited columns fill the permitted height.
-        while self.eye.y < 512.0 && Self::collides(self.eye, world) {
-            self.eye.y += 1.0;
+        let column = meters_to_voxel(self.eye.to_array());
+        let ground = world.surface_height(column[0], column[2]) as f32 * VOXEL_METERS;
+        self.eye.y = ground + VOXEL_METERS + PLAYER_EYE_HEIGHT;
+        while self.eye.y < 256.0 && Self::collides(self.eye, world) {
+            self.eye.y += VOXEL_METERS;
         }
-        self.eye.y = self.eye.y.min(512.0);
+        self.eye.y = self.eye.y.min(256.0);
         if Self::collides(self.eye, world) {
             self.flying = true;
         }
@@ -86,20 +121,20 @@ impl Player {
         self.grounded = false;
     }
     pub fn occupies(&self, block: [i32; 3]) -> bool {
-        let min = self.eye + Vec3::new(-0.3, -1.6, -0.3);
-        let max = self.eye + Vec3::new(0.3, 0.15, 0.3);
-        (0..3).all(|i| max[i] > block[i] as f32 && min[i] < block[i] as f32 + 1.0)
+        let min = Self::aabb_min(self.eye);
+        let max = Self::aabb_max(self.eye);
+        let block_min = Vec3::from_array(voxel_to_meters(block));
+        let block_max = block_min + Vec3::splat(VOXEL_METERS);
+        (0..3).all(|i| max[i] > block_min[i] && min[i] < block_max[i])
     }
     fn collides(eye: Vec3, world: &World) -> bool {
-        let min = (eye + Vec3::new(-0.3, -1.6, -0.3) + Vec3::splat(0.001))
-            .floor()
-            .as_ivec3();
-        let max = (eye + Vec3::new(0.3, 0.15, 0.3) - Vec3::splat(0.001))
-            .floor()
-            .as_ivec3();
-        for z in min.z..=max.z {
-            for y in min.y..=max.y {
-                for x in min.x..=max.x {
+        let min = Self::aabb_min(eye) + Vec3::splat(0.001);
+        let max = Self::aabb_max(eye) - Vec3::splat(0.001);
+        let vmin = meters_to_voxel(min.to_array());
+        let vmax = meters_to_voxel(max.to_array());
+        for z in vmin[2]..=vmax[2] {
+            for y in vmin[1]..=vmax[1] {
+                for x in vmin[0]..=vmax[0] {
                     if world.block_at(x, y, z).is_solid() {
                         return true;
                     }
@@ -108,7 +143,11 @@ impl Player {
         }
         false
     }
-    pub fn tick(&mut self, world: &World, motion: Motion, dt: f32) {
+    pub fn tick(&mut self, world: &World, mut motion: Motion, dt: f32) {
+        if self.health <= 0.0 {
+            motion = Motion::default();
+            self.flying = false;
+        }
         let forward = Vec3::new(self.yaw.sin(), 0.0, -self.yaw.cos());
         let right = Vec3::new(self.yaw.cos(), 0.0, self.yaw.sin());
         let direction = (forward * motion.forward + right * motion.right).normalize_or_zero();
@@ -143,10 +182,10 @@ impl Player {
                 }
             }
         }
-        self.eye.x = self.eye.x.clamp(-999_900.0, 999_900.0);
-        self.eye.z = self.eye.z.clamp(-999_900.0, 999_900.0);
-        self.eye.y = self.eye.y.clamp(-64.0, 512.0);
-        if self.eye.y <= -60.0 {
+        self.eye.x = self.eye.x.clamp(-499_950.0, 499_950.0);
+        self.eye.z = self.eye.z.clamp(-499_950.0, 499_950.0);
+        self.eye.y = self.eye.y.clamp(-32.0, 256.0);
+        if self.eye.y <= -30.0 {
             self.recover_above_surface(world);
         }
     }
@@ -169,12 +208,18 @@ mod tests {
     fn falling_player_lands_and_can_jump_without_tunneling() {
         let world = platform();
         let mut player = Player::new(&world);
-        player.eye = Vec3::new(0.5, 220.0, 0.5);
+        let top = 200.0 * VOXEL_METERS + VOXEL_METERS;
+        player.eye = Vec3::new(0.25, top + 10.0, 0.25);
         for _ in 0..240 {
             player.tick(&world, Motion::default(), 1.0 / 60.0);
         }
         assert!(player.grounded);
-        assert!((202.59..202.76).contains(&player.eye.y), "{}", player.eye.y);
+        let expected = top + PLAYER_EYE_HEIGHT;
+        assert!(
+            (expected - 0.08..expected + 0.08).contains(&player.eye.y),
+            "{}",
+            player.eye.y
+        );
         let ground_y = player.eye.y;
         player.tick(
             &world,
@@ -189,13 +234,16 @@ mod tests {
     #[test]
     fn placement_excludes_player_body_but_not_remote_blocks() {
         let mut player = Player::new(&platform());
-        player.eye = Vec3::new(0.5, 202.7, 0.5);
+        let top = 200.0 * VOXEL_METERS + VOXEL_METERS;
+        player.eye = Vec3::new(0.25, top + PLAYER_EYE_HEIGHT, 0.25);
         assert!(player.occupies([0, 201, 0]));
-        assert!(!player.occupies([1, 201, 0]));
+        assert!(!player.occupies([2, 201, 0]));
         assert!(!player.occupies([0, 200, 0]));
+        assert_eq!(Player::standing_height(), PLAYER_HEIGHT);
     }
     #[test]
     fn look_is_bounded_and_direction_is_normalized() {
+        const { assert!(PLAYER_HEIGHT > 1.5 && PLAYER_HEIGHT < 2.2) };
         let mut player = Player::new(&platform());
         player.look(1000.0, 1000.0);
         assert!((player.direction().length() - 1.0).abs() < 0.0001);
@@ -207,7 +255,7 @@ mod tests {
         let world = platform();
         let mut player = Player::new(&world);
         assert!(player.toggle_flight(&world));
-        player.eye = Vec3::new(0.5, 201.5, 0.5);
+        player.eye = Vec3::new(0.25, 200.0 * VOXEL_METERS + 0.2, 0.25);
         assert!(Player::collides(player.eye, &world));
         assert!(!player.toggle_flight(&world));
         assert!(player.flying);
@@ -217,7 +265,7 @@ mod tests {
                 vertical: 1.0,
                 ..Default::default()
             },
-            0.1,
+            0.25,
         );
         assert!(player.toggle_flight(&world));
         assert!(!player.flying);
@@ -237,7 +285,10 @@ mod tests {
         }
         let player = Player::new(&tree_world);
         assert!(!Player::collides(player.eye, &tree_world));
-        assert!(player.eye.y > tree_world.surface_height(64, -64) as f32 + 3.0);
+        assert!(
+            player.eye.y
+                > tree_world.surface_height(64, -64) as f32 * VOXEL_METERS + PLAYER_EYE_HEIGHT
+        );
         let mut world = World::new(728_491);
         let ground = world.surface_height(64, -64);
         for y in ground + 1..=ground + 12 {
@@ -245,10 +296,10 @@ mod tests {
         }
         let mut player = Player::new(&world);
         assert!(!Player::collides(player.eye, &world));
-        player.eye.y = -61.0;
+        player.eye.y = -31.0;
         player.tick(&world, Motion::default(), 1.0 / 60.0);
         assert!(!Player::collides(player.eye, &world));
-        assert!(player.eye.y > (ground + 12) as f32 + 1.6);
+        assert!(player.eye.y > (ground + 12) as f32 * VOXEL_METERS + PLAYER_EYE_HEIGHT - 0.05);
     }
     #[test]
     fn a_natural_trunk_grows_without_being_planted() {

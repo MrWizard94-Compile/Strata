@@ -1,4 +1,7 @@
-use crate::world::{CHUNK_SIZE, ChunkKey, Mesh, World};
+use crate::world::{
+    ChunkKey, DataChunkKey, Mesh, RENDER_CHUNK_SIZE, VOXEL_METERS, World, data_chunk_key,
+    render_chunk_key,
+};
 use std::{
     collections::HashSet,
     mem::size_of_val,
@@ -74,6 +77,7 @@ pub struct Streaming {
     pub loaded: HashSet<ChunkKey>,
     invalidated: HashSet<ChunkKey>,
     pending: HashSet<ChunkKey>,
+    pub dirty_data: HashSet<DataChunkKey>,
     deferred: Option<CompletedMesh>,
     desired: Vec<ChunkKey>,
     center: Option<(i32, i32, i32)>,
@@ -131,6 +135,7 @@ impl Streaming {
             loaded: HashSet::new(),
             invalidated: HashSet::new(),
             pending: HashSet::new(),
+            dirty_data: HashSet::new(),
             deferred: None,
             desired: Vec::new(),
             center: None,
@@ -141,8 +146,8 @@ impl Streaming {
     }
 
     pub fn update(&mut self, eye: [f32; 3], radius: i32, world: &Arc<World>) -> Vec<ChunkKey> {
-        let cx = (eye[0].floor() as i32).div_euclid(CHUNK_SIZE);
-        let cz = (eye[2].floor() as i32).div_euclid(CHUNK_SIZE);
+        let cx = ((eye[0] / VOXEL_METERS).floor() as i32).div_euclid(RENDER_CHUNK_SIZE);
+        let cz = ((eye[2] / VOXEL_METERS).floor() as i32).div_euclid(RENDER_CHUNK_SIZE);
         let mut removed = Vec::new();
         if self.center != Some((cx, cz, radius)) {
             self.center = Some((cx, cz, radius));
@@ -157,7 +162,7 @@ impl Streaming {
                     }
                 }
             }
-            let cy = (eye[1].floor() as i32).div_euclid(CHUNK_SIZE);
+            let cy = ((eye[1] / VOXEL_METERS).floor() as i32).div_euclid(RENDER_CHUNK_SIZE);
             self.desired.sort_by_key(|&(x, y, z)| {
                 ((x - cx).pow(2) + (z - cz).pow(2)) * 4 + (y - cy).pow(2)
             });
@@ -290,13 +295,12 @@ impl Streaming {
     pub fn invalidate_edit(&mut self, position: [i32; 3]) {
         self.revision = self.revision.wrapping_add(1);
         self.pending.clear();
-        let center = position.map(|c| c.div_euclid(CHUNK_SIZE));
+        self.dirty_data.insert(data_chunk_key(position));
+        let center = render_chunk_key(position);
         // Meshing reads a halo for occlusion and neighbouring faces.
         self.invalidated
             .extend(self.loaded.iter().copied().filter(|&(x, y, z)| {
-                (x - center[0]).abs() <= 1
-                    && (y - center[1]).abs() <= 1
-                    && (z - center[2]).abs() <= 1
+                (x - center.0).abs() <= 1 && (y - center.1).abs() <= 1 && (z - center.2).abs() <= 1
             }));
     }
 
@@ -339,6 +343,7 @@ mod tests {
                 loaded: HashSet::new(),
                 invalidated: HashSet::new(),
                 pending: HashSet::new(),
+                dirty_data: HashSet::new(),
                 deferred: None,
                 desired: Vec::new(),
                 center: None,
@@ -385,6 +390,7 @@ mod tests {
                 position: [0.0; 3],
                 normal: [0.0, 1.0, 0.0],
                 color: [1.0; 4],
+                uv: [0.0, 0.0],
                 texture_layer: 0,
             };
             vertices
@@ -874,5 +880,41 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("shutdown releases the full results queue");
         dropper.join().unwrap();
+    }
+
+    #[test]
+    fn an_edit_flags_the_data_chunk_and_remeshes_only_the_parent_render_region() {
+        let mut world = World::new(1);
+        let position = [7, 40, 1];
+        world.set_block(position, crate::world::Block::Stone);
+        assert!(world.data_chunk_is_modified(data_chunk_key(position)));
+        assert!(!world.data_chunk_is_modified(data_chunk_key([8, 200, 1])));
+
+        let world = Arc::new(world);
+        let (mut streaming, jobs, results) = harness(8, 8);
+        let eye = [
+            position[0] as f32 * VOXEL_METERS,
+            position[1] as f32 * VOXEL_METERS,
+            position[2] as f32 * VOXEL_METERS,
+        ];
+        streaming.update(eye, 0, &world);
+        let queued: Vec<_> = jobs.try_iter().collect();
+        let render = render_chunk_key(position);
+        let data = data_chunk_key(position);
+        assert!(queued.iter().any(|job| job.key == render));
+        assert!(queued.iter().all(|job| job.key != data || data == render));
+        streaming.invalidate_edit(position);
+        assert!(streaming.dirty_data.contains(&data));
+        streaming.update(eye, 0, &world);
+        let remesh: Vec<_> = jobs.try_iter().collect();
+        assert!(remesh.iter().any(|job| job.key == render));
+        assert!(remesh.iter().all(|job| job.key != data || data == render));
+        results.send(result(render, 0)).unwrap();
+        assert!(
+            ready(&mut streaming).is_empty(),
+            "stale pre-edit result dropped"
+        );
+        results.send(result(render, streaming.revision)).unwrap();
+        assert_eq!(ready(&mut streaming), [render]);
     }
 }

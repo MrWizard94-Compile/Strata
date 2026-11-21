@@ -23,6 +23,8 @@ pub struct PlayerSave {
     pub yaw: f32,
     pub pitch: f32,
     pub flying: bool,
+    #[serde(default = "default_health")]
+    pub health: f32,
 }
 
 /// Schema 1 world save. `time_of_day`, `hotbar`, and `selected_slot` are optional.
@@ -44,6 +46,10 @@ pub struct Snapshot {
     /// Selected hotbar index, `0..HOTBAR_SLOTS`. Older saves omit this and use slot 0.
     #[serde(default)]
     selected_slot: u8,
+}
+
+fn default_health() -> f32 {
+    crate::survival::PLAYER_MAX_HEALTH
 }
 
 fn default_time_of_day() -> f32 {
@@ -82,6 +88,9 @@ impl Snapshot {
             || !self.player.pitch.is_finite()
             || self.player.pitch.abs() > 1.55
             || self.player.yaw.abs() > std::f32::consts::TAU
+            || !self.player.health.is_finite()
+            || self.player.health < 0.0
+            || self.player.health > crate::survival::PLAYER_MAX_HEALTH
         {
             return Err("World contains an invalid player position or orientation.".into());
         }
@@ -285,10 +294,11 @@ mod tests {
     }
     fn player() -> PlayerSave {
         PlayerSave {
-            eye: [0.0, 80.0, 0.0],
+            eye: [0.0, 40.0, 0.0],
             yaw: 0.0,
             pitch: 0.0,
             flying: false,
+            health: crate::survival::PLAYER_MAX_HEALTH,
         }
     }
     fn save_world(

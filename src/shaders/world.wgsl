@@ -92,7 +92,8 @@ struct TerrainVertex {
     @location(0) position: vec3<f32>,
     @location(1) normal: vec3<f32>,
     @location(2) color: vec4<f32>,
-    @location(3) texture_layer: u32,
+    @location(3) uv: vec2<f32>,
+    @location(4) texture_layer: u32,
 };
 
 struct TerrainFragment {
@@ -100,7 +101,8 @@ struct TerrainFragment {
     @location(0) world: vec3<f32>,
     @location(1) normal: vec3<f32>,
     @location(2) color: vec4<f32>,
-    @location(3) @interpolate(flat) texture_layer: u32,
+    @location(3) uv: vec2<f32>,
+    @location(4) @interpolate(flat) texture_layer: u32,
 };
 
 @vertex
@@ -110,6 +112,7 @@ fn vs_terrain(input: TerrainVertex) -> TerrainFragment {
     out.world = input.position;
     out.normal = input.normal;
     out.color = input.color;
+    out.uv = input.uv;
     out.texture_layer = input.texture_layer;
     return out;
 }
@@ -119,15 +122,9 @@ fn fs_terrain(input: TerrainFragment) -> @location(0) vec4<f32> {
     let eye_direction = normalize(camera.eye_time.xyz - input.world);
     let distance = length(camera.eye_time.xyz - input.world);
     let normal = normalize(input.normal);
-    // World-axis coordinates repeat one 32x32 tile per block, including merged
-    // faces and negative coordinates. Side V increases from top to bottom.
-    var uv = input.world.xz;
-    if abs(normal.x) > 0.5 {
-        uv = vec2<f32>(input.world.z, -input.world.y);
-    } else if abs(normal.z) > 0.5 {
-        uv = vec2<f32>(input.world.x, -input.world.y);
-    }
-    let albedo = textureSample(material_tiles, material_sampler, uv, i32(input.texture_layer)).rgb
+    // Vertex UV: terrain is voxel units (one 32x32 tile per 0.5 m block, including
+    // merged faces). Entity faces store 0-1 so the authored tile sits on the model.
+    let albedo = textureSample(material_tiles, material_sampler, input.uv, i32(input.texture_layer)).rgb
         * input.color.rgb;
     var color: vec3<f32>;
 
@@ -168,7 +165,7 @@ fn vs_selection(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f3
         vec3<f32>(0., 0., 1.), vec3<f32>(1., 0., 1.), vec3<f32>(1., 1., 1.), vec3<f32>(0., 1., 1.));
     let edges = array<u32, 24>(0u,1u,1u,2u,2u,3u,3u,0u,4u,5u,5u,6u,6u,7u,7u,4u,0u,4u,1u,5u,2u,6u,3u,7u);
     let local = (corners[edges[index]] - vec3<f32>(0.5)) * 1.006 + vec3<f32>(0.5);
-    return camera.view_projection * vec4<f32>(camera.selected.xyz + local, 1.0);
+    return camera.view_projection * vec4<f32>(camera.selected.xyz + local * camera.selected.w, 1.0);
 }
 
 @fragment

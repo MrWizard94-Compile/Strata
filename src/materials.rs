@@ -5,7 +5,7 @@
 use crate::world::Block;
 
 pub const TILE_SIZE: u32 = 32;
-pub const LAYER_COUNT: u32 = 17;
+pub const LAYER_COUNT: u32 = 19;
 
 const GRASS_TOP: u32 = 0;
 const GRASS_SIDE: u32 = 1;
@@ -24,6 +24,8 @@ const COAL_ORE: u32 = 13;
 const IRON_ORE: u32 = 14;
 const GOLD_ORE: u32 = 15;
 const DIAMOND_ORE: u32 = 16;
+pub const HOLLOW_LAYER: u32 = 17;
+pub const GRAZER_LAYER: u32 = 18;
 
 /// Axis-aligned block face to texture-array layer. Grass side v=0 is its top
 /// edge; wood grain runs along increasing v. Air is never meshed and falls back
@@ -48,6 +50,12 @@ pub fn layer_for(block: Block, normal: [i32; 3]) -> u32 {
         Block::IronOre => IRON_ORE,
         Block::GoldOre => GOLD_ORE,
         Block::DiamondOre => DIAMOND_ORE,
+        Block::Motor => CRYSTAL,
+        Block::Shaft if normal[1] != 0 => ENDGRAIN,
+        Block::Shaft => BARK,
+        Block::Gear => LIMESTONE,
+        Block::Belt => CLAY,
+        Block::Assembler => BASALT,
     }
 }
 
@@ -144,6 +152,8 @@ fn pixel(layer: u32, x: i32, y: i32) -> [u8; 4] {
         IRON_ORE => ore(x, y, [176, 96, 64], 29),
         GOLD_ORE => ore(x, y, [228, 184, 62], 47),
         DIAMOND_ORE => ore(x, y, [86, 228, 214], 61),
+        HOLLOW_LAYER => hollow_warden(x, y),
+        GRAZER_LAYER => dune_grazer(x, y),
         _ => unreachable!("all generated layer IDs are defined"),
     };
     let color = shade(color, grain);
@@ -375,6 +385,46 @@ fn ore(x: i32, y: i32, speck: [u8; 3], salt: u32) -> [u8; 3] {
     } else {
         host
     }
+}
+
+fn hollow_warden(x: i32, y: i32) -> [u8; 3] {
+    let mut color = [28, 86, 92];
+    let plate = ((x / 4) + (y / 5)).rem_euclid(3);
+    if plate == 0 {
+        color = shade(color, 18);
+    } else if plate == 2 {
+        color = shade(color, -14);
+    }
+    let eye_y = wrap_distance(y, 11);
+    let left = wrap_distance(x, 10);
+    let right = wrap_distance(x, 21);
+    if eye_y.abs() <= 2 && (left.abs() <= 2 || right.abs() <= 2) {
+        color = [214, 236, 120];
+        if eye_y.abs() + left.abs().min(right.abs()) <= 1 {
+            color = [18, 22, 16];
+        }
+    }
+    if y > 22 {
+        color = shade([46, 38, 34], (hash(x, y, 71) % 11) as i16 - 5);
+    }
+    shade(color, (hash(x, y, 19) % 9) as i16 - 4)
+}
+
+fn dune_grazer(x: i32, y: i32) -> [u8; 3] {
+    let mut color = [168, 124, 72];
+    if y > 20 {
+        color = [214, 186, 142];
+    }
+    let spot = hash(x / 3, y / 3, 53) % 5;
+    if spot == 0 {
+        color = shade(color, -28);
+    } else if spot == 1 {
+        color = shade(color, 16);
+    }
+    if wrap_distance(x, 16).abs() < 3 && y < 10 {
+        color = [92, 64, 40];
+    }
+    shade(color, (hash(x, y, 41) % 13) as i16 - 6)
 }
 
 fn basalt(x: i32, y: i32) -> [u8; 3] {

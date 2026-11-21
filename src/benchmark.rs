@@ -248,7 +248,7 @@ fn scenarios() -> Vec<Scenario> {
             description: "32-cubed Stone edit volume at y=192 surrounded by a one-cell generated-air halo",
             world: isolated,
             chunks: single.clone(),
-            expected_surface_area: Some(f64::from(6 * CHUNK_SIZE * CHUNK_SIZE)),
+            expected_surface_area: Some(f64::from(6 * CHUNK_SIZE * CHUNK_SIZE) * 0.25),
         },
         Scenario {
             name: "enclosed_solid_chunk",
@@ -262,7 +262,9 @@ fn scenarios() -> Vec<Scenario> {
             description: "alternating Stone/Air cells continued through a one-cell halo; worst-case unmergeable exposed faces",
             world: checkerboard,
             chunks: single,
-            expected_surface_area: Some(f64::from(CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE / 2 * 6)),
+            expected_surface_area: Some(
+                f64::from(CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE / 2 * 6) * 0.25,
+            ),
         },
         Scenario {
             name: "edited_terrain_route",
@@ -309,6 +311,7 @@ fn inspect_mesh(mesh: &Mesh, key: ChunkKey, geometry: &mut Geometry) -> Result<(
             .iter()
             .chain(&vertex.normal)
             .chain(&vertex.color)
+            .chain(&vertex.uv)
         {
             if !value.is_finite() {
                 return Err("non-finite vertex component".into());
